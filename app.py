@@ -993,12 +993,26 @@ with within_tab:
     else:
         athlete_options = within_summary["name_key"].tolist()
         name_map = dict(zip(within_summary["name_key"], within_summary["athlete"]))
-        default_key = athlete_options[0]
+
+        # Give this selector a stable key and force one clean redraw after a
+        # pitcher change. This avoids stale chart content inside st.tabs on
+        # some Streamlit/browser combinations.
+        selector_key = "within_individual_pitcher"
+        rendered_key = "within_individual_pitcher_rendered"
+        if st.session_state.get(selector_key) not in athlete_options:
+            st.session_state[selector_key] = athlete_options[0]
+
         selected_key = st.selectbox(
             "Pitcher",
             athlete_options,
             format_func=lambda key: name_map.get(key, key),
+            key=selector_key,
         )
+
+        if st.session_state.get(rendered_key) != selected_key:
+            st.session_state[rendered_key] = selected_key
+            st.rerun()
+
         player_pairs = within_pairs[within_pairs["name_key"] == selected_key].sort_values("date").copy()
         player_row = within_summary[within_summary["name_key"] == selected_key].iloc[0]
 
@@ -1062,7 +1076,7 @@ with within_tab:
                 paired_display,
                 hide_index=True,
                 use_container_width=True,
-                height=min(460, 44 + 36 * (len(paired_display) + 1 
+                height=min(460, 44 + 36 * (len(paired_display) + 1)),
                 column_config={
                     "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
                     "YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
