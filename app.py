@@ -32,6 +32,23 @@ DEFAULT_VELO_TAB = "FB Velo"
 LOCAL_SERVICE_ACCOUNT_FILE = Path.home() / "Desktop" / "service_account.json"
 MIN_LAST_YTD_FB_VELO = 85.0
 
+# Only these affiliate / roster groups are available in the dashboard.
+INCLUDED_TEAMS = [
+    "DSL", "FCL", "Fredericksburg", "Wilmington",
+    "Harrisburg", "Rochester", "Washington", "REHAB",
+]
+TEAM_ALIASES = {
+    "DSL": "DSL",
+    "FCL": "FCL",
+    "FREDERICKSBURG": "Fredericksburg",
+    "WILMINGTON": "Wilmington",
+    "HARRISBURG": "Harrisburg",
+    "ROCHESTER": "Rochester",
+    "WASHINGTON": "Washington",
+    "REHAB": "REHAB",
+    "REHABILITATION": "REHAB",
+}
+
 # -----------------------------------------------------------------------------
 # DESIGN SYSTEM
 # -----------------------------------------------------------------------------
@@ -60,39 +77,56 @@ st.markdown(
 <style>
     :root {{
       --fb-bg: {BG}; --fb-card: {CARD_BG}; --fb-navy: {NAVY};
-      --fb-red: {ACCENT_RED}; --fb-text: {TEXT}; --fb-sub: {SUBTEXT};
-      --fb-border: {BORDER};
+      --fb-red: {ACCENT_RED}; --fb-blue: {BLUE}; --fb-text: {TEXT};
+      --fb-sub: {SUBTEXT}; --fb-border: {BORDER};
     }}
     .stApp {{ background: var(--fb-bg); color: var(--fb-text); }}
-    [data-testid="stSidebar"] {{ background: var(--fb-navy); }}
+    .block-container {{ max-width: 1540px; padding-top: 2.15rem; padding-bottom: 3rem; }}
+    h1, h2, h3 {{ letter-spacing: -0.025em; }}
+
+    [data-testid="stSidebar"] {{
+      background: linear-gradient(180deg, #081B3A 0%, #0A1F44 100%);
+      border-right: 1px solid rgba(255,255,255,.08);
+    }}
+    [data-testid="stSidebar"] > div:first-child {{ padding-top: 1.5rem; }}
     [data-testid="stSidebar"] * {{ color: #FFFFFF; }}
     [data-testid="stSidebar"] [data-baseweb="select"] * {{ color: var(--fb-text); }}
     [data-testid="stSidebar"] .stDateInput input,
     [data-testid="stSidebar"] .stNumberInput input {{ color: var(--fb-text) !important; }}
-    [data-testid="stSidebar"] .stCaption {{ color: #B7C6DD !important; }}
-    .block-container {{ max-width: 1500px; padding-top: 2.0rem; padding-bottom: 2.5rem; }}
+    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{
+      color: #DCE7F5 !important; font-weight: 700; font-size: .84rem;
+    }}
+    [data-testid="stSidebar"] hr {{ border-color: rgba(255,255,255,.13); }}
+    [data-testid="stSidebar"] .stButton button {{
+      background: {ACCENT_RED}; color: #FFFFFF; border: none; border-radius: 10px;
+      font-weight: 800; letter-spacing: .01em; min-height: 2.5rem;
+    }}
+    [data-testid="stSidebar"] .stButton button:hover {{ background: #A80D26; }}
+
     .metric-card {{
-      background: var(--fb-card); border: 1px solid var(--fb-border);
-      border-radius: 15px; padding: 18px 20px; min-height: 116px;
-      box-shadow: 0 6px 20px rgba(15, 35, 64, .06);
+      position: relative; overflow: hidden; background: var(--fb-card);
+      border: 1px solid var(--fb-border); border-radius: 16px; padding: 18px 20px;
+      min-height: 120px; box-shadow: 0 8px 26px rgba(15,35,64,.06);
     }}
-    .metric-accent {{ width: 34px; height: 4px; border-radius: 8px; margin-bottom: 15px; }}
-    .metric-label {{ color: var(--fb-sub); font-size: 11px; letter-spacing: .08em;
-                     font-weight: 700; text-transform: uppercase; margin-bottom: 7px; }}
-    .metric-value {{ color: var(--fb-navy); font-size: 28px; line-height: 1.05;
-                     font-weight: 750; margin: 0; }}
-    .metric-sub {{ color: var(--fb-sub); font-size: 12px; line-height: 1.35; }}
-    .section-card {{
-      background: var(--fb-card); border: 1px solid var(--fb-border);
-      border-radius: 15px; padding: 22px; box-shadow: 0 6px 20px rgba(15, 35, 64, .06);
-      margin-top: 1.25rem;
+    .metric-card:after {{
+      content: ""; position: absolute; right: -28px; bottom: -28px; width: 90px; height: 90px;
+      border-radius: 50%; background: rgba(30,90,168,.045);
     }}
-    .eyebrow {{ color: {ACCENT_RED}; font-size: 11px; letter-spacing: .1em;
-                 font-weight: 800; text-transform: uppercase; margin-bottom: 6px; }}
-    .section-eyebrow {{ color: {BLUE}; font-size: 11px; letter-spacing: .08em;
-                        font-weight: 800; text-transform: uppercase; margin-bottom: 4px; }}
-    .stButton button {{ border-radius: 10px; font-weight: 700; }}
-    .stDataFrame {{ border: 1px solid var(--fb-border); border-radius: 12px; overflow: hidden; }}
+    .metric-accent {{ width: 36px; height: 4px; border-radius: 999px; margin-bottom: 15px; }}
+    .metric-label {{ color: var(--fb-sub); font-size: 10px; letter-spacing: .1em;
+                     font-weight: 800; text-transform: uppercase; margin-bottom: 7px; }}
+    .metric-value {{ color: var(--fb-navy); font-size: 29px; line-height: 1.05;
+                     font-weight: 800; margin: 0; letter-spacing: -0.03em; }}
+    .lookup-value {{ font-size: 32px; font-weight: 800; letter-spacing: -0.035em; margin-top: 6px; }}
+
+    [data-testid="stVerticalBlockBorderWrapper"] {{
+      background: #FFFFFF; border: 1px solid var(--fb-border) !important;
+      border-radius: 16px !important; box-shadow: 0 8px 26px rgba(15,35,64,.055);
+      padding: 7px 8px 10px 8px;
+    }}
+    [data-testid="stDataFrame"] {{ border: 1px solid var(--fb-border); border-radius: 12px; overflow: hidden; }}
+    .stPlotlyChart {{ border-radius: 12px; overflow: hidden; }}
+    .stAlert {{ border-radius: 12px; }}
 </style>
 """,
     unsafe_allow_html=True,
@@ -124,6 +158,14 @@ def parse_sheet_dates(series: pd.Series) -> pd.Series:
                 pd.Timestamp("1899-12-30") + pd.to_timedelta(numeric[serial_mask], unit="D")
             )
     return parsed.dt.normalize()
+
+
+def normalize_team(value) -> str | None:
+    """Return the approved display name for a team, otherwise None."""
+    if pd.isna(value):
+        return None
+    key = re.sub(r"[^A-Z0-9]", "", str(value).upper().strip())
+    return TEAM_ALIASES.get(key)
 
 
 def canonical_name(value) -> str:
@@ -232,11 +274,16 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, str]:
         "athlete": jump_raw[jump_name_col].astype(str).str.strip(),
         "date": parse_sheet_dates(jump_raw[jump_date_col]),
         "ci": pd.to_numeric(jump_raw[jump_ci_col], errors="coerce"),
-        "team": jump_raw[jump_team_col].astype(str).str.strip() if jump_team_col else "Unassigned",
+        "team_raw": jump_raw[jump_team_col].astype(str).str.strip() if jump_team_col else "",
     })
+    jump["team"] = jump["team_raw"].map(normalize_team)
     jump["name_key"] = jump["athlete"].map(canonical_name)
-    jump = jump[(jump["athlete"] != "") & (jump["name_key"] != "")].dropna(subset=["date", "ci"])
-    jump = jump.sort_values(["athlete", "date"]).reset_index(drop=True)
+    jump = jump[
+        (jump["athlete"] != "") &
+        (jump["name_key"] != "") &
+        (jump["team"].notna())
+    ].dropna(subset=["date", "ci"])
+    jump = jump.drop(columns=["team_raw"]).sort_values(["athlete", "date"]).reset_index(drop=True)
 
     # FB Velo
     velo_raw.columns = velo_raw.columns.astype(str).str.strip()
@@ -387,10 +434,11 @@ def base_figure_layout(fig: go.Figure, height: int) -> go.Figure:
     fig.update_layout(
         paper_bgcolor=CARD_BG,
         plot_bgcolor=CARD_BG,
-        font={"family": "Arial, sans-serif", "color": TEXT},
+        font={"family": "Inter, Avenir Next, Arial, sans-serif", "color": TEXT},
         hoverlabel={"bgcolor": "#FFFFFF", "bordercolor": BORDER, "font": {"color": TEXT, "size": 13}, "align": "left"},
-        margin={"l": 64, "r": 26, "t": 18, "b": 58},
+        margin={"l": 66, "r": 30, "t": 20, "b": 58},
         height=height,
+        bargap=0.28,
         showlegend=False,
     )
     return fig
@@ -417,7 +465,7 @@ def build_scatter(summary: pd.DataFrame, show_labels: bool, ci_lookup: float | N
         mode="markers+text" if show_labels else "markers",
         text=summary["athlete"] if show_labels else None,
         textposition="top center", textfont={"size": 10, "color": NAVY},
-        marker={"size": 12, "color": ACCENT_RED, "opacity": 0.82, "line": {"color": "#FFFFFF", "width": 1.5}},
+        marker={"size": 13, "color": ACCENT_RED, "opacity": 0.88, "line": {"color": "#FFFFFF", "width": 2}},
         customdata=customdata,
         hovertemplate=(
             "<b>%{customdata[0]}</b><br>"
@@ -481,7 +529,8 @@ def build_band_chart(summary: pd.DataFrame, band_width: int) -> go.Figure:
         return base_figure_layout(fig, 380)
 
     fig.add_trace(go.Bar(
-        x=bands["CI band"], y=bands["Last YTD FB Velo"], marker_color=BLUE,
+        x=bands["CI band"], y=bands["Last YTD FB Velo"],
+        marker={"color": BLUE, "line": {"color": NAVY_MID, "width": 0.8}},
         text=[f"{velo:.1f}" for velo in bands["Last YTD FB Velo"]], textposition="outside", cliponaxis=False,
         customdata=np.column_stack([bands["Pitchers"], bands["Average CI"]]),
         hovertemplate=(
@@ -515,7 +564,8 @@ def metric_card(title: str, value: str, accent: str) -> str:
 # APP
 # -----------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("<h2 style='color:#FFFFFF;margin:0 0 16px;font-size:27px;'>YTD FB Velo × CI</h2>", unsafe_allow_html=True)
+    st.markdown("<div style='height:4px;width:42px;border-radius:999px;background:#C8102E;margin:2px 0 16px;'></div>", unsafe_allow_html=True)
+    st.markdown("<h2 style='color:#FFFFFF;margin:0 0 18px;font-size:27px;letter-spacing:-.03em;'>YTD FB Velo × CI</h2>", unsafe_allow_html=True)
     refresh = st.button("↻ Refresh", use_container_width=True, type="primary")
 
 if refresh:
@@ -544,7 +594,8 @@ with st.sidebar:
     else:
         start_date = end_date = selected_dates
 
-    teams = ["All Teams"] + sorted(team for team in jump["team"].dropna().unique().tolist() if str(team).strip())
+    available_teams = set(jump["team"].dropna().unique().tolist())
+    teams = ["All Teams"] + [team for team in INCLUDED_TEAMS if team in available_teams]
     team_filter = st.selectbox("Team", teams)
 
     st.markdown("---")
@@ -571,9 +622,17 @@ mean_velo = summary["avg_fb_velo"].mean() if n_pitchers else np.nan
 mean_ci = summary["avg_ci"].mean() if n_pitchers else np.nan
 r_text = f"{stats[0]:+.2f}" if stats is not None else "—"
 
-st.markdown("<h1 style='margin:0 0 22px;color:#0A1F44;'>YTD FB Velo × CI</h1>", unsafe_allow_html=True)
+title_col, filter_col = st.columns([4, 1])
+with title_col:
+    st.markdown("<h1 style='margin:0;color:#0A1F44;font-size:37px;font-weight:800;'>YTD FB Velo × CI</h1>", unsafe_allow_html=True)
+with filter_col:
+    st.markdown(
+        f"<div style='text-align:right;color:#667085;font-weight:700;font-size:13px;padding-top:13px;'>{html.escape(team_filter)}</div>",
+        unsafe_allow_html=True,
+    )
 
 period_text = f"{fmt_date(start_date)} – {fmt_date(end_date)}"
+st.markdown(f"<div style='color:#667085;font-size:13px;margin:3px 0 20px;'>{html.escape(period_text)}</div>", unsafe_allow_html=True)
 cols = st.columns(4)
 metric_values = [
     ("Pitchers", str(n_pitchers), BLUE),
@@ -590,51 +649,48 @@ estimated_velo = np.nan
 if stats is not None:
     estimated_velo = stats[2] * float(ci_lookup) + stats[3]
 
-st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-lookup_left, lookup_right = st.columns(2)
-with lookup_left:
-    st.markdown("<div class='section-eyebrow' style='color:#0D7E8A;'>CI lookup</div>", unsafe_allow_html=True)
-    st.markdown(f"<div style='font-size:32px;font-weight:750;color:#0A1F44;margin-top:8px;'>{fmt(ci_lookup, 1)} N·s</div>", unsafe_allow_html=True)
-with lookup_right:
-    st.markdown("<div class='section-eyebrow'>Estimated FB velo</div>", unsafe_allow_html=True)
-    lookup_value = f"{fmt(estimated_velo)} mph" if pd.notna(estimated_velo) else "—"
-    st.markdown(f"<div style='font-size:32px;font-weight:750;color:#0D7E8A;margin-top:8px;'>{lookup_value}</div>", unsafe_allow_html=True)
-st.markdown("</div>", unsafe_allow_html=True)
+with st.container(border=True):
+    st.subheader("CI Lookup", anchor=False)
+    lookup_left, lookup_right = st.columns(2)
+    with lookup_left:
+        st.markdown("<div class='metric-label'>Average CI</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='lookup-value' style='color:#0A1F44;'>{fmt(ci_lookup, 1)} N·s</div>", unsafe_allow_html=True)
+    with lookup_right:
+        st.markdown("<div class='metric-label'>Estimated FB Velo</div>", unsafe_allow_html=True)
+        lookup_value = f"{fmt(estimated_velo)} mph" if pd.notna(estimated_velo) else "—"
+        st.markdown(f"<div class='lookup-value' style='color:#0D7E8A;'>{lookup_value}</div>", unsafe_allow_html=True)
 
-# CI bands, scatter, and table
-st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-st.markdown("<h3 style='margin:0;color:#0A1F44;'>FB Velo by CI Band</h3>", unsafe_allow_html=True)
-st.plotly_chart(build_band_chart(summary, int(ci_band_width)), use_container_width=True, config={"displayModeBar": False})
-st.markdown("</div>", unsafe_allow_html=True)
+with st.container(border=True):
+    st.subheader("FB Velo by CI Band", anchor=False)
+    st.plotly_chart(build_band_chart(summary, int(ci_band_width)), use_container_width=True, config={"displayModeBar": False})
 
-st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-st.markdown("<h3 style='margin:0;color:#0A1F44;'>CI vs YTD FB Velo</h3>", unsafe_allow_html=True)
-st.plotly_chart(build_scatter(summary, show_labels, float(ci_lookup)), use_container_width=True, config={"displayModeBar": False})
-st.markdown("</div>", unsafe_allow_html=True)
+with st.container(border=True):
+    st.subheader("CI vs YTD FB Velo", anchor=False)
+    st.plotly_chart(build_scatter(summary, show_labels, float(ci_lookup)), use_container_width=True, config={"displayModeBar": False})
 
-st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-st.markdown("<h3 style='margin:0 0 14px;color:#0A1F44;'>Pitcher Results</h3>", unsafe_allow_html=True)
-if summary.empty:
-    st.info("No matching pitchers.")
-else:
-    display = summary[[
-        "athlete", "team", "avg_fb_velo", "ytd_as_of_date", "avg_ci", "fb_records", "ci_jumps", "ci_test_dates", "first_ci_date", "last_ci_date",
-    ]].copy()
-    display.columns = [
-        "Pitcher", "Team", "Last YTD FB Velo", "YTD FB As Of", "Average CI", "FB Records", "CI Jumps", "CI Test Dates", "First CI", "Last CI",
-    ]
-    for date_col in ["YTD FB As Of", "First CI", "Last CI"]:
-        display[date_col] = display[date_col].map(fmt_date)
-    display["Last YTD FB Velo"] = display["Last YTD FB Velo"].round(2)
-    display["Average CI"] = display["Average CI"].round(2)
-    st.dataframe(
-        display,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Last YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
-            "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
-        },
-    )
-st.markdown("</div>", unsafe_allow_html=True)
+with st.container(border=True):
+    st.subheader("Pitcher Results", anchor=False)
+    if summary.empty:
+        st.info("No matching pitchers.")
+    else:
+        display = summary[[
+            "athlete", "team", "avg_fb_velo", "ytd_as_of_date", "avg_ci", "fb_records", "ci_jumps", "ci_test_dates", "first_ci_date", "last_ci_date",
+        ]].copy()
+        display.columns = [
+            "Pitcher", "Team", "Last YTD FB Velo", "YTD FB As Of", "Average CI", "FB Records", "CI Jumps", "CI Test Dates", "First CI", "Last CI",
+        ]
+        for date_col in ["YTD FB As Of", "First CI", "Last CI"]:
+            display[date_col] = display[date_col].map(fmt_date)
+        display["Last YTD FB Velo"] = display["Last YTD FB Velo"].round(2)
+        display["Average CI"] = display["Average CI"].round(2)
+        st.dataframe(
+            display,
+            hide_index=True,
+            use_container_width=True,
+            height=min(620, 44 + 36 * (len(display) + 1)),
+            column_config={
+                "Last YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
+            },
+        )
 
