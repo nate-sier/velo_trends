@@ -1,0 +1,640 @@
+"""
+FB Velo × CI — Streamlit deployment-ready dashboard.
+
+For every selected date window, each matched pitcher gets:
+  * The last ytd_fb_velo available inside that window
+  * The mean raw concentric impulse from Jump Data inside that same window
+
+Pitchers whose last in-window ytd_fb_velo is below 85 mph are excluded.
+"""
+from __future__ import annotations
+
+import html
+import os
+import re
+import unicodedata
+from datetime import datetime
+from pathlib import Path
+
+import gspread
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from google.oauth2.service_account import Credentials
+
+# -----------------------------------------------------------------------------
+# CONFIGURATION
+# -----------------------------------------------------------------------------
+DEFAULT_SHEET_ID = "1CF2n3fAt8jALZK6HIC80Un20ITScfSMZd4kXM4ZPMSo"
+DEFAULT_JUMP_TAB = "Jump Data"
+DEFAULT_VELO_TAB = "FB Velo"
+LOCAL_SERVICE_ACCOUNT_FILE = Path.home() / "Desktop" / "service_account.json"
+MIN_LAST_YTD_FB_VELO = 85.0
+
+# -----------------------------------------------------------------------------
+# DESIGN SYSTEM
+# -----------------------------------------------------------------------------
+BG = "#F6F8FC"
+CARD_BG = "#FFFFFF"
+NAVY = "#0A1F44"
+NAVY_MID = "#183B6D"
+ACCENT_RED = "#C8102E"
+BLUE = "#1E5AA8"
+GREEN = "#14805E"
+TEAL = "#0D7E8A"
+TEXT = "#162033"
+SUBTEXT = "#667085"
+BORDER = "#DDE4EE"
+GRID = "#E8EDF3"
+
+st.set_page_config(
+    page_title="YTD FB Velo × CI",
+    page_icon="⚾",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    f"""
+<style>
+    :root {{
+      --fb-bg: {BG}; --fb-card: {CARD_BG}; --fb-navy: {NAVY};
+      --fb-red: {ACCENT_RED}; --fb-text: {TEXT}; --fb-sub: {SUBTEXT};
+      --fb-border: {BORDER};
+    }}
+    .stApp {{ background: var(--fb-bg); color: var(--fb-text); }}
+    [data-testid="stSidebar"] {{ background: var(--fb-navy); }}
+    [data-testid="stSidebar"] * {{ color: #FFFFFF; }}
+    [data-testid="stSidebar"] [data-baseweb="select"] * {{ color: var(--fb-text); }}
+    [data-testid="stSidebar"] .stDateInput input,
+    [data-testid="stSidebar"] .stNumberInput input {{ color: var(--fb-text) !important; }}
+    [data-testid="stSidebar"] .stCaption {{ color: #B7C6DD !important; }}
+    .block-container {{ max-width: 1500px; padding-top: 2.0rem; padding-bottom: 2.5rem; }}
+    .metric-card {{
+      background: var(--fb-card); border: 1px solid var(--fb-border);
+      border-radius: 15px; padding: 18px 20px; min-height: 116px;
+      box-shadow: 0 6px 20px rgba(15, 35, 64, .06);
+    }}
+    .metric-accent {{ width: 34px; height: 4px; border-radius: 8px; margin-bottom: 15px; }}
+    .metric-label {{ color: var(--fb-sub); font-size: 11px; letter-spacing: .08em;
+                     font-weight: 700; text-transform: uppercase; margin-bottom: 7px; }}
+    .metric-value {{ color: var(--fb-navy); font-size: 28px; line-height: 1.05;
+                     font-weight: 750; margin: 0; }}
+    .metric-sub {{ color: var(--fb-sub); font-size: 12px; line-height: 1.35; }}
+    .section-card {{
+      background: var(--fb-card); border: 1px solid var(--fb-border);
+      border-radius: 15px; padding: 22px; box-shadow: 0 6px 20px rgba(15, 35, 64, .06);
+      margin-top: 1.25rem;
+    }}
+    .eyebrow {{ color: {ACCENT_RED}; font-size: 11px; letter-spacing: .1em;
+                 font-weight: 800; text-transform: uppercase; margin-bottom: 6px; }}
+    .section-eyebrow {{ color: {BLUE}; font-size: 11px; letter-spacing: .08em;
+                        font-weight: 800; text-transform: uppercase; margin-bottom: 4px; }}
+    .stButton button {{ border-radius: 10px; font-weight: 700; }}
+    .stDataFrame {{ border: 1px solid var(--fb-border); border-radius: 12px; overflow: hidden; }}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# -----------------------------------------------------------------------------
+# HELPERS
+# -----------------------------------------------------------------------------
+def first_existing(columns: list[str], candidates: list[str]) -> str | None:
+    """Return the first matching column name, case-insensitively."""
+    lookup = {str(col).strip().lower(): col for col in columns}
+    for candidate in candidates:
+        found = lookup.get(candidate.strip().lower())
+        if found is not None:
+            return found
+    return None
+
+
+def parse_sheet_dates(series: pd.Series) -> pd.Series:
+    """Parse normal dates and Google/Excel serial-date values safely."""
+    raw = series.copy()
+    parsed = pd.to_datetime(raw, errors="coerce")
+    missing = parsed.isna()
+    if missing.any():
+        numeric = pd.to_numeric(raw[missing], errors="coerce")
+        serial_mask = numeric.between(30000, 60000)
+        if serial_mask.any():
+            parsed.loc[numeric[serial_mask].index] = (
+                pd.Timestamp("1899-12-30") + pd.to_timedelta(numeric[serial_mask], unit="D")
+            )
+    return parsed.dt.normalize()
+
+
+def canonical_name(value) -> str:
+    """Create a stable name key across the two Google Sheet tabs."""
+    if pd.isna(value):
+        return ""
+
+    name = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
+    name = name.lower().strip()
+    if "," in name:
+        pieces = [piece.strip() for piece in name.split(",") if piece.strip()]
+        if len(pieces) >= 2:
+            name = " ".join(pieces[1:] + [pieces[0]])
+
+    tokens = re.findall(r"[a-z0-9]+", name)
+    suffixes = {"jr", "sr", "ii", "iii", "iv", "v"}
+    tokens = [token for token in tokens if token not in suffixes]
+    return " ".join(sorted(tokens))
+
+
+def fmt(value, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value):,.{digits}f}"
+
+
+def fmt_date(value) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    value = pd.Timestamp(value)
+    return f"{value.strftime('%b')} {value.day}, {value.year}"
+
+
+def secret_or_default(key: str, default: str) -> str:
+    try:
+        return str(st.secrets.get(key, default))
+    except Exception:
+        return default
+
+
+def get_credentials() -> Credentials:
+    """Use Streamlit secrets when deployed; fall back to local JSON for local runs."""
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+
+    try:
+        service_account_info = st.secrets.get("gcp_service_account")
+    except Exception:
+        service_account_info = None
+
+    if service_account_info:
+        return Credentials.from_service_account_info(dict(service_account_info), scopes=scopes)
+
+    local_file = Path(os.environ.get("SERVICE_ACCOUNT_FILE", str(LOCAL_SERVICE_ACCOUNT_FILE))).expanduser()
+    if local_file.exists():
+        return Credentials.from_service_account_file(str(local_file), scopes=scopes)
+
+    raise FileNotFoundError(
+        "No Google credentials were found. For local use, put service_account.json on your Desktop. "
+        "For Streamlit deployment, add [gcp_service_account] to the app's Secrets settings."
+    )
+
+
+def read_tab(client: gspread.Client, sheet_id: str, tab_name: str) -> pd.DataFrame:
+    worksheet = client.open_by_key(sheet_id).worksheet(tab_name)
+    return pd.DataFrame(worksheet.get_all_records())
+
+
+@st.cache_data(ttl=300, show_spinner="Loading Google Sheet data…")
+def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Load and normalize Jump Data + FB Velo from the configured Google Sheet."""
+    sheet_id = secret_or_default("SHEET_ID", DEFAULT_SHEET_ID)
+    jump_tab = secret_or_default("JUMP_TAB", DEFAULT_JUMP_TAB)
+    velo_tab = secret_or_default("VELO_TAB", DEFAULT_VELO_TAB)
+
+    creds = get_credentials()
+    client = gspread.authorize(creds)
+    jump_raw = read_tab(client, sheet_id, jump_tab)
+    velo_raw = read_tab(client, sheet_id, velo_tab)
+
+    if jump_raw.empty:
+        raise ValueError(f"The '{jump_tab}' tab did not return any rows.")
+    if velo_raw.empty:
+        raise ValueError(f"The '{velo_tab}' tab did not return any rows.")
+
+    # Jump Data
+    jump_raw.columns = jump_raw.columns.astype(str).str.strip()
+    jump_name_col = first_existing(jump_raw.columns.tolist(), ["Athlete", "athlete", "Player", "player", "Name", "name"])
+    jump_date_col = first_existing(jump_raw.columns.tolist(), ["Date", "date", "Test Date", "test_date"])
+    jump_ci_col = first_existing(jump_raw.columns.tolist(), ["Concentric Impulse [N s]", "Concentric Impulse", "CI"])
+    jump_team_col = first_existing(jump_raw.columns.tolist(), ["Team", "team", "Level", "level"])
+
+    missing_jump = [
+        label for label, col in {
+            "athlete name": jump_name_col,
+            "date": jump_date_col,
+            "concentric impulse": jump_ci_col,
+        }.items() if col is None
+    ]
+    if missing_jump:
+        raise ValueError(f"Jump Data is missing required column(s): {', '.join(missing_jump)}.")
+
+    jump = pd.DataFrame({
+        "athlete": jump_raw[jump_name_col].astype(str).str.strip(),
+        "date": parse_sheet_dates(jump_raw[jump_date_col]),
+        "ci": pd.to_numeric(jump_raw[jump_ci_col], errors="coerce"),
+        "team": jump_raw[jump_team_col].astype(str).str.strip() if jump_team_col else "Unassigned",
+    })
+    jump["name_key"] = jump["athlete"].map(canonical_name)
+    jump = jump[(jump["athlete"] != "") & (jump["name_key"] != "")].dropna(subset=["date", "ci"])
+    jump = jump.sort_values(["athlete", "date"]).reset_index(drop=True)
+
+    # FB Velo
+    velo_raw.columns = velo_raw.columns.astype(str).str.strip()
+    velo_name_col = first_existing(velo_raw.columns.tolist(), ["pitcher", "Pitcher", "athlete", "Athlete", "player", "Player", "Name", "name"])
+    velo_date_col = first_existing(velo_raw.columns.tolist(), ["game_date", "Game_Date", "Game Date", "date", "Date"])
+    velo_ytd_col = first_existing(velo_raw.columns.tolist(), [
+        "ytd_fb_velo", "YTD_FB_Velo", "YTD FB Velo", "YTD Fastball Velo",
+        "ytd fastball velo", "ytd_fastball_velo",
+    ])
+
+    missing_velo = [
+        label for label, col in {
+            "pitcher name": velo_name_col,
+            "game date": velo_date_col,
+            "ytd_fb_velo": velo_ytd_col,
+        }.items() if col is None
+    ]
+    if missing_velo:
+        raise ValueError(
+            f"FB Velo is missing required column(s): {', '.join(missing_velo)}. "
+            "This app requires ytd_fb_velo."
+        )
+
+    velo = pd.DataFrame({
+        "pitcher": velo_raw[velo_name_col].astype(str).str.strip(),
+        "date": parse_sheet_dates(velo_raw[velo_date_col]),
+        "ytd_fb_velo": pd.to_numeric(velo_raw[velo_ytd_col], errors="coerce"),
+    })
+    velo["name_key"] = velo["pitcher"].map(canonical_name)
+    velo = velo[(velo["pitcher"] != "") & (velo["name_key"] != "")].dropna(subset=["date", "ytd_fb_velo"])
+    velo = velo.sort_values(["pitcher", "date"], kind="stable").reset_index(drop=True)
+
+    status = (
+        f"Loaded {len(jump):,} Jump Data rows and {len(velo):,} FB Velo rows · "
+        f"{datetime.now().strftime('%I:%M %p').lstrip('0')}"
+    )
+    return jump, velo, status
+
+
+def build_summary(
+    jump: pd.DataFrame,
+    velo: pd.DataFrame,
+    start_date,
+    end_date,
+    team_filter: str,
+    min_velo_records: int,
+    min_ci_jumps: int,
+) -> pd.DataFrame:
+    """Create one matched pitcher-level row inside a shared selected date window."""
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+
+    jump_window = jump[(jump["date"] >= start) & (jump["date"] <= end)].copy()
+    velo_window = velo[(velo["date"] >= start) & (velo["date"] <= end)].copy()
+
+    # Team is the pitcher's most recent team in Jump Data, independent of window.
+    team_lookup = (
+        jump.sort_values("date")
+        .groupby("name_key", as_index=False)
+        .tail(1)[["name_key", "team"]]
+        .drop_duplicates("name_key")
+    )
+
+    jump_summary = (
+        jump_window.groupby("name_key", as_index=False)
+        .agg(
+            athlete=("athlete", "first"),
+            avg_ci=("ci", "mean"),
+            ci_jumps=("ci", "count"),
+            ci_test_dates=("date", "nunique"),
+            first_ci_date=("date", "min"),
+            last_ci_date=("date", "max"),
+        )
+    )
+
+    # Keep count of eligible FB rows, while charting only the last YTD velo in-window.
+    velo_window = velo_window.sort_values(["name_key", "date"], kind="stable")
+    velo_counts = (
+        velo_window.groupby("name_key", as_index=False)
+        .agg(
+            fb_records=("ytd_fb_velo", "count"),
+            first_fb_date=("date", "min"),
+            last_fb_date=("date", "max"),
+        )
+    )
+    latest_ytd = (
+        velo_window.groupby("name_key", as_index=False)
+        .tail(1)[["name_key", "ytd_fb_velo", "date"]]
+        .rename(columns={"ytd_fb_velo": "avg_fb_velo", "date": "ytd_as_of_date"})
+    )
+    velo_summary = velo_counts.merge(latest_ytd, on="name_key", how="inner")
+
+    summary = velo_summary.merge(jump_summary, on="name_key", how="inner")
+    summary = summary.merge(team_lookup, on="name_key", how="left")
+    summary["team"] = summary["team"].fillna("Unassigned")
+
+    # Automatically exclude pitchers below the requested velocity floor.
+    summary = summary[summary["avg_fb_velo"] >= MIN_LAST_YTD_FB_VELO].copy()
+    summary = summary[
+        (summary["fb_records"] >= max(1, int(min_velo_records))) &
+        (summary["ci_jumps"] >= max(1, int(min_ci_jumps)))
+    ].copy()
+
+    if team_filter != "All Teams":
+        summary = summary[summary["team"] == team_filter].copy()
+
+    return summary.sort_values("avg_fb_velo", ascending=False).reset_index(drop=True)
+
+
+def correlation_stats(summary: pd.DataFrame) -> tuple[float, float, float, float] | None:
+    if len(summary) < 2:
+        return None
+    x = summary["avg_ci"].to_numpy(dtype=float)
+    y = summary["avg_fb_velo"].to_numpy(dtype=float)
+    if np.isclose(np.std(x), 0) or np.isclose(np.std(y), 0):
+        return None
+    slope, intercept = np.polyfit(x, y, 1)
+    r = float(np.corrcoef(x, y)[0, 1])
+    return r, r * r, float(slope), float(intercept)
+
+
+def ci_band_summary(summary: pd.DataFrame, band_width: int) -> pd.DataFrame:
+    if summary.empty:
+        return pd.DataFrame(columns=["CI band", "Last YTD FB Velo", "Pitchers", "Average CI"])
+
+    width = max(1, int(band_width))
+    work = summary[["avg_ci", "avg_fb_velo"]].dropna().copy()
+    work["band_start"] = np.floor(work["avg_ci"] / width) * width
+    grouped = (
+        work.groupby("band_start", as_index=False)
+        .agg(
+            **{
+                "Last YTD FB Velo": ("avg_fb_velo", "mean"),
+                "Pitchers": ("avg_fb_velo", "count"),
+                "Average CI": ("avg_ci", "mean"),
+            }
+        )
+        .sort_values("band_start")
+    )
+    grouped["CI band"] = grouped["band_start"].map(lambda lower: f"{lower:.0f}–{lower + width:.0f} N·s")
+    grouped["Last YTD FB Velo"] = grouped["Last YTD FB Velo"].round(2)
+    grouped["Average CI"] = grouped["Average CI"].round(2)
+    grouped["Pitchers"] = grouped["Pitchers"].astype(int)
+    return grouped[["CI band", "Last YTD FB Velo", "Pitchers", "Average CI"]]
+
+
+def base_figure_layout(fig: go.Figure, height: int) -> go.Figure:
+    fig.update_layout(
+        paper_bgcolor=CARD_BG,
+        plot_bgcolor=CARD_BG,
+        font={"family": "Arial, sans-serif", "color": TEXT},
+        hoverlabel={"bgcolor": "#FFFFFF", "bordercolor": BORDER, "font": {"color": TEXT, "size": 13}, "align": "left"},
+        margin={"l": 64, "r": 26, "t": 18, "b": 58},
+        height=height,
+        showlegend=False,
+    )
+    return fig
+
+
+def build_scatter(summary: pd.DataFrame, show_labels: bool, ci_lookup: float | None) -> go.Figure:
+    fig = go.Figure()
+    if summary.empty:
+        fig.add_annotation(
+            text="No matched pitchers meet the selected window and minimum-data rules.",
+            showarrow=False, font={"size": 15, "color": SUBTEXT}, x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 560)
+
+    customdata = np.column_stack([
+        summary["athlete"], summary["team"], summary["fb_records"], summary["ci_jumps"],
+        summary["ci_test_dates"], summary["last_fb_date"].map(fmt_date),
+        summary["first_ci_date"].map(fmt_date), summary["last_ci_date"].map(fmt_date),
+    ])
+    fig.add_trace(go.Scatter(
+        x=summary["avg_ci"], y=summary["avg_fb_velo"],
+        mode="markers+text" if show_labels else "markers",
+        text=summary["athlete"] if show_labels else None,
+        textposition="top center", textfont={"size": 10, "color": NAVY},
+        marker={"size": 12, "color": ACCENT_RED, "opacity": 0.82, "line": {"color": "#FFFFFF", "width": 1.5}},
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Team: %{customdata[1]}<br>"
+            "Last YTD FB velo: %{y:.2f} mph<br>"
+            "Average CI: %{x:.2f} N·s<br><br>"
+            "FB records: %{customdata[2]} · YTD as of %{customdata[5]}<br>"
+            "CI jumps: %{customdata[3]} across %{customdata[4]} test dates · %{customdata[6]}–%{customdata[7]}"
+            "<extra></extra>"
+        ),
+    ))
+
+    stats = correlation_stats(summary)
+    if stats is not None:
+        r, r2, slope, intercept = stats
+        x_range = np.linspace(summary["avg_ci"].min(), summary["avg_ci"].max(), 100)
+        fig.add_trace(go.Scatter(
+            x=x_range, y=slope * x_range + intercept, mode="lines",
+            line={"color": NAVY_MID, "width": 2.5, "dash": "dash"}, hoverinfo="skip",
+        ))
+        fig.add_annotation(
+            text=f"r = {r:+.2f} · R² = {r2:.2f}",
+            x=0.02, y=0.98, xref="paper", yref="paper", xanchor="left", yanchor="top",
+            showarrow=False, font={"color": NAVY, "size": 13}, bgcolor="#FFFFFF",
+            bordercolor=BORDER, borderwidth=1, borderpad=7,
+        )
+        if ci_lookup is not None and np.isfinite(ci_lookup):
+            predicted = slope * float(ci_lookup) + intercept
+            fig.add_vline(x=float(ci_lookup), line_color=TEAL, line_width=1.5, line_dash="dot")
+            fig.add_hline(y=predicted, line_color=TEAL, line_width=1.5, line_dash="dot")
+            fig.add_trace(go.Scatter(
+                x=[float(ci_lookup)], y=[predicted], mode="markers",
+                marker={"size": 15, "color": TEAL, "symbol": "diamond", "line": {"color": "#FFFFFF", "width": 2}},
+                hovertemplate=(
+                    "<b>CI lookup</b><br>Average CI: %{x:.1f} N·s<br>"
+                    "Estimated last YTD FB velo: %{y:.2f} mph<extra></extra>"
+                ),
+            ))
+
+    fig.update_xaxes(
+        title="Average concentric impulse (N·s)", showgrid=True, gridcolor=GRID,
+        zeroline=False, linecolor=BORDER, tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Last YTD FB velocity (mph)", showgrid=True, gridcolor=GRID,
+        zeroline=False, linecolor=BORDER, tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 560)
+
+
+def build_band_chart(summary: pd.DataFrame, band_width: int) -> go.Figure:
+    bands = ci_band_summary(summary, band_width)
+    fig = go.Figure()
+    if bands.empty:
+        fig.add_annotation(
+            text="No matched pitchers are available for CI bands.", showarrow=False,
+            font={"size": 14, "color": SUBTEXT}, x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 380)
+
+    fig.add_trace(go.Bar(
+        x=bands["CI band"], y=bands["Last YTD FB Velo"], marker_color=BLUE,
+        text=[f"{velo:.1f}" for velo in bands["Last YTD FB Velo"]], textposition="outside", cliponaxis=False,
+        customdata=np.column_stack([bands["Pitchers"], bands["Average CI"]]),
+        hovertemplate=(
+            "<b>%{x}</b><br>Mean last YTD FB velo: %{y:.2f} mph<br>"
+            "Pitchers: %{customdata[0]}<br>Mean CI within band: %{customdata[1]:.2f} N·s<extra></extra>"
+        ),
+    ))
+    y_min = max(0, float(bands["Last YTD FB Velo"].min()) - 1.5)
+    y_max = float(bands["Last YTD FB Velo"].max()) + 1.25
+    fig.update_xaxes(
+        title="Pitcher average CI band", showgrid=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Mean last YTD FB velo (mph)", range=[y_min, y_max], showgrid=True, gridcolor=GRID,
+        zeroline=False, linecolor=BORDER, tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 380)
+
+
+def metric_card(title: str, value: str, accent: str) -> str:
+    return f"""
+    <div class="metric-card">
+      <div class="metric-accent" style="background:{accent};"></div>
+      <div class="metric-label">{html.escape(title)}</div>
+      <div class="metric-value">{html.escape(value)}</div>
+    </div>
+    """
+
+# -----------------------------------------------------------------------------
+# APP
+# -----------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("<h2 style='color:#FFFFFF;margin:0 0 16px;font-size:27px;'>YTD FB Velo × CI</h2>", unsafe_allow_html=True)
+    refresh = st.button("↻ Refresh", use_container_width=True, type="primary")
+
+if refresh:
+    load_source_data.clear()
+
+try:
+    jump, velo, status = load_source_data()
+except Exception as exc:
+    st.error(f"Could not load data. {exc}")
+    st.stop()
+
+all_dates = pd.concat([jump["date"], velo["date"]], ignore_index=True).dropna()
+min_date = all_dates.min().date()
+max_date = all_dates.max().date()
+default_start = max(pd.Timestamp(year=max_date.year, month=1, day=1).date(), min_date)
+
+with st.sidebar:
+    selected_dates = st.date_input(
+        "Date range",
+        value=(default_start, max_date),
+        min_value=min_date,
+        max_value=max_date,
+    )
+    if isinstance(selected_dates, tuple) and len(selected_dates) == 2:
+        start_date, end_date = selected_dates
+    else:
+        start_date = end_date = selected_dates
+
+    teams = ["All Teams"] + sorted(team for team in jump["team"].dropna().unique().tolist() if str(team).strip())
+    team_filter = st.selectbox("Team", teams)
+
+    st.markdown("---")
+    ci_lookup = st.number_input("CI lookup", min_value=0.0, step=1.0, value=280.0, format="%.1f")
+    ci_band_width = st.selectbox("CI band", [5, 10, 15, 20], index=1, format_func=lambda x: f"{x} N·s")
+
+    st.markdown("---")
+    min_velo_records = st.number_input("Min FB records", min_value=1, step=1, value=1)
+    min_ci_jumps = st.number_input("Min CI jumps", min_value=1, step=1, value=1)
+    show_labels = st.checkbox("Show names")
+
+summary = build_summary(
+    jump=jump,
+    velo=velo,
+    start_date=start_date,
+    end_date=end_date,
+    team_filter=team_filter,
+    min_velo_records=int(min_velo_records),
+    min_ci_jumps=int(min_ci_jumps),
+)
+stats = correlation_stats(summary)
+n_pitchers = len(summary)
+mean_velo = summary["avg_fb_velo"].mean() if n_pitchers else np.nan
+mean_ci = summary["avg_ci"].mean() if n_pitchers else np.nan
+r_text = f"{stats[0]:+.2f}" if stats is not None else "—"
+
+st.markdown("<h1 style='margin:0 0 22px;color:#0A1F44;'>YTD FB Velo × CI</h1>", unsafe_allow_html=True)
+
+period_text = f"{fmt_date(start_date)} – {fmt_date(end_date)}"
+cols = st.columns(4)
+metric_values = [
+    ("Pitchers", str(n_pitchers), BLUE),
+    ("Correlation", r_text, ACCENT_RED),
+    ("Last YTD FB Velo", f"{fmt(mean_velo)} mph", TEAL),
+    ("Average CI", f"{fmt(mean_ci)} N·s", GREEN),
+]
+for column, values in zip(cols, metric_values):
+    with column:
+        st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+# CI lookup
+estimated_velo = np.nan
+if stats is not None:
+    estimated_velo = stats[2] * float(ci_lookup) + stats[3]
+
+st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+lookup_left, lookup_right = st.columns(2)
+with lookup_left:
+    st.markdown("<div class='section-eyebrow' style='color:#0D7E8A;'>CI lookup</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='font-size:32px;font-weight:750;color:#0A1F44;margin-top:8px;'>{fmt(ci_lookup, 1)} N·s</div>", unsafe_allow_html=True)
+with lookup_right:
+    st.markdown("<div class='section-eyebrow'>Estimated FB velo</div>", unsafe_allow_html=True)
+    lookup_value = f"{fmt(estimated_velo)} mph" if pd.notna(estimated_velo) else "—"
+    st.markdown(f"<div style='font-size:32px;font-weight:750;color:#0D7E8A;margin-top:8px;'>{lookup_value}</div>", unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
+# CI bands, scatter, and table
+st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+st.markdown("<h3 style='margin:0;color:#0A1F44;'>FB Velo by CI Band</h3>", unsafe_allow_html=True)
+st.plotly_chart(build_band_chart(summary, int(ci_band_width)), use_container_width=True, config={"displayModeBar": False})
+st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+st.markdown("<h3 style='margin:0;color:#0A1F44;'>CI vs YTD FB Velo</h3>", unsafe_allow_html=True)
+st.plotly_chart(build_scatter(summary, show_labels, float(ci_lookup)), use_container_width=True, config={"displayModeBar": False})
+st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+st.markdown("<h3 style='margin:0 0 14px;color:#0A1F44;'>Pitcher Results</h3>", unsafe_allow_html=True)
+if summary.empty:
+    st.info("No matching pitchers.")
+else:
+    display = summary[[
+        "athlete", "team", "avg_fb_velo", "ytd_as_of_date", "avg_ci", "fb_records", "ci_jumps", "ci_test_dates", "first_ci_date", "last_ci_date",
+    ]].copy()
+    display.columns = [
+        "Pitcher", "Team", "Last YTD FB Velo", "YTD FB As Of", "Average CI", "FB Records", "CI Jumps", "CI Test Dates", "First CI", "Last CI",
+    ]
+    for date_col in ["YTD FB As Of", "First CI", "Last CI"]:
+        display[date_col] = display[date_col].map(fmt_date)
+    display["Last YTD FB Velo"] = display["Last YTD FB Velo"].round(2)
+    display["Average CI"] = display["Average CI"].round(2)
+    st.dataframe(
+        display,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Last YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
+            "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
+        },
+    )
+st.markdown("</div>", unsafe_allow_html=True)
+
