@@ -994,11 +994,9 @@ with within_tab:
         athlete_options = within_summary["name_key"].tolist()
         name_map = dict(zip(within_summary["name_key"], within_summary["athlete"]))
 
-        # Give this selector a stable key and force one clean redraw after a
-        # pitcher change. This avoids stale chart content inside st.tabs on
-        # some Streamlit/browser combinations.
+        # Keep the dropdown state stable, but give the selected player's plots
+        # their own keys so Streamlit/Plotly always replaces the old figures.
         selector_key = "within_individual_pitcher"
-        rendered_key = "within_individual_pitcher_rendered"
         if st.session_state.get(selector_key) not in athlete_options:
             st.session_state[selector_key] = athlete_options[0]
 
@@ -1008,10 +1006,6 @@ with within_tab:
             format_func=lambda key: name_map.get(key, key),
             key=selector_key,
         )
-
-        if st.session_state.get(rendered_key) != selected_key:
-            st.session_state[rendered_key] = selected_key
-            st.rerun()
 
         player_pairs = within_pairs[within_pairs["name_key"] == selected_key].sort_values("date").copy()
         player_row = within_summary[within_summary["name_key"] == selected_key].iloc[0]
@@ -1031,11 +1025,21 @@ with within_tab:
         with left:
             with st.container(border=True):
                 st.subheader("Δ CI vs Δ YTD FB Velo", anchor=False)
-                st.plotly_chart(build_within_scatter(player_pairs), use_container_width=True, config={"displayModeBar": False})
+                st.plotly_chart(
+                    build_within_scatter(player_pairs),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=f"within_scatter_{selected_key}_{bucket_mode}",
+                )
         with right:
             with st.container(border=True):
                 st.subheader("CI + YTD FB Velo", anchor=False)
-                st.plotly_chart(build_within_timeline(player_pairs), use_container_width=True, config={"displayModeBar": False})
+                st.plotly_chart(
+                    build_within_timeline(player_pairs),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=f"within_timeline_{selected_key}_{bucket_mode}",
+                )
 
         with st.container(border=True):
             st.subheader("Within-Individual Results", anchor=False)
@@ -1077,6 +1081,7 @@ with within_tab:
                 hide_index=True,
                 use_container_width=True,
                 height=min(460, 44 + 36 * (len(paired_display) + 1)),
+                key=f"within_bucket_table_{selected_key}_{bucket_mode}",
                 column_config={
                     "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
                     "YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
