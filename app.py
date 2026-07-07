@@ -90,11 +90,57 @@ st.markdown(
     }}
     [data-testid="stSidebar"] > div:first-child {{ padding-top: 1.5rem; }}
     [data-testid="stSidebar"] * {{ color: #FFFFFF; }}
-    [data-testid="stSidebar"] [data-baseweb="select"] * {{ color: var(--fb-text); }}
-    [data-testid="stSidebar"] .stDateInput input,
-    [data-testid="stSidebar"] .stNumberInput input {{ color: var(--fb-text) !important; }}
     [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{
       color: #DCE7F5 !important; font-weight: 700; font-size: .84rem;
+    }}
+    [data-testid="stSidebar"] [data-baseweb="select"] > div,
+    [data-testid="stSidebar"] .stDateInput > div > div,
+    [data-testid="stSidebar"] .stNumberInput > div > div,
+    [data-testid="stSidebar"] div[data-baseweb="input"] > div {{
+      background: #FFFFFF !important;
+      border: 1px solid var(--fb-border) !important;
+      border-radius: 14px !important;
+      min-height: 3rem;
+      box-shadow: none !important;
+    }}
+    [data-testid="stSidebar"] [data-baseweb="select"] div,
+    [data-testid="stSidebar"] [data-baseweb="select"] span,
+    [data-testid="stSidebar"] [data-baseweb="select"] input,
+    [data-testid="stSidebar"] .stDateInput input,
+    [data-testid="stSidebar"] .stNumberInput input,
+    [data-testid="stSidebar"] div[data-baseweb="input"] input {{
+      color: var(--fb-text) !important;
+      -webkit-text-fill-color: var(--fb-text) !important;
+      opacity: 1 !important;
+    }}
+    [data-testid="stSidebar"] [data-baseweb="select"] svg,
+    [data-testid="stSidebar"] .stDateInput svg,
+    [data-testid="stSidebar"] .stNumberInput svg {{
+      fill: var(--fb-text) !important;
+      color: var(--fb-text) !important;
+    }}
+    [data-testid="stSidebar"] div[role="listbox"],
+    [data-testid="stSidebar"] div[role="option"] {{
+      background: #FFFFFF !important;
+      color: var(--fb-text) !important;
+    }}
+    [data-testid="stSidebar"] div[role="listbox"] *,
+    [data-testid="stSidebar"] div[role="option"] * {{
+      color: var(--fb-text) !important;
+    }}
+    [data-testid="stSidebar"] [role="radiogroup"] {{ gap: .35rem !important; }}
+    [data-testid="stSidebar"] [role="radiogroup"] label,
+    [data-testid="stSidebar"] [role="radiogroup"] div[role="radio"] {{
+      background: #FFFFFF !important;
+      border: 1px solid var(--fb-border) !important;
+      border-radius: 12px !important;
+      color: var(--fb-text) !important;
+    }}
+    [data-testid="stSidebar"] [role="radiogroup"] label *,
+    [data-testid="stSidebar"] [role="radiogroup"] div[role="radio"] * {{
+      color: var(--fb-text) !important;
+      -webkit-text-fill-color: var(--fb-text) !important;
+      opacity: 1 !important;
     }}
     [data-testid="stSidebar"] hr {{ border-color: rgba(255,255,255,.13); }}
     [data-testid="stSidebar"] .stButton button {{
