@@ -89,59 +89,73 @@ st.markdown(
       border-right: 1px solid rgba(255,255,255,.08);
     }}
     [data-testid="stSidebar"] > div:first-child {{ padding-top: 1.5rem; }}
-    [data-testid="stSidebar"] * {{ color: #FFFFFF; }}
-    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{
-      color: #DCE7F5 !important; font-weight: 700; font-size: .84rem;
+
+    /* Keep sidebar labels/lightweight copy readable without overriding form controls. */
+    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p,
+    [data-testid="stSidebar"] .stMarkdown p,
+    [data-testid="stSidebar"] .stMarkdown span {{
+      color: #DCE7F5 !important;
     }}
-    [data-testid="stSidebar"] [data-baseweb="select"] > div,
+    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{
+      font-weight: 700; font-size: .84rem;
+    }}
+
+    /* Selectboxes: selected values and menu text must always be dark on white. */
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] div[role="combobox"],
+    [data-testid="stSidebar"] [data-baseweb="select"] > div {{
+      background: #FFFFFF !important;
+      border: 1px solid #DDE4EE !important;
+      border-radius: 14px !important;
+      min-height: 3rem !important;
+      box-shadow: none !important;
+    }}
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] *,
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] div[role="combobox"] *,
+    [data-testid="stSidebar"] [data-baseweb="select"] input,
+    [data-testid="stSidebar"] [data-baseweb="select"] span,
+    [data-testid="stSidebar"] [data-baseweb="select"] div {{
+      color: #162033 !important;
+      -webkit-text-fill-color: #162033 !important;
+      opacity: 1 !important;
+    }}
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] svg,
+    [data-testid="stSidebar"] [data-baseweb="select"] svg {{
+      fill: #162033 !important;
+      color: #162033 !important;
+      opacity: 1 !important;
+    }}
+
+    /* Native Streamlit input controls. */
     [data-testid="stSidebar"] .stDateInput > div > div,
     [data-testid="stSidebar"] .stNumberInput > div > div,
     [data-testid="stSidebar"] div[data-baseweb="input"] > div {{
       background: #FFFFFF !important;
-      border: 1px solid var(--fb-border) !important;
+      border: 1px solid #DDE4EE !important;
       border-radius: 14px !important;
       min-height: 3rem;
       box-shadow: none !important;
     }}
-    [data-testid="stSidebar"] [data-baseweb="select"] div,
-    [data-testid="stSidebar"] [data-baseweb="select"] span,
-    [data-testid="stSidebar"] [data-baseweb="select"] input,
     [data-testid="stSidebar"] .stDateInput input,
     [data-testid="stSidebar"] .stNumberInput input,
     [data-testid="stSidebar"] div[data-baseweb="input"] input {{
-      color: var(--fb-text) !important;
-      -webkit-text-fill-color: var(--fb-text) !important;
+      color: #162033 !important;
+      -webkit-text-fill-color: #162033 !important;
       opacity: 1 !important;
     }}
-    [data-testid="stSidebar"] [data-baseweb="select"] svg,
-    [data-testid="stSidebar"] .stDateInput svg,
-    [data-testid="stSidebar"] .stNumberInput svg {{
-      fill: var(--fb-text) !important;
-      color: var(--fb-text) !important;
-    }}
-    [data-testid="stSidebar"] div[role="listbox"],
-    [data-testid="stSidebar"] div[role="option"] {{
-      background: #FFFFFF !important;
-      color: var(--fb-text) !important;
-    }}
-    [data-testid="stSidebar"] div[role="listbox"] *,
-    [data-testid="stSidebar"] div[role="option"] * {{
-      color: var(--fb-text) !important;
-    }}
-    [data-testid="stSidebar"] [role="radiogroup"] {{ gap: .35rem !important; }}
-    [data-testid="stSidebar"] [role="radiogroup"] label,
-    [data-testid="stSidebar"] [role="radiogroup"] div[role="radio"] {{
-      background: #FFFFFF !important;
-      border: 1px solid var(--fb-border) !important;
-      border-radius: 12px !important;
-      color: var(--fb-text) !important;
-    }}
-    [data-testid="stSidebar"] [role="radiogroup"] label *,
-    [data-testid="stSidebar"] [role="radiogroup"] div[role="radio"] * {{
-      color: var(--fb-text) !important;
-      -webkit-text-fill-color: var(--fb-text) !important;
+
+    /* Dropdown menu can render in a portal outside the sidebar. */
+    div[data-baseweb="popover"],
+    div[role="listbox"] {{ background: #FFFFFF !important; }}
+    div[data-baseweb="popover"] *,
+    div[role="listbox"] *,
+    div[role="option"],
+    div[role="option"] * {{
+      color: #162033 !important;
+      -webkit-text-fill-color: #162033 !important;
       opacity: 1 !important;
     }}
+
     [data-testid="stSidebar"] hr {{ border-color: rgba(255,255,255,.13); }}
     [data-testid="stSidebar"] .stButton button {{
       background: {ACCENT_RED}; color: #FFFFFF; border: none; border-radius: 10px;
@@ -1034,11 +1048,12 @@ with st.sidebar:
     st.markdown("---")
     ci_lookup = st.number_input("CI lookup", min_value=0.0, step=1.0, value=280.0, format="%.1f")
     ci_band_width = st.selectbox("CI band", [5, 10, 15, 20], index=1, format_func=lambda x: f"{x} N·s")
-    ci_band_velo_stat = st.segmented_control(
+    ci_band_velo_stat = st.selectbox(
         "CI band FB velo",
-        options=["Mean", "Median"],
-        default="Mean",
-    ) if hasattr(st, "segmented_control") else st.selectbox("CI band FB velo", ["Mean", "Median"])
+        ["Mean", "Median"],
+        index=0,
+        key="ci_band_fb_velo_stat",
+    )
 
     st.markdown("---")
     min_velo_records = st.number_input("Min FB records", min_value=1, step=1, value=1)
