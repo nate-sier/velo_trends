@@ -1062,7 +1062,7 @@ with within_tab:
                 paired_display,
                 hide_index=True,
                 use_container_width=True,
-                height=min(460, 44 + 36 * (len(paired_display) + 1)),
+                height=min(460, 44 + 36 * (len(paired_display) + 1 
                 column_config={
                     "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
                     "YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
