@@ -441,9 +441,13 @@ def correlation_stats(summary: pd.DataFrame) -> tuple[float, float, float, float
     return r, r * r, float(slope), float(intercept)
 
 
-def ci_band_summary(summary: pd.DataFrame, band_width: int) -> pd.DataFrame:
+def ci_band_summary(summary: pd.DataFrame, band_width: int, velo_stat: str = "Mean") -> pd.DataFrame:
+    """Summarize last YTD FB velo by pitcher-average CI bucket using mean or median."""
+    stat = "Median" if str(velo_stat).strip().lower() == "median" else "Mean"
+    velo_col = f"{stat} Last YTD FB Velo"
+
     if summary.empty:
-        return pd.DataFrame(columns=["CI band", "Last YTD FB Velo", "Pitchers", "Average CI"])
+        return pd.DataFrame(columns=["CI band", velo_col, "Pitchers", "Average CI"])
 
     width = max(1, int(band_width))
     work = summary[["avg_ci", "avg_fb_velo"]].dropna().copy()
@@ -452,7 +456,7 @@ def ci_band_summary(summary: pd.DataFrame, band_width: int) -> pd.DataFrame:
         work.groupby("band_start", as_index=False)
         .agg(
             **{
-                "Last YTD FB Velo": ("avg_fb_velo", "mean"),
+                velo_col: ("avg_fb_velo", "median" if stat == "Median" else "mean"),
                 "Pitchers": ("avg_fb_velo", "count"),
                 "Average CI": ("avg_ci", "mean"),
             }
@@ -460,10 +464,10 @@ def ci_band_summary(summary: pd.DataFrame, band_width: int) -> pd.DataFrame:
         .sort_values("band_start")
     )
     grouped["CI band"] = grouped["band_start"].map(lambda lower: f"{lower:.0f}–{lower + width:.0f} N·s")
-    grouped["Last YTD FB Velo"] = grouped["Last YTD FB Velo"].round(2)
+    grouped[velo_col] = grouped[velo_col].round(2)
     grouped["Average CI"] = grouped["Average CI"].round(2)
     grouped["Pitchers"] = grouped["Pitchers"].astype(int)
-    return grouped[["CI band", "Last YTD FB Velo", "Pitchers", "Average CI"]]
+    return grouped[["CI band", velo_col, "Pitchers", "Average CI"]]
 
 
 def base_figure_layout(fig: go.Figure, height: int) -> go.Figure:
@@ -552,8 +556,10 @@ def build_scatter(summary: pd.DataFrame, show_labels: bool, ci_lookup: float | N
     return base_figure_layout(fig, 560)
 
 
-def build_band_chart(summary: pd.DataFrame, band_width: int) -> go.Figure:
-    bands = ci_band_summary(summary, band_width)
+def build_band_chart(summary: pd.DataFrame, band_width: int, velo_stat: str = "Mean") -> go.Figure:
+    stat = "Median" if str(velo_stat).strip().lower() == "median" else "Mean"
+    velo_col = f"{stat} Last YTD FB Velo"
+    bands = ci_band_summary(summary, band_width, stat)
     fig = go.Figure()
     if bands.empty:
         fig.add_annotation(
@@ -565,26 +571,146 @@ def build_band_chart(summary: pd.DataFrame, band_width: int) -> go.Figure:
         return base_figure_layout(fig, 380)
 
     fig.add_trace(go.Bar(
-        x=bands["CI band"], y=bands["Last YTD FB Velo"],
+        x=bands["CI band"], y=bands[velo_col],
         marker={"color": BLUE, "line": {"color": NAVY_MID, "width": 0.8}},
-        text=[f"{velo:.1f}" for velo in bands["Last YTD FB Velo"]], textposition="outside", cliponaxis=False,
+        text=[f"{velo:.1f}" for velo in bands[velo_col]], textposition="outside", cliponaxis=False,
         customdata=np.column_stack([bands["Pitchers"], bands["Average CI"]]),
         hovertemplate=(
-            "<b>%{x}</b><br>Mean last YTD FB velo: %{y:.2f} mph<br>"
+            f"<b>%{{x}}</b><br>{stat} last YTD FB velo: %{{y:.2f}} mph<br>"
             "Pitchers: %{customdata[0]}<br>Mean CI within band: %{customdata[1]:.2f} N·s<extra></extra>"
         ),
     ))
-    y_min = max(0, float(bands["Last YTD FB Velo"].min()) - 1.5)
-    y_max = float(bands["Last YTD FB Velo"].max()) + 1.25
+    y_min = max(0, float(bands[velo_col].min()) - 1.5)
+    y_max = float(bands[velo_col].max()) + 1.25
     fig.update_xaxes(
         title="Pitcher average CI band", showgrid=False, linecolor=BORDER,
         tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
     )
     fig.update_yaxes(
-        title="Mean last YTD FB velo (mph)", range=[y_min, y_max], showgrid=True, gridcolor=GRID,
+        title=f"{stat} last YTD FB velo (mph)", range=[y_min, y_max], showgrid=True, gridcolor=GRID,
         zeroline=False, linecolor=BORDER, tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
     )
     return base_figure_layout(fig, 380)
+
+
+
+def ci_band_members(
+    summary: pd.DataFrame,
+    band_width: int,
+    ci_band: str,
+    velo_stat: str = "Mean",
+) -> tuple[pd.DataFrame, float, str]:
+    """Return all pitchers in one CI band and flag them versus that band's mean/median velo."""
+    stat = "Median" if str(velo_stat).strip().lower() == "median" else "Mean"
+    width = max(1, int(band_width))
+
+    cols = ["athlete", "team", "avg_ci", "avg_fb_velo"]
+    if summary.empty or any(col not in summary.columns for col in cols):
+        return pd.DataFrame(columns=cols + ["CI band", "Status", "Difference"]), np.nan, stat
+
+    detail = summary[cols].dropna().copy()
+    detail["band_start"] = np.floor(detail["avg_ci"] / width) * width
+    detail["CI band"] = detail["band_start"].map(
+        lambda lower: f"{lower:.0f}–{lower + width:.0f} N·s"
+    )
+    detail = detail[detail["CI band"] == ci_band].copy()
+    if detail.empty:
+        return detail, np.nan, stat
+
+    reference = (
+        float(detail["avg_fb_velo"].median())
+        if stat == "Median"
+        else float(detail["avg_fb_velo"].mean())
+    )
+    detail["Difference"] = detail["avg_fb_velo"] - reference
+    detail["Status"] = np.where(
+        np.isclose(detail["Difference"], 0, atol=1e-10),
+        f"At {stat.lower()}",
+        np.where(detail["Difference"] > 0, f"Above {stat.lower()}", f"Below {stat.lower()}"),
+    )
+    detail["Display"] = detail.apply(
+        lambda row: f"{row['athlete']} · {row['avg_ci']:.1f} CI", axis=1
+    )
+    return detail.sort_values("avg_fb_velo", ascending=False).reset_index(drop=True), reference, stat
+
+
+def build_ci_band_member_chart(
+    summary: pd.DataFrame,
+    band_width: int,
+    ci_band: str,
+    velo_stat: str = "Mean",
+) -> go.Figure:
+    """Horizontal detail chart for every pitcher in a selected CI band."""
+    detail, reference, stat = ci_band_members(summary, band_width, ci_band, velo_stat)
+    fig = go.Figure()
+
+    if detail.empty:
+        fig.add_annotation(
+            text="No pitchers are available in this CI band.", showarrow=False,
+            font={"size": 14, "color": SUBTEXT}, x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 340)
+
+    status_style = [
+        (f"Above {stat.lower()}", GREEN),
+        (f"At {stat.lower()}", TEAL),
+        (f"Below {stat.lower()}", ACCENT_RED),
+    ]
+    category_order = detail["Display"].tolist()
+
+    for status, color in status_style:
+        sub = detail[detail["Status"] == status].copy()
+        if sub.empty:
+            continue
+        customdata = np.column_stack([
+            sub["athlete"], sub["team"], sub["avg_ci"], sub["Difference"], sub["Status"],
+        ])
+        fig.add_trace(go.Bar(
+            x=sub["avg_fb_velo"],
+            y=sub["Display"],
+            orientation="h",
+            name=status.title(),
+            marker={"color": color, "line": {"color": "#FFFFFF", "width": 1}},
+            text=[f"{value:.2f}" for value in sub["avg_fb_velo"]],
+            textposition="outside",
+            cliponaxis=False,
+            customdata=customdata,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Team: %{customdata[1]}<br>"
+                "Average CI: %{customdata[2]:.2f} N·s<br>"
+                "Last YTD FB velo: %{x:.2f} mph<br>"
+                f"{stat} difference: %{{customdata[3]:+.2f}} mph<br>"
+                "Flag: %{customdata[4]}<extra></extra>"
+            ),
+        ))
+
+    x_min = max(0, float(detail["avg_fb_velo"].min()) - 1.5)
+    x_max = float(detail["avg_fb_velo"].max()) + 1.25
+    fig.add_vline(
+        x=reference, line_color=NAVY_MID, line_width=2, line_dash="dash",
+        annotation_text=f"{stat} {reference:.2f}",
+        annotation_font_color=NAVY_MID,
+        annotation_position="top right",
+    )
+    fig.update_xaxes(
+        title="Last YTD FB velo (mph)", range=[x_min, x_max], showgrid=True, gridcolor=GRID,
+        zeroline=False, linecolor=BORDER, tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Pitcher · Average CI", categoryorder="array", categoryarray=category_order,
+        autorange="reversed", showgrid=False, linecolor=BORDER, tickfont={"color": TEXT, "size": 12},
+        title_font={"color": SUBTEXT}, automargin=True,
+    )
+    fig = base_figure_layout(fig, max(340, len(detail) * 42 + 125))
+    fig.update_layout(
+        showlegend=True,
+        legend={"orientation": "h", "x": 0, "y": 1.14, "font": {"color": SUBTEXT}},
+        margin={"l": 190, "r": 70, "t": 50, "b": 58},
+    )
+    return fig
 
 
 def metric_card(title: str, value: str, accent: str) -> str:
@@ -862,6 +988,11 @@ with st.sidebar:
     st.markdown("---")
     ci_lookup = st.number_input("CI lookup", min_value=0.0, step=1.0, value=280.0, format="%.1f")
     ci_band_width = st.selectbox("CI band", [5, 10, 15, 20], index=1, format_func=lambda x: f"{x} N·s")
+    ci_band_velo_stat = st.segmented_control(
+        "CI band FB velo",
+        options=["Mean", "Median"],
+        default="Mean",
+    ) if hasattr(st, "segmented_control") else st.selectbox("CI band FB velo", ["Mean", "Median"])
 
     st.markdown("---")
     min_velo_records = st.number_input("Min FB records", min_value=1, step=1, value=1)
@@ -937,9 +1068,44 @@ with overview_tab:
             lookup_value = f"{fmt(estimated_velo)} mph" if pd.notna(estimated_velo) else "—"
             st.markdown(f"<div class='lookup-value' style='color:#0D7E8A;'>{lookup_value}</div>", unsafe_allow_html=True)
 
+    ci_band_overview = ci_band_summary(summary, int(ci_band_width), ci_band_velo_stat)
+
     with st.container(border=True):
-        st.subheader("FB Velo by CI Band", anchor=False)
-        st.plotly_chart(build_band_chart(summary, int(ci_band_width)), use_container_width=True, config={"displayModeBar": False})
+        st.subheader(f"{ci_band_velo_stat} FB Velo by CI Band", anchor=False)
+        st.plotly_chart(
+            build_band_chart(summary, int(ci_band_width), ci_band_velo_stat),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"ci_band_chart_{ci_band_width}_{ci_band_velo_stat}_{team_filter}_{start_date}_{end_date}",
+        )
+
+    if not ci_band_overview.empty:
+        band_options = ci_band_overview["CI band"].tolist()
+        band_detail_key = "ci_band_detail_selector"
+        if st.session_state.get(band_detail_key) not in band_options:
+            st.session_state[band_detail_key] = band_options[0]
+
+        with st.container(border=True):
+            st.subheader("CI Band Pitchers", anchor=False)
+            selected_ci_band = st.selectbox(
+                "CI band",
+                band_options,
+                key=band_detail_key,
+            )
+            st.plotly_chart(
+                build_ci_band_member_chart(
+                    summary,
+                    int(ci_band_width),
+                    selected_ci_band,
+                    ci_band_velo_stat,
+                ),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=(
+                    f"ci_band_detail_{selected_ci_band}_{ci_band_width}_"
+                    f"{ci_band_velo_stat}_{team_filter}_{start_date}_{end_date}"
+                ),
+            )
 
     with st.container(border=True):
         st.subheader("CI vs YTD FB Velo", anchor=False)
