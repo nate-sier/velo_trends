@@ -31,6 +31,7 @@ DEFAULT_JUMP_TAB = "Jump Data"
 DEFAULT_VELO_TAB = "FB Velo"
 LOCAL_SERVICE_ACCOUNT_FILE = Path.home() / "Desktop" / "service_account.json"
 MIN_LAST_YTD_FB_VELO = 85.0
+POTENTIAL_CI_INCREASE = 10.0
 
 # Only these affiliate / roster groups are available in the dashboard.
 INCLUDED_TEAMS = [
@@ -1102,17 +1103,29 @@ with overview_tab:
     mean_velo = summary["avg_fb_velo"].mean() if n_pitchers else np.nan
     mean_ci = summary["avg_ci"].mean() if n_pitchers else np.nan
     r_text = f"{stats[0]:+.2f}" if stats is not None else "—"
+    potential_velo_increase = stats[2] * POTENTIAL_CI_INCREASE if stats is not None else np.nan
+    potential_velo_text = (
+        f"{potential_velo_increase:+.2f} mph"
+        if pd.notna(potential_velo_increase)
+        else "—"
+    )
 
-    cols = st.columns(4)
+    cols = st.columns(5)
     metric_values = [
         ("Pitchers", str(n_pitchers), BLUE),
         ("Correlation", r_text, ACCENT_RED),
         ("Last YTD FB Velo", f"{fmt(mean_velo)} mph", TEAL),
         ("Average CI", f"{fmt(mean_ci)} N·s", GREEN),
+        (f"Potential Velo Increase · +{POTENTIAL_CI_INCREASE:.0f} N·s CI", potential_velo_text, NAVY_MID),
     ]
     for column, values in zip(cols, metric_values):
         with column:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    st.caption(
+        "Potential velo increase is the current regression slope multiplied by a +10 N·s CI change. "
+        "It reflects the selected sample's association and is not a guaranteed individual response."
+    )
 
     estimated_velo = np.nan
     if stats is not None:
