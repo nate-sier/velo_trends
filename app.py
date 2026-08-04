@@ -1,11 +1,14 @@
 """
-FB Velo × CI — Streamlit deployment-ready dashboard.
+Performance × CI — Streamlit deployment-ready dashboard.
 
-For every selected date window, each matched pitcher gets:
-  * The last ytd_fb_velo available inside that window
-  * The mean raw concentric impulse from Jump Data inside that same window
+Pitching:
+  * Last in-window ytd_fb_velo matched to mean in-window raw CI.
+  * Pitchers below 85 mph are excluded.
 
-Pitchers whose last in-window ytd_fb_velo is below 85 mph are excluded.
+Hitting:
+  * One final monthly_avg_bat_speed value per hitter-month.
+  * Mean raw CI from the same calendar month.
+  * Cross-sectional and within-individual monthly analysis.
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ from google.oauth2.service_account import Credentials
 DEFAULT_SHEET_ID = "1CF2n3fAt8jALZK6HIC80Un20ITScfSMZd4kXM4ZPMSo"
 DEFAULT_JUMP_TAB = "Jump Data"
 DEFAULT_VELO_TAB = "FB Velo"
+DEFAULT_BAT_TAB = "PP_Sprint"
 LOCAL_SERVICE_ACCOUNT_FILE = Path.home() / "Desktop" / "service_account.json"
 MIN_LAST_YTD_FB_VELO = 85.0
 POTENTIAL_CI_INCREASE = 10.0
@@ -67,7 +71,7 @@ BORDER = "#DDE4EE"
 GRID = "#E8EDF3"
 
 st.set_page_config(
-    page_title="YTD FB Velo × CI",
+    page_title="Performance × CI",
     page_icon="⚾",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -334,21 +338,25 @@ def read_tab(client: gspread.Client, sheet_id: str, tab_name: str) -> pd.DataFra
 
 
 @st.cache_data(ttl=300, show_spinner="Loading Google Sheet data…")
-def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    """Load and normalize Jump Data + FB Velo from the configured Google Sheet."""
+def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    """Load and normalize Jump Data, FB Velo, and monthly bat-speed data."""
     sheet_id = secret_or_default("SHEET_ID", DEFAULT_SHEET_ID)
     jump_tab = secret_or_default("JUMP_TAB", DEFAULT_JUMP_TAB)
     velo_tab = secret_or_default("VELO_TAB", DEFAULT_VELO_TAB)
+    bat_tab = secret_or_default("BAT_TAB", DEFAULT_BAT_TAB)
 
     creds = get_credentials()
     client = gspread.authorize(creds)
     jump_raw = read_tab(client, sheet_id, jump_tab)
     velo_raw = read_tab(client, sheet_id, velo_tab)
+    bat_raw = read_tab(client, sheet_id, bat_tab)
 
     if jump_raw.empty:
         raise ValueError(f"The '{jump_tab}' tab did not return any rows.")
     if velo_raw.empty:
         raise ValueError(f"The '{velo_tab}' tab did not return any rows.")
+    if bat_raw.empty:
+        raise ValueError(f"The '{bat_tab}' tab did not return any rows.")
 
     # Jump Data
     jump_raw.columns = jump_raw.columns.astype(str).str.strip()
@@ -413,11 +421,82 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, str]:
     velo = velo[(velo["pitcher"] != "") & (velo["name_key"] != "")].dropna(subset=["date", "ytd_fb_velo"])
     velo = velo.sort_values(["pitcher", "date"], kind="stable").reset_index(drop=True)
 
+
+    # Monthly bat speed. The source repeats monthly_avg_bat_speed on each
+    # game row, so retain one final non-null value per hitter and month.
+    bat_raw.columns = bat_raw.columns.astype(str).str.strip()
+    bat_name_col = first_existing(
+        bat_raw.columns.tolist(),
+        [
+            "batter", "Batter", "hitter", "Hitter", "athlete", "Athlete",
+            "player", "Player", "Name", "name",
+        ],
+    )
+    bat_date_col = first_existing(
+        bat_raw.columns.tolist(),
+        ["game_date", "Game Date", "date", "Date"],
+    )
+    bat_speed_col = first_existing(
+        bat_raw.columns.tolist(),
+        [
+            "monthly_avg_bat_speed", "Monthly Avg Bat Speed",
+            "monthly avg bat speed", "monthly_average_bat_speed",
+            "Monthly Average Bat Speed",
+        ],
+    )
+    bat_team_col = first_existing(
+        bat_raw.columns.tolist(),
+        ["Team", "team", "Level", "level"],
+    )
+
+    missing_bat = [
+        label for label, col in {
+            "batter name": bat_name_col,
+            "game date": bat_date_col,
+            "monthly_avg_bat_speed": bat_speed_col,
+        }.items() if col is None
+    ]
+    if missing_bat:
+        raise ValueError(
+            f"Bat-speed tab is missing required column(s): {', '.join(missing_bat)}. "
+            "The default BAT_TAB is 'PP_Sprint'."
+        )
+
+    bat = pd.DataFrame({
+        "hitter": bat_raw[bat_name_col].astype(str).str.strip(),
+        "date": parse_sheet_dates(bat_raw[bat_date_col]),
+        "monthly_avg_bat_speed": pd.to_numeric(
+            bat_raw[bat_speed_col], errors="coerce"
+        ),
+        "team_raw": (
+            bat_raw[bat_team_col].astype(str).str.strip()
+            if bat_team_col else ""
+        ),
+    })
+    bat["team"] = bat["team_raw"].map(normalize_team)
+    bat["name_key"] = bat["hitter"].map(canonical_name)
+    bat = bat[
+        (bat["hitter"] != "") & (bat["name_key"] != "")
+    ].dropna(subset=["date", "monthly_avg_bat_speed"])
+    bat["month"] = bat["date"].dt.to_period("M").dt.to_timestamp()
+    bat = bat.sort_values(["name_key", "month", "date"], kind="stable")
+    bat = (
+        bat.groupby(["name_key", "month"], as_index=False)
+        .tail(1)[[
+            "name_key", "hitter", "month", "date",
+            "monthly_avg_bat_speed", "team",
+        ]]
+        .rename(columns={"date": "bat_speed_as_of"})
+        .sort_values(["hitter", "month"], kind="stable")
+        .reset_index(drop=True)
+    )
+
     status = (
-        f"Loaded {len(jump):,} Jump Data rows and {len(velo):,} FB Velo rows · "
+        f"Loaded {len(jump):,} Jump Data rows, {len(velo):,} FB Velo rows, "
+        f"and {len(bat):,} hitter-month bat-speed rows · "
         f"{datetime.now().strftime('%I:%M %p').lstrip('0')}"
     )
-    return jump, velo, status
+    return jump, velo, bat, status
 
 
 def build_summary(
@@ -1008,24 +1087,612 @@ def build_within_timeline(player_pairs: pd.DataFrame) -> go.Figure:
     return base_figure_layout(fig, 360)
 
 
+
+
+# -----------------------------------------------------------------------------
+# MONTHLY BAT SPEED × CI
+# -----------------------------------------------------------------------------
+def build_bat_monthly_pairs(
+    jump: pd.DataFrame,
+    bat: pd.DataFrame,
+    start_date,
+    end_date,
+    team_filter: str,
+    min_ci_jumps: int,
+) -> pd.DataFrame:
+    """Match calendar-month CI averages to monthly_avg_bat_speed."""
+    start_month = pd.Timestamp(start_date).to_period("M").start_time.normalize()
+    end_month = pd.Timestamp(end_date).to_period("M").start_time.normalize()
+
+    jump_monthly = jump.copy()
+    jump_monthly["month"] = jump_monthly["date"].dt.to_period("M").dt.to_timestamp()
+    jump_monthly = jump_monthly[
+        (jump_monthly["month"] >= start_month)
+        & (jump_monthly["month"] <= end_month)
+    ]
+    ci_monthly = (
+        jump_monthly.groupby(["name_key", "month"], as_index=False)
+        .agg(
+            athlete=("athlete", "first"),
+            avg_ci=("ci", "mean"),
+            ci_jumps=("ci", "count"),
+            ci_test_dates=("date", "nunique"),
+            first_ci_date=("date", "min"),
+            last_ci_date=("date", "max"),
+        )
+    )
+
+    team_lookup = (
+        jump.sort_values("date")
+        .groupby("name_key", as_index=False)
+        .tail(1)[["name_key", "team"]]
+        .drop_duplicates("name_key")
+        .rename(columns={"team": "current_team"})
+    )
+
+    bat_window = bat[
+        (bat["month"] >= start_month) & (bat["month"] <= end_month)
+    ].copy()
+    pairs = ci_monthly.merge(
+        bat_window, on=["name_key", "month"], how="inner"
+    )
+    pairs = pairs.merge(team_lookup, on="name_key", how="left")
+    pairs["team"] = pairs["current_team"].combine_first(pairs["team"])
+    pairs = pairs.drop(columns=["current_team"])
+    pairs["team"] = pairs["team"].fillna("Unassigned")
+    pairs = pairs[
+        pairs["ci_jumps"] >= max(1, int(min_ci_jumps))
+    ].copy()
+
+    if team_filter != "All Teams":
+        pairs = pairs[pairs["team"] == team_filter].copy()
+
+    pairs["month_label"] = pairs["month"].dt.strftime("%b %Y")
+    pairs["observation"] = (
+        pairs["athlete"] + " · " + pairs["month_label"]
+    )
+    return pairs.sort_values(
+        ["month", "athlete"], kind="stable"
+    ).reset_index(drop=True)
+
+
+def bat_correlation_stats(
+    pairs: pd.DataFrame,
+) -> tuple[float, float, float, float] | None:
+    if len(pairs) < 2:
+        return None
+    x = pairs["avg_ci"].to_numpy(dtype=float)
+    y = pairs["monthly_avg_bat_speed"].to_numpy(dtype=float)
+    if np.isclose(np.std(x), 0) or np.isclose(np.std(y), 0):
+        return None
+    slope, intercept = np.polyfit(x, y, 1)
+    r = float(np.corrcoef(x, y)[0, 1])
+    return r, r * r, float(slope), float(intercept)
+
+
+def bat_ci_band_summary(
+    pairs: pd.DataFrame,
+    band_width: int,
+    bat_stat: str = "Mean",
+) -> pd.DataFrame:
+    stat = "Median" if str(bat_stat).strip().lower() == "median" else "Mean"
+    speed_col = f"{stat} Monthly Bat Speed"
+    if pairs.empty:
+        return pd.DataFrame(
+            columns=[
+                "CI band", speed_col, "Hitter-Months", "Hitters", "Average CI"
+            ]
+        )
+
+    width = max(1, int(band_width))
+    work = pairs[
+        ["name_key", "avg_ci", "monthly_avg_bat_speed"]
+    ].dropna().copy()
+    work["band_start"] = np.floor(work["avg_ci"] / width) * width
+    grouped = (
+        work.groupby("band_start", as_index=False)
+        .agg(
+            **{
+                speed_col: (
+                    "monthly_avg_bat_speed",
+                    "median" if stat == "Median" else "mean",
+                ),
+                "Hitter-Months": ("monthly_avg_bat_speed", "count"),
+                "Hitters": ("name_key", "nunique"),
+                "Average CI": ("avg_ci", "mean"),
+            }
+        )
+        .sort_values("band_start")
+    )
+    grouped["CI band"] = grouped["band_start"].map(
+        lambda lower: f"{lower:.0f}–{lower + width:.0f} N·s"
+    )
+    grouped[speed_col] = grouped[speed_col].round(2)
+    grouped["Average CI"] = grouped["Average CI"].round(2)
+    return grouped[
+        ["CI band", speed_col, "Hitter-Months", "Hitters", "Average CI"]
+    ]
+
+
+def build_bat_scatter(
+    pairs: pd.DataFrame,
+    show_labels: bool,
+    ci_lookup: float | None,
+) -> go.Figure:
+    fig = go.Figure()
+    if pairs.empty:
+        fig.add_annotation(
+            text="No matched hitter-months meet the selected rules.",
+            showarrow=False,
+            font={"size": 15, "color": SUBTEXT},
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 560)
+
+    customdata = np.column_stack([
+        pairs["athlete"],
+        pairs["team"],
+        pairs["month_label"],
+        pairs["ci_jumps"],
+        pairs["ci_test_dates"],
+        pairs["first_ci_date"].map(fmt_date),
+        pairs["last_ci_date"].map(fmt_date),
+        pairs["bat_speed_as_of"].map(fmt_date),
+    ])
+    fig.add_trace(go.Scatter(
+        x=pairs["avg_ci"],
+        y=pairs["monthly_avg_bat_speed"],
+        mode="markers+text" if show_labels else "markers",
+        text=pairs["observation"] if show_labels else None,
+        textposition="top center",
+        textfont={"size": 9, "color": NAVY},
+        marker={
+            "size": 13,
+            "color": BLUE,
+            "opacity": 0.86,
+            "line": {"color": "#FFFFFF", "width": 2},
+        },
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b> · %{customdata[2]}<br>"
+            "Team: %{customdata[1]}<br>"
+            "Monthly average bat speed: %{y:.2f} mph<br>"
+            "Monthly average CI: %{x:.2f} N·s<br><br>"
+            "CI jumps: %{customdata[3]} across %{customdata[4]} dates · "
+            "%{customdata[5]}–%{customdata[6]}<br>"
+            "Bat-speed value as of %{customdata[7]}<extra></extra>"
+        ),
+    ))
+
+    stats = bat_correlation_stats(pairs)
+    if stats is not None:
+        r, r2, slope, intercept = stats
+        x_range = np.linspace(
+            pairs["avg_ci"].min(), pairs["avg_ci"].max(), 100
+        )
+        fig.add_trace(go.Scatter(
+            x=x_range,
+            y=slope * x_range + intercept,
+            mode="lines",
+            line={"color": NAVY_MID, "width": 2.5, "dash": "dash"},
+            hoverinfo="skip",
+        ))
+        fig.add_annotation(
+            text=f"r = {r:+.2f} · R² = {r2:.2f}",
+            x=0.02,
+            y=0.98,
+            xref="paper",
+            yref="paper",
+            xanchor="left",
+            yanchor="top",
+            showarrow=False,
+            font={"color": NAVY, "size": 13},
+            bgcolor="#FFFFFF",
+            bordercolor=BORDER,
+            borderwidth=1,
+            borderpad=7,
+        )
+        if ci_lookup is not None and np.isfinite(ci_lookup):
+            predicted = slope * float(ci_lookup) + intercept
+            fig.add_vline(
+                x=float(ci_lookup),
+                line_color=TEAL,
+                line_width=1.5,
+                line_dash="dot",
+            )
+            fig.add_hline(
+                y=predicted,
+                line_color=TEAL,
+                line_width=1.5,
+                line_dash="dot",
+            )
+            fig.add_trace(go.Scatter(
+                x=[float(ci_lookup)],
+                y=[predicted],
+                mode="markers",
+                marker={
+                    "size": 15,
+                    "color": TEAL,
+                    "symbol": "diamond",
+                    "line": {"color": "#FFFFFF", "width": 2},
+                },
+                hovertemplate=(
+                    "<b>CI lookup</b><br>"
+                    "Monthly average CI: %{x:.1f} N·s<br>"
+                    "Estimated monthly average bat speed: %{y:.2f} mph"
+                    "<extra></extra>"
+                ),
+            ))
+
+    fig.update_xaxes(
+        title="Monthly average concentric impulse (N·s)",
+        showgrid=True,
+        gridcolor=GRID,
+        zeroline=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Monthly average bat speed (mph)",
+        showgrid=True,
+        gridcolor=GRID,
+        zeroline=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 560)
+
+
+def build_bat_band_chart(
+    pairs: pd.DataFrame,
+    band_width: int,
+    bat_stat: str = "Mean",
+) -> go.Figure:
+    stat = "Median" if str(bat_stat).strip().lower() == "median" else "Mean"
+    speed_col = f"{stat} Monthly Bat Speed"
+    bands = bat_ci_band_summary(pairs, band_width, stat)
+    fig = go.Figure()
+    if bands.empty:
+        fig.add_annotation(
+            text="No matched hitter-months are available for CI bands.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 380)
+
+    fig.add_trace(go.Bar(
+        x=bands["CI band"],
+        y=bands[speed_col],
+        marker={"color": BLUE, "line": {"color": NAVY_MID, "width": 0.8}},
+        text=[f"{speed:.1f}" for speed in bands[speed_col]],
+        textposition="outside",
+        cliponaxis=False,
+        customdata=np.column_stack([
+            bands["Hitter-Months"],
+            bands["Hitters"],
+            bands["Average CI"],
+        ]),
+        hovertemplate=(
+            f"<b>%{{x}}</b><br>{stat} monthly bat speed: %{{y:.2f}} mph<br>"
+            "Hitter-months: %{customdata[0]}<br>"
+            "Hitters: %{customdata[1]}<br>"
+            "Mean CI within band: %{customdata[2]:.2f} N·s"
+            "<extra></extra>"
+        ),
+    ))
+    y_min = max(0, float(bands[speed_col].min()) - 2.0)
+    y_max = float(bands[speed_col].max()) + 1.5
+    fig.update_xaxes(
+        title="Monthly average CI band",
+        showgrid=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title=f"{stat} monthly average bat speed (mph)",
+        range=[y_min, y_max],
+        showgrid=True,
+        gridcolor=GRID,
+        zeroline=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 380)
+
+
+
+
+def build_bat_within_pairs(monthly_pairs: pd.DataFrame) -> pd.DataFrame:
+    pairs = monthly_pairs.sort_values(
+        ["name_key", "month"], kind="stable"
+    ).copy()
+    if pairs.empty:
+        pairs["delta_ci"] = pd.Series(dtype=float)
+        pairs["delta_bat_speed"] = pd.Series(dtype=float)
+        return pairs
+
+    first_ci = pairs.groupby("name_key")["avg_ci"].transform("first")
+    first_bat = pairs.groupby("name_key")[
+        "monthly_avg_bat_speed"
+    ].transform("first")
+    pairs["delta_ci"] = pairs["avg_ci"] - first_ci
+    pairs["delta_bat_speed"] = (
+        pairs["monthly_avg_bat_speed"] - first_bat
+    )
+    return pairs
+
+
+def build_bat_within_summary(
+    pairs: pd.DataFrame,
+    min_paired_months: int,
+) -> pd.DataFrame:
+    rows = []
+    required = max(3, int(min_paired_months))
+    columns = [
+        "name_key", "athlete", "team", "paired_months", "r", "r2",
+        "slope", "first_month", "last_month", "delta_ci",
+        "delta_bat_speed",
+    ]
+    if pairs.empty:
+        return pd.DataFrame(columns=columns)
+
+    for name_key, grp in pairs.groupby("name_key", sort=False):
+        grp = grp.sort_values("month")
+        n = len(grp)
+        if n < required:
+            continue
+
+        x = grp["delta_ci"].to_numpy(dtype=float)
+        y = grp["delta_bat_speed"].to_numpy(dtype=float)
+        if np.isclose(np.std(x), 0) or np.isclose(np.std(y), 0):
+            r = np.nan
+            r2 = np.nan
+            slope = np.nan
+        else:
+            slope, _ = np.polyfit(x, y, 1)
+            r = float(np.corrcoef(x, y)[0, 1])
+            r2 = r * r
+
+        rows.append({
+            "name_key": name_key,
+            "athlete": grp["athlete"].iloc[0],
+            "team": grp["team"].iloc[0],
+            "paired_months": n,
+            "r": r,
+            "r2": r2,
+            "slope": slope,
+            "first_month": grp["month"].iloc[0],
+            "last_month": grp["month"].iloc[-1],
+            "delta_ci": grp["delta_ci"].iloc[-1],
+            "delta_bat_speed": grp["delta_bat_speed"].iloc[-1],
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows).sort_values(
+        ["r", "paired_months"],
+        ascending=[False, False],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+def build_bat_within_scatter(player_pairs: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if player_pairs.empty:
+        fig.add_annotation(
+            text="No monthly CI and bat-speed pairs for this hitter.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 470)
+
+    customdata = np.column_stack([
+        player_pairs["month_label"],
+        player_pairs["avg_ci"],
+        player_pairs["monthly_avg_bat_speed"],
+        player_pairs["ci_jumps"],
+        player_pairs["last_ci_date"].map(fmt_date),
+    ])
+    fig.add_trace(go.Scatter(
+        x=player_pairs["delta_ci"],
+        y=player_pairs["delta_bat_speed"],
+        mode="markers+text",
+        text=player_pairs["month_label"],
+        textposition="top center",
+        textfont={"size": 10, "color": NAVY},
+        marker={
+            "size": 13,
+            "color": BLUE,
+            "opacity": 0.9,
+            "line": {"color": "#FFFFFF", "width": 2},
+        },
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Δ CI: %{x:+.2f} N·s<br>"
+            "Δ monthly bat speed: %{y:+.2f} mph<br><br>"
+            "Monthly CI: %{customdata[1]:.2f} N·s · "
+            "%{customdata[3]} jumps<br>"
+            "Last CI test: %{customdata[4]}<br>"
+            "Monthly average bat speed: %{customdata[2]:.2f} mph"
+            "<extra></extra>"
+        ),
+    ))
+    fig.add_vline(x=0, line_color="#AAB5C5", line_width=1)
+    fig.add_hline(y=0, line_color="#AAB5C5", line_width=1)
+
+    if (
+        len(player_pairs) >= 3
+        and not np.isclose(player_pairs["delta_ci"].std(), 0)
+        and not np.isclose(player_pairs["delta_bat_speed"].std(), 0)
+    ):
+        x = player_pairs["delta_ci"].to_numpy(dtype=float)
+        y = player_pairs["delta_bat_speed"].to_numpy(dtype=float)
+        slope, intercept = np.polyfit(x, y, 1)
+        r = float(np.corrcoef(x, y)[0, 1])
+        x_range = np.linspace(x.min(), x.max(), 100)
+        fig.add_trace(go.Scatter(
+            x=x_range,
+            y=slope * x_range + intercept,
+            mode="lines",
+            line={"color": NAVY_MID, "width": 2.5, "dash": "dash"},
+            hoverinfo="skip",
+        ))
+        fig.add_annotation(
+            text=f"r = {r:+.2f} · {len(player_pairs)} paired months",
+            x=0.02,
+            y=0.98,
+            xref="paper",
+            yref="paper",
+            xanchor="left",
+            yanchor="top",
+            showarrow=False,
+            font={"color": NAVY, "size": 13},
+            bgcolor="#FFFFFF",
+            bordercolor=BORDER,
+            borderwidth=1,
+            borderpad=7,
+        )
+
+    fig.update_xaxes(
+        title="Change in monthly average CI from first month (N·s)",
+        showgrid=True,
+        gridcolor=GRID,
+        zeroline=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Change in monthly average bat speed from first month (mph)",
+        showgrid=True,
+        gridcolor=GRID,
+        zeroline=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 470)
+
+
+def build_bat_within_timeline(player_pairs: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if player_pairs.empty:
+        fig.add_annotation(
+            text="No paired months.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 360)
+
+    fig.add_trace(go.Scatter(
+        x=player_pairs["month"],
+        y=player_pairs["avg_ci"],
+        mode="lines+markers",
+        name="Monthly average CI",
+        line={"color": BLUE, "width": 2.5},
+        marker={"size": 8},
+        customdata=player_pairs[["month_label"]],
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Monthly average CI: %{y:.2f} N·s<extra></extra>"
+        ),
+    ))
+    fig.add_trace(go.Scatter(
+        x=player_pairs["month"],
+        y=player_pairs["monthly_avg_bat_speed"],
+        mode="lines+markers",
+        name="Monthly average bat speed",
+        yaxis="y2",
+        line={"color": ACCENT_RED, "width": 2.5},
+        marker={"size": 8},
+        customdata=player_pairs[["month_label"]],
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Monthly average bat speed: %{y:.2f} mph<extra></extra>"
+        ),
+    ))
+    fig.update_layout(
+        yaxis={
+            "title": "Monthly average CI (N·s)",
+            "showgrid": True,
+            "gridcolor": GRID,
+            "zeroline": False,
+            "linecolor": BORDER,
+            "tickfont": {"color": SUBTEXT},
+            "title_font": {"color": SUBTEXT},
+        },
+        yaxis2={
+            "title": "Monthly average bat speed (mph)",
+            "overlaying": "y",
+            "side": "right",
+            "showgrid": False,
+            "zeroline": False,
+            "linecolor": BORDER,
+            "tickfont": {"color": SUBTEXT},
+            "title_font": {"color": SUBTEXT},
+        },
+        legend={
+            "orientation": "h",
+            "x": 0,
+            "y": 1.15,
+            "font": {"color": SUBTEXT},
+        },
+        showlegend=True,
+    )
+    fig.update_xaxes(
+        showgrid=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 360)
+
+
 # -----------------------------------------------------------------------------
 # APP
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("<div style='height:4px;width:42px;border-radius:999px;background:#C8102E;margin:2px 0 16px;'></div>", unsafe_allow_html=True)
-    st.markdown("<h2 style='color:#FFFFFF;margin:0 0 18px;font-size:27px;letter-spacing:-.03em;'>YTD FB Velo × CI</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='color:#FFFFFF;margin:0 0 18px;font-size:27px;letter-spacing:-.03em;'>Performance × CI</h2>", unsafe_allow_html=True)
     refresh = st.button("↻ Refresh", use_container_width=True, type="primary")
 
 if refresh:
     load_source_data.clear()
 
 try:
-    jump, velo, status = load_source_data()
+    jump, velo, bat, status = load_source_data()
 except Exception as exc:
     st.error(f"Could not load data. {exc}")
     st.stop()
 
-all_dates = pd.concat([jump["date"], velo["date"]], ignore_index=True).dropna()
+all_dates = pd.concat([jump["date"], velo["date"], bat["month"]], ignore_index=True).dropna()
 min_date = all_dates.min().date()
 max_date = all_dates.max().date()
 default_start = max(pd.Timestamp(year=max_date.year, month=1, day=1).date(), min_date)
@@ -1042,7 +1709,7 @@ with st.sidebar:
     else:
         start_date = end_date = selected_dates
 
-    available_teams = set(jump["team"].dropna().unique().tolist())
+    available_teams = set(jump["team"].dropna().unique().tolist()) | set(bat["team"].dropna().unique().tolist())
     teams = ["All Teams"] + [team for team in INCLUDED_TEAMS if team in available_teams]
     team_filter = st.selectbox("Team", teams)
 
@@ -1055,6 +1722,12 @@ with st.sidebar:
         index=0,
         key="ci_band_fb_velo_stat",
     )
+    ci_band_bat_stat = st.selectbox(
+        "CI band bat speed",
+        ["Mean", "Median"],
+        index=0,
+        key="ci_band_bat_speed_stat",
+    )
 
     st.markdown("---")
     min_velo_records = st.number_input("Min FB records", min_value=1, step=1, value=1)
@@ -1063,7 +1736,8 @@ with st.sidebar:
 
     st.markdown("---")
     bucket_mode = st.selectbox("Within bucket", ["Week", "Half-Month"])
-    min_paired_dates = st.number_input("Min paired buckets", min_value=3, max_value=30, step=1, value=3)
+    min_paired_dates = st.number_input("Min paired FB buckets", min_value=3, max_value=30, step=1, value=3)
+    min_paired_months = st.number_input("Min paired bat months", min_value=3, max_value=24, step=1, value=3)
 
 summary = build_summary(
     jump=jump,
@@ -1084,10 +1758,24 @@ within_pairs = build_within_individual_pairs(
 )
 within_summary = build_within_individual_summary(within_pairs, int(min_paired_dates))
 
+bat_monthly_pairs = build_bat_monthly_pairs(
+    jump=jump,
+    bat=bat,
+    start_date=start_date,
+    end_date=end_date,
+    team_filter=team_filter,
+    min_ci_jumps=int(min_ci_jumps),
+)
+bat_within_pairs = build_bat_within_pairs(bat_monthly_pairs)
+bat_within_summary = build_bat_within_summary(
+    bat_within_pairs,
+    int(min_paired_months),
+)
+
 period_text = f"{fmt_date(start_date)} – {fmt_date(end_date)}"
 title_col, filter_col = st.columns([4, 1])
 with title_col:
-    st.markdown("<h1 style='margin:0;color:#0A1F44;font-size:37px;font-weight:800;'>YTD FB Velo × CI</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='margin:0;color:#0A1F44;font-size:37px;font-weight:800;'>Performance × CI</h1>", unsafe_allow_html=True)
 with filter_col:
     st.markdown(
         f"<div style='text-align:right;color:#667085;font-weight:700;font-size:13px;padding-top:13px;'>{html.escape(team_filter)}</div>",
@@ -1095,7 +1783,10 @@ with filter_col:
     )
 st.markdown(f"<div style='color:#667085;font-size:13px;margin:3px 0 20px;'>{html.escape(period_text)}</div>", unsafe_allow_html=True)
 
-overview_tab, within_tab = st.tabs(["Overview", "Within Individual"])
+overview_tab, within_tab, bat_overview_tab, bat_within_tab = st.tabs([
+    "FB Velo Overview", "FB Velo Within Individual",
+    "Bat Speed Overview", "Bat Speed Within Individual",
+])
 
 with overview_tab:
     stats = correlation_stats(summary)
@@ -1327,5 +2018,476 @@ with within_tab:
                     "YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
                     "Δ CI": st.column_config.NumberColumn(format="%+.2f N·s"),
                     "Δ FB Velo": st.column_config.NumberColumn(format="%+.2f mph"),
+                },
+            )
+
+
+with bat_overview_tab:
+    bat_stats = bat_correlation_stats(bat_monthly_pairs)
+    n_hitter_months = len(bat_monthly_pairs)
+    n_hitters = (
+        bat_monthly_pairs["name_key"].nunique()
+        if n_hitter_months else 0
+    )
+    mean_bat_speed = (
+        bat_monthly_pairs["monthly_avg_bat_speed"].mean()
+        if n_hitter_months else np.nan
+    )
+    mean_monthly_ci = (
+        bat_monthly_pairs["avg_ci"].mean()
+        if n_hitter_months else np.nan
+    )
+    bat_r_text = (
+        f"{bat_stats[0]:+.2f}" if bat_stats is not None else "—"
+    )
+    potential_bat_increase = (
+        bat_stats[2] * POTENTIAL_CI_INCREASE
+        if bat_stats is not None else np.nan
+    )
+    potential_bat_text = (
+        f"{potential_bat_increase:+.2f} mph"
+        if pd.notna(potential_bat_increase) else "—"
+    )
+
+    top_cols = st.columns(3)
+    top_metrics = [
+        ("Hitter-Months", str(n_hitter_months), BLUE),
+        ("Hitters", str(n_hitters), NAVY_MID),
+        ("Correlation", bat_r_text, ACCENT_RED),
+    ]
+    for column, values in zip(top_cols, top_metrics):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    bottom_cols = st.columns(3)
+    bottom_metrics = [
+        (
+            "Monthly Avg Bat Speed",
+            f"{fmt(mean_bat_speed)} mph",
+            TEAL,
+        ),
+        (
+            "Monthly Average CI",
+            f"{fmt(mean_monthly_ci)} N·s",
+            GREEN,
+        ),
+        (
+            f"Potential Bat Speed Increase · +{POTENTIAL_CI_INCREASE:.0f} N·s CI",
+            potential_bat_text,
+            NAVY_MID,
+        ),
+    ]
+    for column, values in zip(bottom_cols, bottom_metrics):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    st.caption(
+        "Each observation is one hitter-month: mean raw CI from the "
+        "calendar month matched to the final monthly_avg_bat_speed value "
+        "for that same month. Potential bat-speed increase is the selected "
+        "sample's regression slope × 10 N·s and is not a guaranteed "
+        "individual response."
+    )
+
+    estimated_bat_speed = (
+        bat_stats[2] * float(ci_lookup) + bat_stats[3]
+        if bat_stats is not None else np.nan
+    )
+    with st.container(border=True):
+        st.subheader("Monthly CI Lookup", anchor=False)
+        lookup_left, lookup_right = st.columns(2)
+        with lookup_left:
+            st.markdown(
+                "<div class='metric-label'>Monthly Average CI</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div class='lookup-value' style='color:#0A1F44;'>"
+                f"{fmt(ci_lookup, 1)} N·s</div>",
+                unsafe_allow_html=True,
+            )
+        with lookup_right:
+            st.markdown(
+                "<div class='metric-label'>Estimated Monthly Avg Bat Speed</div>",
+                unsafe_allow_html=True,
+            )
+            lookup_value = (
+                f"{fmt(estimated_bat_speed)} mph"
+                if pd.notna(estimated_bat_speed) else "—"
+            )
+            st.markdown(
+                f"<div class='lookup-value' style='color:#0D7E8A;'>"
+                f"{lookup_value}</div>",
+                unsafe_allow_html=True,
+            )
+
+    with st.container(border=True):
+        st.subheader(
+            f"{ci_band_bat_stat} Monthly Bat Speed by CI Band",
+            anchor=False,
+        )
+        st.plotly_chart(
+            build_bat_band_chart(
+                bat_monthly_pairs,
+                int(ci_band_width),
+                ci_band_bat_stat,
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=(
+                f"bat_ci_band_{ci_band_width}_{ci_band_bat_stat}_"
+                f"{team_filter}_{start_date}_{end_date}"
+            ),
+        )
+
+    with st.container(border=True):
+        st.subheader(
+            "Monthly CI vs Monthly Average Bat Speed",
+            anchor=False,
+        )
+        st.plotly_chart(
+            build_bat_scatter(
+                bat_monthly_pairs,
+                show_labels,
+                float(ci_lookup),
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=(
+                f"bat_scatter_{team_filter}_{start_date}_{end_date}_"
+                f"{show_labels}_{ci_lookup}"
+            ),
+        )
+
+    with st.container(border=True):
+        st.subheader("Hitter-Month Results", anchor=False)
+        if bat_monthly_pairs.empty:
+            st.info("No matching hitter-months.")
+        else:
+            bat_display = bat_monthly_pairs[[
+                "athlete",
+                "team",
+                "month",
+                "monthly_avg_bat_speed",
+                "bat_speed_as_of",
+                "avg_ci",
+                "ci_jumps",
+                "ci_test_dates",
+                "first_ci_date",
+                "last_ci_date",
+            ]].copy()
+            bat_display.columns = [
+                "Hitter",
+                "Team",
+                "Month",
+                "Monthly Avg Bat Speed",
+                "Bat Speed As Of",
+                "Monthly Average CI",
+                "CI Jumps",
+                "CI Test Dates",
+                "First CI",
+                "Last CI",
+            ]
+            bat_display["Month"] = (
+                pd.to_datetime(bat_display["Month"])
+                .dt.strftime("%b %Y")
+            )
+            for date_col in [
+                "Bat Speed As Of", "First CI", "Last CI"
+            ]:
+                bat_display[date_col] = bat_display[date_col].map(
+                    fmt_date
+                )
+            bat_display["Monthly Avg Bat Speed"] = (
+                bat_display["Monthly Avg Bat Speed"].round(2)
+            )
+            bat_display["Monthly Average CI"] = (
+                bat_display["Monthly Average CI"].round(2)
+            )
+            st.dataframe(
+                bat_display,
+                hide_index=True,
+                use_container_width=True,
+                height=min(
+                    660,
+                    44 + 36 * (len(bat_display) + 1),
+                ),
+                column_config={
+                    "Monthly Avg Bat Speed":
+                        st.column_config.NumberColumn(
+                            format="%.2f mph"
+                        ),
+                    "Monthly Average CI":
+                        st.column_config.NumberColumn(
+                            format="%.2f N·s"
+                        ),
+                },
+            )
+
+
+with bat_within_tab:
+    bat_eligible_count = len(bat_within_summary)
+    bat_valid_r = (
+        bat_within_summary["r"].dropna()
+        if not bat_within_summary.empty
+        else pd.Series(dtype=float)
+    )
+    bat_mean_within_r = (
+        bat_valid_r.mean() if not bat_valid_r.empty else np.nan
+    )
+
+    cols = st.columns(4)
+    metrics = [
+        ("Hitters", str(bat_eligible_count), BLUE),
+        (
+            "Mean Within r",
+            f"{bat_mean_within_r:+.2f}"
+            if pd.notna(bat_mean_within_r)
+            else "—",
+            ACCENT_RED,
+        ),
+        (
+            "Paired Hitter-Months",
+            str(len(bat_within_pairs)),
+            TEAL,
+        ),
+        ("Bucket", "Calendar Month", GREEN),
+    ]
+    for column, values in zip(cols, metrics):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    if bat_within_summary.empty:
+        st.info("No hitters meet the paired-month rule.")
+    else:
+        hitter_options = bat_within_summary["name_key"].tolist()
+        hitter_name_map = dict(zip(
+            bat_within_summary["name_key"],
+            bat_within_summary["athlete"],
+        ))
+        hitter_selector_key = "bat_within_individual_hitter"
+        if (
+            st.session_state.get(hitter_selector_key)
+            not in hitter_options
+        ):
+            st.session_state[hitter_selector_key] = hitter_options[0]
+
+        selected_hitter_key = st.selectbox(
+            "Hitter",
+            hitter_options,
+            format_func=lambda key: hitter_name_map.get(key, key),
+            key=hitter_selector_key,
+        )
+        hitter_pairs = bat_within_pairs[
+            bat_within_pairs["name_key"] == selected_hitter_key
+        ].sort_values("month").copy()
+        hitter_row = bat_within_summary[
+            bat_within_summary["name_key"] == selected_hitter_key
+        ].iloc[0]
+
+        player_cols = st.columns(4)
+        player_metrics = [
+            (
+                "Paired Months",
+                str(int(hitter_row["paired_months"])),
+                BLUE,
+            ),
+            (
+                "Within r",
+                f"{hitter_row['r']:+.2f}"
+                if pd.notna(hitter_row["r"])
+                else "—",
+                ACCENT_RED,
+            ),
+            (
+                "Δ CI",
+                f"{hitter_row['delta_ci']:+.1f} N·s",
+                TEAL,
+            ),
+            (
+                "Δ Bat Speed",
+                f"{hitter_row['delta_bat_speed']:+.2f} mph",
+                GREEN,
+            ),
+        ]
+        for column, values in zip(player_cols, player_metrics):
+            with column:
+                st.markdown(
+                    metric_card(*values),
+                    unsafe_allow_html=True,
+                )
+
+        left, right = st.columns([1.25, 1])
+        with left:
+            with st.container(border=True):
+                st.subheader(
+                    "Δ Monthly CI vs Δ Monthly Bat Speed",
+                    anchor=False,
+                )
+                st.plotly_chart(
+                    build_bat_within_scatter(hitter_pairs),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=(
+                        f"bat_within_scatter_"
+                        f"{selected_hitter_key}"
+                    ),
+                )
+        with right:
+            with st.container(border=True):
+                st.subheader(
+                    "Monthly CI + Bat Speed",
+                    anchor=False,
+                )
+                st.plotly_chart(
+                    build_bat_within_timeline(hitter_pairs),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=(
+                        f"bat_within_timeline_"
+                        f"{selected_hitter_key}"
+                    ),
+                )
+
+        with st.container(border=True):
+            st.subheader(
+                "Within-Individual Hitter Results",
+                anchor=False,
+            )
+            hitter_summary_display = bat_within_summary[[
+                "athlete",
+                "team",
+                "paired_months",
+                "r",
+                "r2",
+                "delta_ci",
+                "delta_bat_speed",
+                "first_month",
+                "last_month",
+            ]].copy()
+            hitter_summary_display.columns = [
+                "Hitter",
+                "Team",
+                "Paired Months",
+                "Within r",
+                "R²",
+                "Δ CI",
+                "Δ Bat Speed",
+                "First Month",
+                "Last Month",
+            ]
+            for col in ["First Month", "Last Month"]:
+                hitter_summary_display[col] = (
+                    pd.to_datetime(hitter_summary_display[col])
+                    .dt.strftime("%b %Y")
+                )
+            hitter_summary_display["Within r"] = (
+                hitter_summary_display["Within r"].round(2)
+            )
+            hitter_summary_display["R²"] = (
+                hitter_summary_display["R²"].round(2)
+            )
+            hitter_summary_display["Δ CI"] = (
+                hitter_summary_display["Δ CI"].round(1)
+            )
+            hitter_summary_display["Δ Bat Speed"] = (
+                hitter_summary_display["Δ Bat Speed"].round(2)
+            )
+            st.dataframe(
+                hitter_summary_display,
+                hide_index=True,
+                use_container_width=True,
+                height=min(
+                    620,
+                    44 + 36 * (len(hitter_summary_display) + 1),
+                ),
+                column_config={
+                    "Within r":
+                        st.column_config.NumberColumn(
+                            format="%+.2f"
+                        ),
+                    "R²":
+                        st.column_config.NumberColumn(
+                            format="%.2f"
+                        ),
+                    "Δ CI":
+                        st.column_config.NumberColumn(
+                            format="%+.1f N·s"
+                        ),
+                    "Δ Bat Speed":
+                        st.column_config.NumberColumn(
+                            format="%+.2f mph"
+                        ),
+                },
+            )
+
+        with st.container(border=True):
+            st.subheader("Monthly Pair Data", anchor=False)
+            hitter_pair_display = hitter_pairs[[
+                "month",
+                "avg_ci",
+                "monthly_avg_bat_speed",
+                "bat_speed_as_of",
+                "ci_jumps",
+                "last_ci_date",
+                "delta_ci",
+                "delta_bat_speed",
+            ]].copy()
+            hitter_pair_display.columns = [
+                "Month",
+                "Monthly Average CI",
+                "Monthly Avg Bat Speed",
+                "Bat Speed As Of",
+                "CI Jumps",
+                "Last CI",
+                "Δ CI",
+                "Δ Bat Speed",
+            ]
+            hitter_pair_display["Month"] = (
+                pd.to_datetime(hitter_pair_display["Month"])
+                .dt.strftime("%b %Y")
+            )
+            for date_col in ["Bat Speed As Of", "Last CI"]:
+                hitter_pair_display[date_col] = (
+                    hitter_pair_display[date_col].map(fmt_date)
+                )
+            for col in [
+                "Monthly Average CI",
+                "Monthly Avg Bat Speed",
+                "Δ CI",
+                "Δ Bat Speed",
+            ]:
+                hitter_pair_display[col] = (
+                    hitter_pair_display[col].round(2)
+                )
+            st.dataframe(
+                hitter_pair_display,
+                hide_index=True,
+                use_container_width=True,
+                height=min(
+                    460,
+                    44 + 36 * (len(hitter_pair_display) + 1),
+                ),
+                key=(
+                    f"bat_monthly_pair_table_"
+                    f"{selected_hitter_key}"
+                ),
+                column_config={
+                    "Monthly Average CI":
+                        st.column_config.NumberColumn(
+                            format="%.2f N·s"
+                        ),
+                    "Monthly Avg Bat Speed":
+                        st.column_config.NumberColumn(
+                            format="%.2f mph"
+                        ),
+                    "Δ CI":
+                        st.column_config.NumberColumn(
+                            format="%+.2f N·s"
+                        ),
+                    "Δ Bat Speed":
+                        st.column_config.NumberColumn(
+                            format="%+.2f mph"
+                        ),
                 },
             )
