@@ -9,16 +9,17 @@ Pinch grip:
   * Pinch Grip tab uses Name, Date, Pinch - R, and Pinch - L.
   * Each row contributes the one populated hand as that athlete's pinch value.
   * Overview mirrors CI: mean in-window pinch matched to last in-window ytd_fb_velo.
-  * Within-individual mirrors CI: paired week/half-month changes from first bucket.
 
 Combined model:
-  * Multiple linear regression uses average in-window CI and pinch strength together.
-  * Both predictors are matched to the same final in-window ytd_fb_velo.
+  * One cross-sectional row per pitcher, matching average in-window CI and
+    average in-window pinch strength to the final in-window ytd_fb_velo.
+  * Multiple linear regression estimates the partial association of CI and
+    pinch strength with fastball velocity.
 
 Hitting:
   * One final monthly_avg_bat_speed value per hitter-month.
   * Mean raw CI from the same calendar month.
-  * Cross-sectional and within-individual monthly analysis.
+  * Cross-sectional monthly analysis.
 """
 from __future__ import annotations
 
@@ -975,6 +976,15 @@ def metric_card(title: str, value: str, accent: str) -> str:
       <div class="metric-value">{html.escape(value)}</div>
     </div>
     """
+
+
+def fisher_mean_correlation(values: pd.Series) -> float:
+    """Average correlations on Fisher's z scale rather than raw r."""
+    clean = pd.to_numeric(values, errors="coerce").dropna().to_numpy(dtype=float)
+    if len(clean) == 0:
+        return np.nan
+    clean = np.clip(clean, -0.999999, 0.999999)
+    return float(np.tanh(np.mean(np.arctanh(clean))))
 
 
 
@@ -2677,143 +2687,231 @@ def build_pinch_within_timeline(player_pairs: pd.DataFrame) -> go.Figure:
 
 
 # -----------------------------------------------------------------------------
-# COMBINED CI + PINCH MODEL
+# COMBINED CI + PINCH OVERVIEW MODEL
 # -----------------------------------------------------------------------------
-def build_combined_summary(
+def build_combined_overview_summary(
     ci_summary: pd.DataFrame,
     pinch_summary: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Keep pitchers who have eligible CI, pinch, and FB-velocity data."""
+    """Create one combined-model row per pitcher, matching the overview tabs."""
     columns = [
         "name_key", "athlete", "team", "avg_fb_velo", "ytd_as_of_date",
         "fb_records", "avg_ci", "ci_jumps", "ci_test_dates",
         "first_ci_date", "last_ci_date", "pinch_hand",
         "avg_pinch_strength", "pinch_tests", "pinch_test_dates",
-        "first_pinch_date", "last_pinch_date",
+        "first_pinch_date", "last_pinch_date", "observation",
     ]
     if ci_summary.empty or pinch_summary.empty:
         return pd.DataFrame(columns=columns)
 
+    ci_keep = ci_summary[[
+        "name_key", "athlete", "team", "avg_fb_velo", "ytd_as_of_date",
+        "fb_records", "avg_ci", "ci_jumps", "ci_test_dates",
+        "first_ci_date", "last_ci_date",
+    ]].copy()
     pinch_keep = pinch_summary[[
-        "name_key", "pinch_hand", "avg_pinch_strength", "pinch_tests",
-        "pinch_test_dates", "first_pinch_date", "last_pinch_date",
-    ]].drop_duplicates("name_key")
+        "name_key", "avg_fb_velo", "ytd_as_of_date", "pinch_hand",
+        "avg_pinch_strength", "pinch_tests", "pinch_test_dates",
+        "first_pinch_date", "last_pinch_date",
+    ]].copy().rename(columns={
+        "avg_fb_velo": "pinch_avg_fb_velo",
+        "ytd_as_of_date": "pinch_ytd_as_of_date",
+    })
 
-    combined = ci_summary.merge(pinch_keep, on="name_key", how="inner")
-    combined = combined.dropna(
-        subset=["avg_ci", "avg_pinch_strength", "avg_fb_velo"]
-    ).copy()
+    combined = ci_keep.merge(pinch_keep, on="name_key", how="inner")
+    if combined.empty:
+        return pd.DataFrame(columns=columns)
+
+    # The CI and pinch overview summaries independently select the same final
+    # in-window YTD velocity. Keep only exact pitcher-level matches.
+    velocity_agrees = np.isclose(
+        combined["avg_fb_velo"].to_numpy(dtype=float),
+        combined["pinch_avg_fb_velo"].to_numpy(dtype=float),
+        equal_nan=False,
+    )
+    date_agrees = (
+        pd.to_datetime(combined["ytd_as_of_date"]).dt.normalize()
+        == pd.to_datetime(combined["pinch_ytd_as_of_date"]).dt.normalize()
+    )
+    combined = combined.loc[velocity_agrees & date_agrees].copy()
+    combined = combined.drop(columns=[
+        "pinch_avg_fb_velo", "pinch_ytd_as_of_date"
+    ])
+    combined = combined.drop_duplicates("name_key", keep="first")
+    combined["observation"] = combined["athlete"]
     return combined[columns].sort_values(
         "avg_fb_velo", ascending=False
     ).reset_index(drop=True)
 
 
-def _single_predictor_r2(x: np.ndarray, y: np.ndarray) -> float:
-    """In-sample R² for one predictor plus an intercept."""
-    if len(x) < 2 or np.isclose(np.std(x), 0) or np.isclose(np.std(y), 0):
-        return np.nan
-    design = np.column_stack([np.ones(len(x)), x])
-    coef, _, rank, _ = np.linalg.lstsq(design, y, rcond=None)
-    if rank < 2:
-        return np.nan
-    pred = design @ coef
-    ss_total = float(np.sum((y - y.mean()) ** 2))
-    if np.isclose(ss_total, 0):
-        return np.nan
-    return float(1.0 - np.sum((y - pred) ** 2) / ss_total)
-
-
-def fit_combined_model(summary: pd.DataFrame) -> dict | None:
-    """Fit FB velo ~ average CI + average pinch using ordinary least squares."""
-    work = summary.dropna(
-        subset=["avg_ci", "avg_pinch_strength", "avg_fb_velo"]
-    ).copy()
-    if len(work) < 4:
+def _fit_cross_sectional_variant(
+    work: pd.DataFrame,
+    predictor_columns: list[str],
+) -> dict | None:
+    """Fit an ordinary pitcher-level regression with one row per pitcher."""
+    needed = ["avg_fb_velo", *predictor_columns]
+    data = work.dropna(subset=needed).copy().reset_index(drop=True)
+    n = len(data)
+    k = len(predictor_columns)
+    if n <= k + 1 or k == 0:
         return None
 
-    x_ci = work["avg_ci"].to_numpy(dtype=float)
-    x_pinch = work["avg_pinch_strength"].to_numpy(dtype=float)
-    y = work["avg_fb_velo"].to_numpy(dtype=float)
-    design = np.column_stack([np.ones(len(work)), x_ci, x_pinch])
-
-    coef, _, rank, _ = np.linalg.lstsq(design, y, rcond=None)
-    if rank < 3 or np.isclose(np.std(y), 0):
+    x_predictors = data[predictor_columns].to_numpy(dtype=float)
+    x = np.column_stack([np.ones(n), x_predictors])
+    y = data["avg_fb_velo"].to_numpy(dtype=float)
+    if np.linalg.matrix_rank(x) < k + 1 or np.isclose(np.std(y), 0):
         return None
 
-    predicted = design @ coef
+    coef, _, _, _ = np.linalg.lstsq(x, y, rcond=None)
+    predicted = x @ coef
     residual = y - predicted
     ss_total = float(np.sum((y - y.mean()) ** 2))
     ss_residual = float(np.sum(residual ** 2))
-    r2 = float(1.0 - ss_residual / ss_total)
-    n = len(work)
-    predictors = 2
-    adjusted_r2 = (
-        float(1.0 - (1.0 - r2) * (n - 1) / (n - predictors - 1))
-        if n > predictors + 1 else np.nan
-    )
+    r2 = float(1.0 - ss_residual / ss_total) if ss_total > 0 else np.nan
     rmse = float(np.sqrt(np.mean(residual ** 2)))
 
-    # Leave-one-out predictions provide a more conservative estimate of how
-    # the model performs on pitchers not used to fit that individual equation.
-    loo_pred = np.full(n, np.nan, dtype=float)
-    if n >= 5:
-        for idx in range(n):
-            keep = np.arange(n) != idx
-            train_design = design[keep]
-            train_y = y[keep]
-            loo_coef, _, loo_rank, _ = np.linalg.lstsq(
-                train_design, train_y, rcond=None
-            )
-            if loo_rank == 3:
-                loo_pred[idx] = float(design[idx] @ loo_coef)
+    df_residual = n - k - 1
+    adjusted_r2 = (
+        float(1.0 - (1.0 - r2) * (n - 1) / df_residual)
+        if df_residual > 0 and pd.notna(r2) else np.nan
+    )
 
-    valid_loo = np.isfinite(loo_pred)
-    if valid_loo.all():
-        cv_rmse = float(np.sqrt(np.mean((y - loo_pred) ** 2)))
-        cv_r2 = float(1.0 - np.sum((y - loo_pred) ** 2) / ss_total)
+    if df_residual > 0:
+        sigma2 = ss_residual / df_residual
+        covariance = sigma2 * np.linalg.pinv(x.T @ x)
+        standard_errors = np.sqrt(
+            np.maximum(np.diag(covariance), 0.0)
+        )
+    else:
+        standard_errors = np.full(k + 1, np.nan)
+
+    # Leave one pitcher out at a time. Because the input has exactly one row
+    # per pitcher, this is ordinary leave-one-observation-out validation.
+    cv_predicted = np.full(n, np.nan, dtype=float)
+    for row_index in range(n):
+        train_mask = np.ones(n, dtype=bool)
+        train_mask[row_index] = False
+        x_train = x[train_mask]
+        y_train = y[train_mask]
+        if (
+            len(y_train) <= k
+            or np.linalg.matrix_rank(x_train) < k + 1
+        ):
+            continue
+        train_coef, _, _, _ = np.linalg.lstsq(
+            x_train, y_train, rcond=None
+        )
+        cv_predicted[row_index] = x[row_index] @ train_coef
+
+    valid_cv = np.isfinite(cv_predicted)
+    if valid_cv.all():
+        cv_error = y - cv_predicted
+        cv_rmse = float(np.sqrt(np.mean(cv_error ** 2)))
+        cv_r2 = (
+            float(1.0 - np.sum(cv_error ** 2) / ss_total)
+            if ss_total > 0 else np.nan
+        )
     else:
         cv_rmse = np.nan
         cv_r2 = np.nan
 
-    y_sd = float(np.std(y, ddof=0))
-    ci_sd = float(np.std(x_ci, ddof=0))
-    pinch_sd = float(np.std(x_pinch, ddof=0))
+    return {
+        "data": data,
+        "coef": coef,
+        "standard_errors": standard_errors,
+        "predicted": predicted,
+        "residual": residual,
+        "r2": r2,
+        "adjusted_r2": adjusted_r2,
+        "rmse": rmse,
+        "cv_predicted": cv_predicted,
+        "cv_rmse": cv_rmse,
+        "cv_r2": cv_r2,
+        "n": n,
+        "k": k,
+        "df_residual": df_residual,
+    }
+
+
+def fit_combined_overview_model(
+    summary: pd.DataFrame,
+) -> dict | None:
+    """Fit final YTD FB velo on average CI and average pinch strength."""
+    combined = _fit_cross_sectional_variant(
+        summary, ["avg_ci", "avg_pinch_strength"]
+    )
+    if combined is None:
+        return None
+
+    data = combined["data"].copy()
+    intercept = float(combined["coef"][0])
+    beta_ci = float(combined["coef"][1])
+    beta_pinch = float(combined["coef"][2])
+    data["predicted_fb_velo"] = combined["predicted"]
+    data["residual_fb_velo"] = combined["residual"]
+    data["cv_predicted_fb_velo"] = combined["cv_predicted"]
+
+    y_sd = float(data["avg_fb_velo"].std(ddof=0))
+    ci_sd = float(data["avg_ci"].std(ddof=0))
+    pinch_sd = float(data["avg_pinch_strength"].std(ddof=0))
     standardized_beta_ci = (
-        float(coef[1] * ci_sd / y_sd)
+        beta_ci * ci_sd / y_sd
         if not np.isclose(ci_sd, 0) and not np.isclose(y_sd, 0)
         else np.nan
     )
     standardized_beta_pinch = (
-        float(coef[2] * pinch_sd / y_sd)
+        beta_pinch * pinch_sd / y_sd
         if not np.isclose(pinch_sd, 0) and not np.isclose(y_sd, 0)
         else np.nan
     )
     ci_pinch_r = (
-        float(np.corrcoef(x_ci, x_pinch)[0, 1])
+        float(np.corrcoef(
+            data["avg_ci"], data["avg_pinch_strength"]
+        )[0, 1])
         if not np.isclose(ci_sd, 0) and not np.isclose(pinch_sd, 0)
         else np.nan
     )
+    vif = (
+        float(1.0 / (1.0 - ci_pinch_r ** 2))
+        if pd.notna(ci_pinch_r) and abs(ci_pinch_r) < 1.0
+        else np.inf
+    )
 
-    work["predicted_fb_velo"] = predicted
-    work["residual_fb_velo"] = residual
-    work["loo_predicted_fb_velo"] = loo_pred
+    ci_only = _fit_cross_sectional_variant(data, ["avg_ci"])
+    pinch_only = _fit_cross_sectional_variant(
+        data, ["avg_pinch_strength"]
+    )
 
     return {
-        "n": n,
-        "intercept": float(coef[0]),
-        "beta_ci": float(coef[1]),
-        "beta_pinch": float(coef[2]),
-        "r2": r2,
-        "adjusted_r2": adjusted_r2,
-        "rmse": rmse,
-        "cv_rmse": cv_rmse,
-        "cv_r2": cv_r2,
+        "n_pitchers": combined["n"],
+        "intercept": intercept,
+        "beta_ci": beta_ci,
+        "beta_pinch": beta_pinch,
+        "se_intercept": float(combined["standard_errors"][0]),
+        "se_ci": float(combined["standard_errors"][1]),
+        "se_pinch": float(combined["standard_errors"][2]),
+        "r2": combined["r2"],
+        "adjusted_r2": combined["adjusted_r2"],
+        "rmse": combined["rmse"],
+        "cv_rmse": combined["cv_rmse"],
+        "cv_r2": combined["cv_r2"],
         "standardized_beta_ci": standardized_beta_ci,
         "standardized_beta_pinch": standardized_beta_pinch,
         "ci_pinch_r": ci_pinch_r,
-        "ci_only_r2": _single_predictor_r2(x_ci, y),
-        "pinch_only_r2": _single_predictor_r2(x_pinch, y),
-        "data": work,
+        "vif": vif,
+        "ci_only_r2": ci_only["r2"] if ci_only is not None else np.nan,
+        "pinch_only_r2": (
+            pinch_only["r2"] if pinch_only is not None else np.nan
+        ),
+        "ci_only_cv_r2": (
+            ci_only["cv_r2"] if ci_only is not None else np.nan
+        ),
+        "pinch_only_cv_r2": (
+            pinch_only["cv_r2"] if pinch_only is not None else np.nan
+        ),
+        "data": data.sort_values(
+            "avg_fb_velo", ascending=False
+        ).reset_index(drop=True),
     }
 
 
@@ -2821,10 +2919,11 @@ def build_combined_actual_predicted_chart(
     model: dict | None,
     show_labels: bool,
 ) -> go.Figure:
+    """Plot one actual-versus-predicted point for each pitcher."""
     fig = go.Figure()
     if model is None or model["data"].empty:
         fig.add_annotation(
-            text="At least four non-collinear pitchers are required.",
+            text="The combined overview model could not be fit.",
             showarrow=False,
             font={"size": 14, "color": SUBTEXT},
             x=0.5, y=0.5, xref="paper", yref="paper",
@@ -2837,7 +2936,8 @@ def build_combined_actual_predicted_chart(
     customdata = np.column_stack([
         data["athlete"], data["team"], data["avg_ci"],
         data["avg_pinch_strength"], data["pinch_hand"],
-        data["residual_fb_velo"],
+        data["avg_fb_velo"], data["residual_fb_velo"],
+        data["ytd_as_of_date"].map(fmt_date),
     ])
     fig.add_trace(go.Scatter(
         x=data["predicted_fb_velo"],
@@ -2845,9 +2945,9 @@ def build_combined_actual_predicted_chart(
         mode="markers+text" if show_labels else "markers",
         text=data["athlete"] if show_labels else None,
         textposition="top center",
-        textfont={"size": 10, "color": NAVY},
+        textfont={"size": 9, "color": NAVY},
         marker={
-            "size": 13, "color": ACCENT_RED, "opacity": 0.88,
+            "size": 13, "color": ACCENT_RED, "opacity": 0.86,
             "line": {"color": "#FFFFFF", "width": 2},
         },
         customdata=customdata,
@@ -2856,39 +2956,50 @@ def build_combined_actual_predicted_chart(
             "Team: %{customdata[1]}<br>"
             "Average CI: %{customdata[2]:.2f} N·s<br>"
             "Average pinch: %{customdata[3]:.2f} · %{customdata[4]}<br>"
+            "Final YTD FB velo: %{customdata[5]:.2f} mph<br>"
+            "YTD as of %{customdata[7]}<br>"
             "Predicted FB velo: %{x:.2f} mph<br>"
-            "Actual FB velo: %{y:.2f} mph<br>"
-            "Residual: %{customdata[5]:+.2f} mph<extra></extra>"
+            "Residual: %{customdata[6]:+.2f} mph<extra></extra>"
         ),
     ))
 
-    lower = float(min(data["predicted_fb_velo"].min(), data["avg_fb_velo"].min())) - 0.5
-    upper = float(max(data["predicted_fb_velo"].max(), data["avg_fb_velo"].max())) + 0.5
+    all_values = np.concatenate([
+        data["predicted_fb_velo"].to_numpy(dtype=float),
+        data["avg_fb_velo"].to_numpy(dtype=float),
+    ])
+    lower = float(np.nanmin(all_values)) - 0.5
+    upper = float(np.nanmax(all_values)) + 0.5
+    if np.isclose(lower, upper):
+        lower -= 0.5
+        upper += 0.5
     fig.add_trace(go.Scatter(
         x=[lower, upper], y=[lower, upper], mode="lines",
         line={"color": NAVY_MID, "width": 2, "dash": "dash"},
         hoverinfo="skip",
     ))
     fig.update_xaxes(
-        title="Combined-model predicted FB velo (mph)",
+        title="Predicted final YTD FB velo (mph)",
         range=[lower, upper], showgrid=True, gridcolor=GRID,
-        zeroline=False, linecolor=BORDER, tickfont={"color": SUBTEXT},
-        title_font={"color": SUBTEXT},
+        zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
     )
     fig.update_yaxes(
-        title="Actual last YTD FB velo (mph)",
+        title="Actual final YTD FB velo (mph)",
         range=[lower, upper], showgrid=True, gridcolor=GRID,
-        zeroline=False, linecolor=BORDER, tickfont={"color": SUBTEXT},
-        title_font={"color": SUBTEXT},
+        zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
     )
     return base_figure_layout(fig, 500)
 
 
-def build_combined_model_comparison_chart(model: dict | None) -> go.Figure:
+def build_combined_model_comparison_chart(
+    model: dict | None,
+) -> go.Figure:
+    """Compare leave-one-pitcher-out cross-validated R²."""
     fig = go.Figure()
     if model is None:
         fig.add_annotation(
-            text="The combined model could not be fit for this selection.",
+            text="The combined overview model could not be fit.",
             showarrow=False,
             font={"size": 14, "color": SUBTEXT},
             x=0.5, y=0.5, xref="paper", yref="paper",
@@ -2898,7 +3009,11 @@ def build_combined_model_comparison_chart(model: dict | None) -> go.Figure:
         return base_figure_layout(fig, 390)
 
     labels = ["CI only", "Pinch only", "CI + Pinch"]
-    values = [model["ci_only_r2"], model["pinch_only_r2"], model["r2"]]
+    values = [
+        model["ci_only_cv_r2"],
+        model["pinch_only_cv_r2"],
+        model["cv_r2"],
+    ]
     fig.add_trace(go.Bar(
         x=labels,
         y=values,
@@ -2906,18 +3021,25 @@ def build_combined_model_comparison_chart(model: dict | None) -> go.Figure:
         text=[f"{value:.2f}" if pd.notna(value) else "—" for value in values],
         textposition="outside",
         cliponaxis=False,
-        hovertemplate="<b>%{x}</b><br>R²: %{y:.3f}<extra></extra>",
+        hovertemplate=(
+            "<b>%{x}</b><br>Leave-one-pitcher-out CV R²: "
+            "%{y:.3f}<extra></extra>"
+        ),
     ))
-    max_value = max([value for value in values if pd.notna(value)] + [0.0])
+    valid = [float(value) for value in values if pd.notna(value)]
+    low = min(valid + [0.0]) - 0.12
+    high = max(valid + [0.0]) + 0.12
+    if high - low < 0.5:
+        high = low + 0.5
     fig.update_xaxes(
-        title="Model", showgrid=False, linecolor=BORDER,
+        title="Pitcher-level model", showgrid=False, linecolor=BORDER,
         tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
     )
     fig.update_yaxes(
-        title="In-sample R²", range=[min(0, max_value - 1.05), max(1.0, max_value + 0.12)],
-        showgrid=True, gridcolor=GRID, zeroline=True, zerolinecolor=BORDER,
-        linecolor=BORDER, tickfont={"color": SUBTEXT},
-        title_font={"color": SUBTEXT},
+        title="Leave-one-pitcher-out CV R²", range=[low, high],
+        showgrid=True, gridcolor=GRID, zeroline=True,
+        zerolinecolor=BORDER, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
     )
     return base_figure_layout(fig, 390)
 
@@ -2999,13 +3121,6 @@ with st.sidebar:
     min_pinch_tests = st.number_input("Min pinch tests", min_value=1, step=1, value=1)
     show_labels = st.checkbox("Show names")
 
-    st.markdown("---")
-    bucket_mode = st.selectbox("Within bucket", ["Week", "Half-Month"])
-    min_paired_dates = st.number_input("Min paired CI buckets", min_value=3, max_value=30, step=1, value=3)
-    min_paired_pinch_dates = st.number_input(
-        "Min paired pinch buckets", min_value=3, max_value=30, step=1, value=3
-    )
-    min_paired_months = st.number_input("Min paired bat months", min_value=3, max_value=24, step=1, value=3)
 
 summary = build_summary(
     jump=jump,
@@ -3016,16 +3131,6 @@ summary = build_summary(
     min_velo_records=int(min_velo_records),
     min_ci_jumps=int(min_ci_jumps),
 )
-within_pairs = build_within_individual_pairs(
-    jump=jump,
-    velo=velo,
-    start_date=start_date,
-    end_date=end_date,
-    team_filter=team_filter,
-    bucket_mode=bucket_mode,
-)
-within_summary = build_within_individual_summary(within_pairs, int(min_paired_dates))
-
 pinch_summary = build_pinch_summary(
     pinch=pinch,
     velo=velo,
@@ -3036,22 +3141,11 @@ pinch_summary = build_pinch_summary(
     min_velo_records=int(min_velo_records),
     min_pinch_tests=int(min_pinch_tests),
 )
-pinch_within_pairs = build_pinch_within_pairs(
-    pinch=pinch,
-    velo=velo,
-    jump=jump,
-    start_date=start_date,
-    end_date=end_date,
-    team_filter=team_filter,
-    bucket_mode=bucket_mode,
+combined_summary = build_combined_overview_summary(
+    summary,
+    pinch_summary,
 )
-pinch_within_summary = build_pinch_within_summary(
-    pinch_within_pairs,
-    int(min_paired_pinch_dates),
-)
-
-combined_summary = build_combined_summary(summary, pinch_summary)
-combined_model = fit_combined_model(combined_summary)
+combined_model = fit_combined_overview_model(combined_summary)
 
 bat_monthly_pairs = build_bat_monthly_pairs(
     jump=jump,
@@ -3061,12 +3155,6 @@ bat_monthly_pairs = build_bat_monthly_pairs(
     team_filter=team_filter,
     min_ci_jumps=int(min_ci_jumps),
 )
-bat_within_pairs = build_bat_within_pairs(bat_monthly_pairs)
-bat_within_summary = build_bat_within_summary(
-    bat_within_pairs,
-    int(min_paired_months),
-)
-
 period_text = f"{fmt_date(start_date)} – {fmt_date(end_date)}"
 title_col, filter_col = st.columns([4, 1])
 with title_col:
@@ -3080,20 +3168,14 @@ st.markdown(f"<div style='color:#667085;font-size:13px;margin:3px 0 20px;'>{html
 
 (
     overview_tab,
-    within_tab,
     pinch_overview_tab,
-    pinch_within_tab,
     combined_model_tab,
     bat_overview_tab,
-    bat_within_tab,
 ) = st.tabs([
     "FB Velo Overview",
-    "FB Velo Within Individual",
     "Pinch Grip Overview",
-    "Pinch Grip Within Individual",
-    "Combined CI + Pinch Model",
+    "Combined CI + Pinch Overview",
     "Bat Speed Overview",
-    "Bat Speed Within Individual",
 ])
 
 with overview_tab:
@@ -3207,125 +3289,6 @@ with overview_tab:
                 column_config={
                     "Last YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
                     "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
-                },
-            )
-
-with within_tab:
-    eligible_count = len(within_summary)
-    valid_r = within_summary["r"].dropna() if not within_summary.empty else pd.Series(dtype=float)
-    mean_within_r = valid_r.mean() if not valid_r.empty else np.nan
-    total_pairs = len(within_pairs)
-
-    cols = st.columns(4)
-    metric_values = [
-        ("Pitchers", str(eligible_count), BLUE),
-        ("Mean Within r", f"{mean_within_r:+.2f}" if pd.notna(mean_within_r) else "—", ACCENT_RED),
-        ("Paired Buckets", str(total_pairs), TEAL),
-        ("Bucket", bucket_mode, GREEN),
-    ]
-    for column, values in zip(cols, metric_values):
-        with column:
-            st.markdown(metric_card(*values), unsafe_allow_html=True)
-
-    if within_summary.empty:
-        st.info("No pitchers meet the paired-bucket rule.")
-    else:
-        athlete_options = within_summary["name_key"].tolist()
-        name_map = dict(zip(within_summary["name_key"], within_summary["athlete"]))
-
-        # Keep the dropdown state stable, but give the selected player's plots
-        # their own keys so Streamlit/Plotly always replaces the old figures.
-        selector_key = "within_individual_pitcher"
-        if st.session_state.get(selector_key) not in athlete_options:
-            st.session_state[selector_key] = athlete_options[0]
-
-        selected_key = st.selectbox(
-            "Pitcher",
-            athlete_options,
-            format_func=lambda key: name_map.get(key, key),
-            key=selector_key,
-        )
-
-        player_pairs = within_pairs[within_pairs["name_key"] == selected_key].sort_values("date").copy()
-        player_row = within_summary[within_summary["name_key"] == selected_key].iloc[0]
-
-        player_cols = st.columns(4)
-        player_metrics = [
-            ("Paired Buckets", str(int(player_row["paired_dates"])), BLUE),
-            ("Within r", f"{player_row['r']:+.2f}" if pd.notna(player_row["r"]) else "—", ACCENT_RED),
-            ("Δ CI", f"{player_row['delta_ci']:+.1f} N·s", TEAL),
-            ("Δ FB Velo", f"{player_row['delta_fb_velo']:+.2f} mph", GREEN),
-        ]
-        for column, values in zip(player_cols, player_metrics):
-            with column:
-                st.markdown(metric_card(*values), unsafe_allow_html=True)
-
-        left, right = st.columns([1.25, 1])
-        with left:
-            with st.container(border=True):
-                st.subheader("Δ CI vs Δ YTD FB Velo", anchor=False)
-                st.plotly_chart(
-                    build_within_scatter(player_pairs),
-                    use_container_width=True,
-                    config={"displayModeBar": False},
-                    key=f"within_scatter_{selected_key}_{bucket_mode}",
-                )
-        with right:
-            with st.container(border=True):
-                st.subheader("CI + YTD FB Velo", anchor=False)
-                st.plotly_chart(
-                    build_within_timeline(player_pairs),
-                    use_container_width=True,
-                    config={"displayModeBar": False},
-                    key=f"within_timeline_{selected_key}_{bucket_mode}",
-                )
-
-        with st.container(border=True):
-            st.subheader("Within-Individual Results", anchor=False)
-            individual_display = within_summary[[
-                "athlete", "team", "paired_dates", "r", "r2", "delta_ci", "delta_fb_velo", "first_date", "last_date",
-            ]].copy()
-            individual_display.columns = [
-                "Pitcher", "Team", "Paired Buckets", "Within r", "R²", "Δ CI", "Δ FB Velo", "First Bucket", "Last Bucket",
-            ]
-            for date_col in ["First Bucket", "Last Bucket"]:
-                individual_display[date_col] = individual_display[date_col].map(fmt_date)
-            individual_display["Within r"] = individual_display["Within r"].round(2)
-            individual_display["R²"] = individual_display["R²"].round(2)
-            individual_display["Δ CI"] = individual_display["Δ CI"].round(1)
-            individual_display["Δ FB Velo"] = individual_display["Δ FB Velo"].round(2)
-            st.dataframe(
-                individual_display,
-                hide_index=True,
-                use_container_width=True,
-                height=min(620, 44 + 36 * (len(individual_display) + 1)),
-                column_config={
-                    "Within r": st.column_config.NumberColumn(format="%+.2f"),
-                    "R²": st.column_config.NumberColumn(format="%.2f"),
-                    "Δ CI": st.column_config.NumberColumn(format="%+.1f N·s"),
-                    "Δ FB Velo": st.column_config.NumberColumn(format="%+.2f mph"),
-                },
-            )
-
-        with st.container(border=True):
-            st.subheader("Bucket Data", anchor=False)
-            paired_display = player_pairs[["bucket_label", "avg_ci", "ytd_fb_velo", "velo_date", "ci_jumps", "last_ci_date", "delta_ci", "delta_fb_velo"]].copy()
-            paired_display.columns = ["Bucket", "Average CI", "YTD FB Velo", "YTD FB As Of", "CI Jumps", "Last CI", "Δ CI", "Δ FB Velo"]
-            for date_col in ["YTD FB As Of", "Last CI"]:
-                paired_display[date_col] = paired_display[date_col].map(fmt_date)
-            for col in ["Average CI", "YTD FB Velo", "Δ CI", "Δ FB Velo"]:
-                paired_display[col] = paired_display[col].round(2)
-            st.dataframe(
-                paired_display,
-                hide_index=True,
-                use_container_width=True,
-                height=min(460, 44 + 36 * (len(paired_display) + 1)),
-                key=f"within_bucket_table_{selected_key}_{bucket_mode}",
-                column_config={
-                    "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
-                    "YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                    "Δ CI": st.column_config.NumberColumn(format="%+.2f N·s"),
-                    "Δ FB Velo": st.column_config.NumberColumn(format="%+.2f mph"),
                 },
             )
 
@@ -3522,271 +3485,86 @@ with pinch_overview_tab:
             )
 
 
-with pinch_within_tab:
-    pinch_eligible_count = len(pinch_within_summary)
-    pinch_valid_r = (
-        pinch_within_summary["r"].dropna()
-        if not pinch_within_summary.empty else pd.Series(dtype=float)
-    )
-    mean_pinch_within_r = (
-        pinch_valid_r.mean() if not pinch_valid_r.empty else np.nan
-    )
-    total_pinch_pairs = len(pinch_within_pairs)
-
-    cols = st.columns(4)
-    metric_values = [
-        ("Pitchers", str(pinch_eligible_count), BLUE),
-        (
-            "Mean Within r",
-            f"{mean_pinch_within_r:+.2f}"
-            if pd.notna(mean_pinch_within_r) else "—",
-            ACCENT_RED,
-        ),
-        ("Paired Buckets", str(total_pinch_pairs), TEAL),
-        ("Bucket", bucket_mode, GREEN),
-    ]
-    for column, values in zip(cols, metric_values):
-        with column:
-            st.markdown(metric_card(*values), unsafe_allow_html=True)
-
-    st.caption(
-        "This uses the same within-individual calculation as the CI tab: "
-        "average pinch strength and the latest YTD FB velo are matched inside "
-        "each week or half-month, converted to changes from the first paired "
-        "bucket, and correlated separately for each pitcher."
-    )
-
-    if pinch_within_summary.empty:
-        st.info("No pitchers meet the paired pinch-bucket rule.")
-    else:
-        pinch_athlete_options = pinch_within_summary["name_key"].tolist()
-        pinch_name_map = dict(zip(
-            pinch_within_summary["name_key"],
-            pinch_within_summary["athlete"],
-        ))
-        pinch_selector_key = "pinch_within_individual_pitcher"
-        if (
-            st.session_state.get(pinch_selector_key)
-            not in pinch_athlete_options
-        ):
-            st.session_state[pinch_selector_key] = pinch_athlete_options[0]
-
-        selected_pinch_key = st.selectbox(
-            "Pitcher",
-            pinch_athlete_options,
-            format_func=lambda key: pinch_name_map.get(key, key),
-            key=pinch_selector_key,
-        )
-        player_pinch_pairs = pinch_within_pairs[
-            pinch_within_pairs["name_key"] == selected_pinch_key
-        ].sort_values("date").copy()
-        player_pinch_row = pinch_within_summary[
-            pinch_within_summary["name_key"] == selected_pinch_key
-        ].iloc[0]
-
-        player_cols = st.columns(5)
-        player_metrics = [
-            (
-                "Paired Buckets",
-                str(int(player_pinch_row["paired_dates"])),
-                BLUE,
-            ),
-            ("Tested Hand", str(player_pinch_row["pinch_hand"]), NAVY_MID),
-            (
-                "Within r",
-                f"{player_pinch_row['r']:+.2f}"
-                if pd.notna(player_pinch_row["r"]) else "—",
-                ACCENT_RED,
-            ),
-            (
-                "Δ Pinch",
-                f"{player_pinch_row['delta_pinch']:+.2f}",
-                TEAL,
-            ),
-            (
-                "Δ FB Velo",
-                f"{player_pinch_row['delta_fb_velo']:+.2f} mph",
-                GREEN,
-            ),
-        ]
-        for column, values in zip(player_cols, player_metrics):
-            with column:
-                st.markdown(metric_card(*values), unsafe_allow_html=True)
-
-        left, right = st.columns([1.25, 1])
-        with left:
-            with st.container(border=True):
-                st.subheader("Δ Pinch vs Δ YTD FB Velo", anchor=False)
-                st.plotly_chart(
-                    build_pinch_within_scatter(player_pinch_pairs),
-                    use_container_width=True,
-                    config={"displayModeBar": False},
-                    key=(
-                        f"pinch_within_scatter_{selected_pinch_key}_"
-                        f"{bucket_mode}"
-                    ),
-                )
-        with right:
-            with st.container(border=True):
-                st.subheader("Pinch + YTD FB Velo", anchor=False)
-                st.plotly_chart(
-                    build_pinch_within_timeline(player_pinch_pairs),
-                    use_container_width=True,
-                    config={"displayModeBar": False},
-                    key=(
-                        f"pinch_within_timeline_{selected_pinch_key}_"
-                        f"{bucket_mode}"
-                    ),
-                )
-
-        with st.container(border=True):
-            st.subheader("Within-Individual Pinch Results", anchor=False)
-            pinch_individual_display = pinch_within_summary[[
-                "athlete", "team", "pinch_hand", "paired_dates", "r", "r2",
-                "delta_pinch", "delta_fb_velo", "first_date", "last_date",
-            ]].copy()
-            pinch_individual_display.columns = [
-                "Pitcher", "Team", "Tested Hand", "Paired Buckets",
-                "Within r", "R²", "Δ Pinch", "Δ FB Velo",
-                "First Bucket", "Last Bucket",
-            ]
-            for date_col in ["First Bucket", "Last Bucket"]:
-                pinch_individual_display[date_col] = (
-                    pinch_individual_display[date_col].map(fmt_date)
-                )
-            for col in ["Within r", "R²", "Δ Pinch", "Δ FB Velo"]:
-                pinch_individual_display[col] = (
-                    pinch_individual_display[col].round(2)
-                )
-            st.dataframe(
-                pinch_individual_display,
-                hide_index=True,
-                use_container_width=True,
-                height=min(
-                    620,
-                    44 + 36 * (len(pinch_individual_display) + 1),
-                ),
-                column_config={
-                    "Within r": st.column_config.NumberColumn(format="%+.2f"),
-                    "R²": st.column_config.NumberColumn(format="%.2f"),
-                    "Δ Pinch": st.column_config.NumberColumn(format="%+.2f"),
-                    "Δ FB Velo": st.column_config.NumberColumn(
-                        format="%+.2f mph"
-                    ),
-                },
-            )
-
-        with st.container(border=True):
-            st.subheader("Pinch Bucket Data", anchor=False)
-            pinch_pair_display = player_pinch_pairs[[
-                "bucket_label", "pinch_hand", "avg_pinch_strength",
-                "ytd_fb_velo", "velo_date", "pinch_tests",
-                "pinch_test_dates", "last_pinch_date", "delta_pinch",
-                "delta_fb_velo",
-            ]].copy()
-            pinch_pair_display.columns = [
-                "Bucket", "Tested Hand", "Average Pinch", "YTD FB Velo",
-                "YTD FB As Of", "Pinch Tests", "Pinch Test Dates",
-                "Last Pinch", "Δ Pinch", "Δ FB Velo",
-            ]
-            for date_col in ["YTD FB As Of", "Last Pinch"]:
-                pinch_pair_display[date_col] = (
-                    pinch_pair_display[date_col].map(fmt_date)
-                )
-            for col in [
-                "Average Pinch", "YTD FB Velo", "Δ Pinch", "Δ FB Velo"
-            ]:
-                pinch_pair_display[col] = pinch_pair_display[col].round(2)
-            st.dataframe(
-                pinch_pair_display,
-                hide_index=True,
-                use_container_width=True,
-                height=min(460, 44 + 36 * (len(pinch_pair_display) + 1)),
-                key=(
-                    f"pinch_within_bucket_table_{selected_pinch_key}_"
-                    f"{bucket_mode}"
-                ),
-                column_config={
-                    "Average Pinch": st.column_config.NumberColumn(
-                        format="%.2f"
-                    ),
-                    "YTD FB Velo": st.column_config.NumberColumn(
-                        format="%.2f mph"
-                    ),
-                    "Δ Pinch": st.column_config.NumberColumn(format="%+.2f"),
-                    "Δ FB Velo": st.column_config.NumberColumn(
-                        format="%+.2f mph"
-                    ),
-                },
-            )
-
 
 with combined_model_tab:
-    n_combined = len(combined_summary)
+    n_combined_pitchers = len(combined_summary)
 
     if combined_model is None:
         cols = st.columns(4)
         values = [
-            ("Pitchers", str(n_combined), BLUE),
-            ("Combined R²", "—", ACCENT_RED),
-            ("Adjusted R²", "—", TEAL),
-            ("Model RMSE", "—", GREEN),
+            ("Pitchers", str(n_combined_pitchers), BLUE),
+            ("Model R²", "—", ACCENT_RED),
+            ("Adjusted R²", "—", NAVY_MID),
+            ("RMSE", "—", GREEN),
         ]
         for column, metric_values in zip(cols, values):
             with column:
                 st.markdown(metric_card(*metric_values), unsafe_allow_html=True)
         st.info(
-            "The combined model needs at least four pitchers with eligible CI, "
-            "pinch-grip, and FB-velocity data, plus variation in both predictors."
+            "The combined overview model needs at least four pitchers with "
+            "eligible CI, pinch-grip, and final in-window YTD FB-velocity data, "
+            "plus variation in both predictors. Each pitcher contributes one row."
         )
     else:
         cols = st.columns(5)
         values = [
-            ("Pitchers", str(combined_model["n"]), BLUE),
-            ("Combined R²", f"{combined_model['r2']:.2f}", ACCENT_RED),
+            ("Pitchers", str(combined_model["n_pitchers"]), BLUE),
+            ("Model R²", f"{combined_model['r2']:.2f}", ACCENT_RED),
             (
                 "Adjusted R²",
                 f"{combined_model['adjusted_r2']:.2f}"
                 if pd.notna(combined_model["adjusted_r2"]) else "—",
-                TEAL,
+                NAVY_MID,
             ),
-            ("Model RMSE", f"{combined_model['rmse']:.2f} mph", GREEN),
+            ("RMSE", f"{combined_model['rmse']:.2f} mph", GREEN),
             (
-                "LOOCV RMSE",
+                "LOO RMSE",
                 f"{combined_model['cv_rmse']:.2f} mph"
                 if pd.notna(combined_model["cv_rmse"]) else "—",
-                NAVY_MID,
+                NAVY,
             ),
         ]
         for column, metric_values in zip(cols, values):
             with column:
                 st.markdown(metric_card(*metric_values), unsafe_allow_html=True)
 
-        ci_effect_10 = combined_model["beta_ci"] * 10.0
-        pinch_effect_10 = combined_model["beta_pinch"] * 10.0
-        both_effect_10 = ci_effect_10 + pinch_effect_10
-        combined_lookup_velo = (
-            combined_model["intercept"]
-            + combined_model["beta_ci"] * float(ci_lookup)
-            + combined_model["beta_pinch"] * float(pinch_lookup)
-        )
-
         st.caption(
-            "This is a multiple linear regression using one row per pitcher: "
-            "mean in-window CI and mean in-window single-hand pinch strength are "
-            "entered together to estimate the same final in-window ytd_fb_velo. "
-            "Each coefficient is a partial association holding the other predictor "
-            "constant. The model is descriptive and does not establish causation."
+            "This model is calculated like the overview tabs: each pitcher "
+            "contributes exactly one observation. Average in-window CI and "
+            "average in-window pinch strength are matched to that pitcher's "
+            "final in-window ytd_fb_velo. The coefficients describe partial "
+            "between-pitcher associations and should not be interpreted as "
+            "causal individual velocity gains."
         )
+        if combined_model["n_pitchers"] < 15:
+            st.warning(
+                "Fewer than 15 pitchers are included. The model can be shown, "
+                "but coefficients and cross-validation results may change "
+                "substantially when individual pitchers are added or removed."
+            )
+        if pd.notna(combined_model["vif"]) and combined_model["vif"] >= 5:
+            st.warning(
+                f"CI and pinch strength have a VIF of {combined_model['vif']:.1f}. "
+                "The two predictors overlap enough that their separate "
+                "coefficients may be unstable."
+            )
 
+        ci_association_10 = combined_model["beta_ci"] * 10.0
+        pinch_association_10 = combined_model["beta_pinch"] * 10.0
+        both_association_10 = ci_association_10 + pinch_association_10
         effect_cols = st.columns(5)
         effect_values = [
-            ("CI Effect · +10 N·s", f"{ci_effect_10:+.2f} mph", BLUE),
-            ("Pinch Effect · +10", f"{pinch_effect_10:+.2f} mph", TEAL),
-            ("Both +10", f"{both_effect_10:+.2f} mph", ACCENT_RED),
-            ("Lookup Estimate", f"{combined_lookup_velo:.2f} mph", GREEN),
+            ("Partial CI Association · +10 N·s", f"{ci_association_10:+.2f} mph", BLUE),
+            ("Partial Pinch Association · +10", f"{pinch_association_10:+.2f} mph", TEAL),
+            ("Both Predictors +10", f"{both_association_10:+.2f} mph", ACCENT_RED),
             (
-                "CI–Pinch Correlation",
+                "LOO CV R²",
+                f"{combined_model['cv_r2']:.2f}"
+                if pd.notna(combined_model["cv_r2"]) else "—",
+                GREEN,
+            ),
+            (
+                "CI–Pinch r",
                 f"{combined_model['ci_pinch_r']:+.2f}"
                 if pd.notna(combined_model["ci_pinch_r"]) else "—",
                 NAVY_MID,
@@ -3797,12 +3575,17 @@ with combined_model_tab:
                 st.markdown(metric_card(*metric_values), unsafe_allow_html=True)
 
         with st.container(border=True):
-            st.subheader("Combined Model Lookup", anchor=False)
+            st.subheader("Combined CI + Pinch Lookup", anchor=False)
+            lookup_estimate = (
+                combined_model["intercept"]
+                + combined_model["beta_ci"] * float(ci_lookup)
+                + combined_model["beta_pinch"] * float(pinch_lookup)
+            )
             lookup_cols = st.columns(3)
             lookup_items = [
-                ("Average CI", f"{float(ci_lookup):.1f} N·s", NAVY),
-                ("Average Pinch Strength", f"{float(pinch_lookup):.1f}", TEAL),
-                ("Estimated FB Velo", f"{combined_lookup_velo:.2f} mph", ACCENT_RED),
+                ("Average CI", f"{float(ci_lookup):.1f} N·s", BLUE),
+                ("Average Pinch", f"{float(pinch_lookup):.1f}", TEAL),
+                ("Estimated Final YTD FB Velo", f"{lookup_estimate:.2f} mph", ACCENT_RED),
             ]
             for column, (label, value, color) in zip(lookup_cols, lookup_items):
                 with column:
@@ -3816,21 +3599,41 @@ with combined_model_tab:
                         unsafe_allow_html=True,
                     )
 
+            model_data = combined_model["data"]
+            outside_ci = not (
+                model_data["avg_ci"].min()
+                <= float(ci_lookup)
+                <= model_data["avg_ci"].max()
+            )
+            outside_pinch = not (
+                model_data["avg_pinch_strength"].min()
+                <= float(pinch_lookup)
+                <= model_data["avg_pinch_strength"].max()
+            )
+            if outside_ci or outside_pinch:
+                st.warning(
+                    "At least one lookup value is outside the observed pitcher "
+                    "range, so this estimate is an extrapolation."
+                )
+
         chart_left, chart_right = st.columns(2)
         with chart_left:
             with st.container(border=True):
-                st.subheader("Model R² Comparison", anchor=False)
+                st.subheader("Cross-Validated Model Comparison", anchor=False)
                 st.caption(
-                    "All three models use the exact same pitchers so the R² values "
-                    "are directly comparable."
+                    "Each value leaves one pitcher out, fits the model on all "
+                    "remaining pitchers, and predicts the held-out pitcher. "
+                    "Unlike ordinary in-sample R², adding pinch is not "
+                    "guaranteed to improve this metric."
                 )
                 st.plotly_chart(
                     build_combined_model_comparison_chart(combined_model),
                     use_container_width=True,
                     config={"displayModeBar": False},
                     key=(
-                        f"combined_model_comparison_{team_filter}_{start_date}_"
-                        f"{end_date}_{min_ci_jumps}_{min_pinch_tests}"
+                        f"combined_overview_comparison_{team_filter}_"
+                        f"{start_date}_{end_date}_{min_ci_jumps}_"
+                        f"{min_pinch_tests}_{min_velo_records}"
                     ),
                 )
         with chart_right:
@@ -3843,23 +3646,45 @@ with combined_model_tab:
                     use_container_width=True,
                     config={"displayModeBar": False},
                     key=(
-                        f"combined_actual_predicted_{team_filter}_{start_date}_"
-                        f"{end_date}_{min_ci_jumps}_{min_pinch_tests}_{show_labels}"
+                        f"combined_overview_actual_predicted_{team_filter}_"
+                        f"{start_date}_{end_date}_{show_labels}_"
+                        f"{min_ci_jumps}_{min_pinch_tests}_{min_velo_records}"
                     ),
                 )
 
         with st.container(border=True):
             st.subheader("Combined Model Coefficients", anchor=False)
             coefficient_table = pd.DataFrame({
-                "Predictor": ["Concentric impulse", "Pinch strength"],
-                "Raw Coefficient": [
+                "Predictor": ["Intercept", "Concentric impulse", "Pinch strength"],
+                "Coefficient": [
+                    combined_model["intercept"],
                     combined_model["beta_ci"],
                     combined_model["beta_pinch"],
                 ],
-                "Effect per +10": [ci_effect_10, pinch_effect_10],
+                "Standard Error": [
+                    combined_model["se_intercept"],
+                    combined_model["se_ci"],
+                    combined_model["se_pinch"],
+                ],
+                "Approx. 95% Lower": [
+                    combined_model["intercept"] - 1.96 * combined_model["se_intercept"],
+                    combined_model["beta_ci"] - 1.96 * combined_model["se_ci"],
+                    combined_model["beta_pinch"] - 1.96 * combined_model["se_pinch"],
+                ],
+                "Approx. 95% Upper": [
+                    combined_model["intercept"] + 1.96 * combined_model["se_intercept"],
+                    combined_model["beta_ci"] + 1.96 * combined_model["se_ci"],
+                    combined_model["beta_pinch"] + 1.96 * combined_model["se_pinch"],
+                ],
                 "Standardized Beta": [
+                    np.nan,
                     combined_model["standardized_beta_ci"],
                     combined_model["standardized_beta_pinch"],
+                ],
+                "Association per +10": [
+                    np.nan,
+                    ci_association_10,
+                    pinch_association_10,
                 ],
             })
             st.dataframe(
@@ -3867,54 +3692,54 @@ with combined_model_tab:
                 hide_index=True,
                 use_container_width=True,
                 column_config={
-                    "Raw Coefficient": st.column_config.NumberColumn(
-                        format="%+.4f mph per unit"
-                    ),
-                    "Effect per +10": st.column_config.NumberColumn(
-                        format="%+.2f mph"
-                    ),
-                    "Standardized Beta": st.column_config.NumberColumn(
-                        format="%+.2f"
-                    ),
+                    "Coefficient": st.column_config.NumberColumn(format="%+.4f"),
+                    "Standard Error": st.column_config.NumberColumn(format="%.4f"),
+                    "Approx. 95% Lower": st.column_config.NumberColumn(format="%+.4f"),
+                    "Approx. 95% Upper": st.column_config.NumberColumn(format="%+.4f"),
+                    "Standardized Beta": st.column_config.NumberColumn(format="%+.2f"),
+                    "Association per +10": st.column_config.NumberColumn(format="%+.2f mph"),
                 },
             )
             st.caption(
-                f"Equation: FB velo = {combined_model['intercept']:.3f} "
-                f"+ ({combined_model['beta_ci']:.4f} × CI) "
-                f"+ ({combined_model['beta_pinch']:.4f} × pinch). "
-                "Standardized beta puts CI and pinch on the same scale for "
-                "relative comparison."
+                "Pitcher-level equation: final YTD FB velo = "
+                f"{combined_model['intercept']:.4f} + "
+                f"({combined_model['beta_ci']:.4f} × average CI) + "
+                f"({combined_model['beta_pinch']:.4f} × average pinch). "
+                "The intervals are ordinary OLS approximations and are "
+                "especially uncertain with small samples."
             )
 
         with st.container(border=True):
-            st.subheader("Combined Model Pitcher Results", anchor=False)
+            st.subheader("Combined Pitcher Results", anchor=False)
             model_data = combined_model["data"]
             combined_display = model_data[[
                 "athlete", "team", "avg_fb_velo", "predicted_fb_velo",
-                "residual_fb_velo", "avg_ci", "ci_jumps",
+                "residual_fb_velo", "ytd_as_of_date", "avg_ci", "ci_jumps",
+                "ci_test_dates", "first_ci_date", "last_ci_date",
                 "avg_pinch_strength", "pinch_hand", "pinch_tests",
-                "ytd_as_of_date",
+                "pinch_test_dates", "first_pinch_date", "last_pinch_date",
             ]].copy()
             combined_display.columns = [
-                "Pitcher", "Team", "Actual FB Velo", "Predicted FB Velo",
-                "Residual", "Average CI", "CI Jumps", "Average Pinch",
-                "Tested Hand", "Pinch Tests", "YTD FB As Of",
+                "Pitcher", "Team", "Actual Final YTD FB Velo",
+                "Predicted FB Velo", "Residual", "YTD FB As Of",
+                "Average CI", "CI Jumps", "CI Test Dates", "First CI",
+                "Last CI", "Average Pinch", "Tested Hand", "Pinch Tests",
+                "Pinch Test Dates", "First Pinch", "Last Pinch",
             ]
-            combined_display["YTD FB As Of"] = (
-                combined_display["YTD FB As Of"].map(fmt_date)
-            )
-            for col in [
-                "Actual FB Velo", "Predicted FB Velo", "Residual",
-                "Average CI", "Average Pinch",
+            for date_col in [
+                "YTD FB As Of", "First CI", "Last CI",
+                "First Pinch", "Last Pinch",
             ]:
-                combined_display[col] = combined_display[col].round(2)
+                combined_display[date_col] = combined_display[date_col].map(
+                    fmt_date
+                )
             st.dataframe(
                 combined_display,
                 hide_index=True,
                 use_container_width=True,
-                height=min(650, 44 + 36 * (len(combined_display) + 1)),
+                height=min(700, 44 + 36 * (len(combined_display) + 1)),
                 column_config={
-                    "Actual FB Velo": st.column_config.NumberColumn(
+                    "Actual Final YTD FB Velo": st.column_config.NumberColumn(
                         format="%.2f mph"
                     ),
                     "Predicted FB Velo": st.column_config.NumberColumn(
@@ -4131,274 +3956,6 @@ with bat_overview_tab:
                     "Monthly Average CI":
                         st.column_config.NumberColumn(
                             format="%.2f N·s"
-                        ),
-                },
-            )
-
-
-with bat_within_tab:
-    bat_eligible_count = len(bat_within_summary)
-    bat_valid_r = (
-        bat_within_summary["r"].dropna()
-        if not bat_within_summary.empty
-        else pd.Series(dtype=float)
-    )
-    bat_mean_within_r = (
-        bat_valid_r.mean() if not bat_valid_r.empty else np.nan
-    )
-
-    cols = st.columns(4)
-    metrics = [
-        ("Hitters", str(bat_eligible_count), BLUE),
-        (
-            "Mean Within r",
-            f"{bat_mean_within_r:+.2f}"
-            if pd.notna(bat_mean_within_r)
-            else "—",
-            ACCENT_RED,
-        ),
-        (
-            "Paired Hitter-Months",
-            str(len(bat_within_pairs)),
-            TEAL,
-        ),
-        ("Bucket", "Calendar Month", GREEN),
-    ]
-    for column, values in zip(cols, metrics):
-        with column:
-            st.markdown(metric_card(*values), unsafe_allow_html=True)
-
-    if bat_within_summary.empty:
-        st.info("No hitters meet the paired-month rule.")
-    else:
-        hitter_options = bat_within_summary["name_key"].tolist()
-        hitter_name_map = dict(zip(
-            bat_within_summary["name_key"],
-            bat_within_summary["athlete"],
-        ))
-        hitter_selector_key = "bat_within_individual_hitter"
-        if (
-            st.session_state.get(hitter_selector_key)
-            not in hitter_options
-        ):
-            st.session_state[hitter_selector_key] = hitter_options[0]
-
-        selected_hitter_key = st.selectbox(
-            "Hitter",
-            hitter_options,
-            format_func=lambda key: hitter_name_map.get(key, key),
-            key=hitter_selector_key,
-        )
-        hitter_pairs = bat_within_pairs[
-            bat_within_pairs["name_key"] == selected_hitter_key
-        ].sort_values("month").copy()
-        hitter_row = bat_within_summary[
-            bat_within_summary["name_key"] == selected_hitter_key
-        ].iloc[0]
-
-        player_cols = st.columns(4)
-        player_metrics = [
-            (
-                "Paired Months",
-                str(int(hitter_row["paired_months"])),
-                BLUE,
-            ),
-            (
-                "Within r",
-                f"{hitter_row['r']:+.2f}"
-                if pd.notna(hitter_row["r"])
-                else "—",
-                ACCENT_RED,
-            ),
-            (
-                "Δ CI",
-                f"{hitter_row['delta_ci']:+.1f} N·s",
-                TEAL,
-            ),
-            (
-                "Δ Bat Speed",
-                f"{hitter_row['delta_bat_speed']:+.2f} mph",
-                GREEN,
-            ),
-        ]
-        for column, values in zip(player_cols, player_metrics):
-            with column:
-                st.markdown(
-                    metric_card(*values),
-                    unsafe_allow_html=True,
-                )
-
-        left, right = st.columns([1.25, 1])
-        with left:
-            with st.container(border=True):
-                st.subheader(
-                    "Δ Monthly CI vs Δ Monthly Bat Speed",
-                    anchor=False,
-                )
-                st.plotly_chart(
-                    build_bat_within_scatter(hitter_pairs),
-                    use_container_width=True,
-                    config={"displayModeBar": False},
-                    key=(
-                        f"bat_within_scatter_"
-                        f"{selected_hitter_key}"
-                    ),
-                )
-        with right:
-            with st.container(border=True):
-                st.subheader(
-                    "Monthly CI + Bat Speed",
-                    anchor=False,
-                )
-                st.plotly_chart(
-                    build_bat_within_timeline(hitter_pairs),
-                    use_container_width=True,
-                    config={"displayModeBar": False},
-                    key=(
-                        f"bat_within_timeline_"
-                        f"{selected_hitter_key}"
-                    ),
-                )
-
-        with st.container(border=True):
-            st.subheader(
-                "Within-Individual Hitter Results",
-                anchor=False,
-            )
-            hitter_summary_display = bat_within_summary[[
-                "athlete",
-                "team",
-                "paired_months",
-                "r",
-                "r2",
-                "delta_ci",
-                "delta_bat_speed",
-                "first_month",
-                "last_month",
-            ]].copy()
-            hitter_summary_display.columns = [
-                "Hitter",
-                "Team",
-                "Paired Months",
-                "Within r",
-                "R²",
-                "Δ CI",
-                "Δ Bat Speed",
-                "First Month",
-                "Last Month",
-            ]
-            for col in ["First Month", "Last Month"]:
-                hitter_summary_display[col] = (
-                    pd.to_datetime(hitter_summary_display[col])
-                    .dt.strftime("%b %Y")
-                )
-            hitter_summary_display["Within r"] = (
-                hitter_summary_display["Within r"].round(2)
-            )
-            hitter_summary_display["R²"] = (
-                hitter_summary_display["R²"].round(2)
-            )
-            hitter_summary_display["Δ CI"] = (
-                hitter_summary_display["Δ CI"].round(1)
-            )
-            hitter_summary_display["Δ Bat Speed"] = (
-                hitter_summary_display["Δ Bat Speed"].round(2)
-            )
-            st.dataframe(
-                hitter_summary_display,
-                hide_index=True,
-                use_container_width=True,
-                height=min(
-                    620,
-                    44 + 36 * (len(hitter_summary_display) + 1),
-                ),
-                column_config={
-                    "Within r":
-                        st.column_config.NumberColumn(
-                            format="%+.2f"
-                        ),
-                    "R²":
-                        st.column_config.NumberColumn(
-                            format="%.2f"
-                        ),
-                    "Δ CI":
-                        st.column_config.NumberColumn(
-                            format="%+.1f N·s"
-                        ),
-                    "Δ Bat Speed":
-                        st.column_config.NumberColumn(
-                            format="%+.2f mph"
-                        ),
-                },
-            )
-
-        with st.container(border=True):
-            st.subheader("Monthly Pair Data", anchor=False)
-            hitter_pair_display = hitter_pairs[[
-                "month",
-                "avg_ci",
-                "monthly_avg_bat_speed",
-                "bat_speed_as_of",
-                "ci_jumps",
-                "last_ci_date",
-                "delta_ci",
-                "delta_bat_speed",
-            ]].copy()
-            hitter_pair_display.columns = [
-                "Month",
-                "Monthly Average CI",
-                "Monthly Avg Bat Speed",
-                "Bat Speed As Of",
-                "CI Jumps",
-                "Last CI",
-                "Δ CI",
-                "Δ Bat Speed",
-            ]
-            hitter_pair_display["Month"] = (
-                pd.to_datetime(hitter_pair_display["Month"])
-                .dt.strftime("%b %Y")
-            )
-            for date_col in ["Bat Speed As Of", "Last CI"]:
-                hitter_pair_display[date_col] = (
-                    hitter_pair_display[date_col].map(fmt_date)
-                )
-            for col in [
-                "Monthly Average CI",
-                "Monthly Avg Bat Speed",
-                "Δ CI",
-                "Δ Bat Speed",
-            ]:
-                hitter_pair_display[col] = (
-                    hitter_pair_display[col].round(2)
-                )
-            st.dataframe(
-                hitter_pair_display,
-                hide_index=True,
-                use_container_width=True,
-                height=min(
-                    460,
-                    44 + 36 * (len(hitter_pair_display) + 1),
-                ),
-                key=(
-                    f"bat_monthly_pair_table_"
-                    f"{selected_hitter_key}"
-                ),
-                column_config={
-                    "Monthly Average CI":
-                        st.column_config.NumberColumn(
-                            format="%.2f N·s"
-                        ),
-                    "Monthly Avg Bat Speed":
-                        st.column_config.NumberColumn(
-                            format="%.2f mph"
-                        ),
-                    "Δ CI":
-                        st.column_config.NumberColumn(
-                            format="%+.2f N·s"
-                        ),
-                    "Δ Bat Speed":
-                        st.column_config.NumberColumn(
-                            format="%+.2f mph"
                         ),
                 },
             )
