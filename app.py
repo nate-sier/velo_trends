@@ -5,6 +5,11 @@ Pitching:
   * Last in-window ytd_fb_velo matched to mean in-window raw CI.
   * Pitchers below 85 mph are excluded.
 
+Pinch grip:
+  * Pinch Grip tab uses Name, Date, Pinch - R, and Pinch - L.
+  * Each row contributes the one populated hand as that athlete's pinch value.
+  * In-window pinch tests are matched to the same last in-window ytd_fb_velo.
+
 Hitting:
   * One final monthly_avg_bat_speed value per hitter-month.
   * Mean raw CI from the same calendar month.
@@ -33,6 +38,7 @@ DEFAULT_SHEET_ID = "1CF2n3fAt8jALZK6HIC80Un20ITScfSMZd4kXM4ZPMSo"
 DEFAULT_JUMP_TAB = "Jump Data"
 DEFAULT_VELO_TAB = "FB Velo"
 DEFAULT_BAT_TAB = "PP_Sprint"
+DEFAULT_PINCH_TAB = "Pinch Grip"
 LOCAL_SERVICE_ACCOUNT_FILE = Path.home() / "Desktop" / "service_account.json"
 MIN_LAST_YTD_FB_VELO = 85.0
 POTENTIAL_CI_INCREASE = 10.0
@@ -52,6 +58,8 @@ TEAM_ALIASES = {
     "WASHINGTON": "Washington",
     "REHAB": "REHAB",
     "REHABILITATION": "REHAB",
+    "WESTPALMBEACH": "FCL",
+    "PALMBEACH": "FCL",
 }
 
 # -----------------------------------------------------------------------------
@@ -338,18 +346,20 @@ def read_tab(client: gspread.Client, sheet_id: str, tab_name: str) -> pd.DataFra
 
 
 @st.cache_data(ttl=300, show_spinner="Loading Google Sheet data…")
-def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
-    """Load and normalize Jump Data, FB Velo, and monthly bat-speed data."""
+def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    """Load and normalize Jump Data, FB Velo, Pinch Grip, and bat-speed data."""
     sheet_id = secret_or_default("SHEET_ID", DEFAULT_SHEET_ID)
     jump_tab = secret_or_default("JUMP_TAB", DEFAULT_JUMP_TAB)
     velo_tab = secret_or_default("VELO_TAB", DEFAULT_VELO_TAB)
     bat_tab = secret_or_default("BAT_TAB", DEFAULT_BAT_TAB)
+    pinch_tab = secret_or_default("PINCH_TAB", DEFAULT_PINCH_TAB)
 
     creds = get_credentials()
     client = gspread.authorize(creds)
     jump_raw = read_tab(client, sheet_id, jump_tab)
     velo_raw = read_tab(client, sheet_id, velo_tab)
     bat_raw = read_tab(client, sheet_id, bat_tab)
+    pinch_raw = read_tab(client, sheet_id, pinch_tab)
 
     if jump_raw.empty:
         raise ValueError(f"The '{jump_tab}' tab did not return any rows.")
@@ -357,6 +367,8 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
         raise ValueError(f"The '{velo_tab}' tab did not return any rows.")
     if bat_raw.empty:
         raise ValueError(f"The '{bat_tab}' tab did not return any rows.")
+    if pinch_raw.empty:
+        raise ValueError(f"The '{pinch_tab}' tab did not return any rows.")
 
     # Jump Data
     jump_raw.columns = jump_raw.columns.astype(str).str.strip()
@@ -421,6 +433,102 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
     velo = velo[(velo["pitcher"] != "") & (velo["name_key"] != "")].dropna(subset=["date", "ytd_fb_velo"])
     velo = velo.sort_values(["pitcher", "date"], kind="stable").reset_index(drop=True)
 
+
+
+    # Pinch Grip. This intentionally uses the dedicated Pinch Grip sheet,
+    # not the DOM Pinch field from Shoulder Data.
+    pinch_raw.columns = pinch_raw.columns.astype(str).str.strip()
+    pinch_name_col = first_existing(
+        pinch_raw.columns.tolist(),
+        ["Name", "name", "Athlete", "athlete", "Player", "player"],
+    )
+    pinch_date_col = first_existing(
+        pinch_raw.columns.tolist(),
+        ["Date", "date", "Test Date", "test_date"],
+    )
+    pinch_team_col = first_existing(
+        pinch_raw.columns.tolist(),
+        ["Team", "team", "Level", "level"],
+    )
+    pinch_player_id_col = first_existing(
+        pinch_raw.columns.tolist(),
+        ["PlayerID", "Player ID", "player_id", "playerid"],
+    )
+    pinch_left_col = first_existing(
+        pinch_raw.columns.tolist(),
+        [
+            "Pinch - L", "Pinch-L", "Pinch L", "pinch - l", "pinch_l",
+            "Left Pinch", "left pinch", "Left_Pinch", "left_pinch",
+        ],
+    )
+    pinch_right_col = first_existing(
+        pinch_raw.columns.tolist(),
+        [
+            "Pinch - R", "Pinch-R", "Pinch R", "pinch - r", "pinch_r",
+            "Right Pinch", "right pinch", "Right_Pinch", "right_pinch",
+        ],
+    )
+
+    missing_pinch = [
+        label for label, col in {
+            "name": pinch_name_col,
+            "date": pinch_date_col,
+        }.items() if col is None
+    ]
+    if missing_pinch:
+        raise ValueError(
+            f"Pinch Grip is missing required column(s): {', '.join(missing_pinch)}."
+        )
+    if pinch_left_col is None and pinch_right_col is None:
+        raise ValueError(
+            "Pinch Grip must contain Pinch - R and/or Pinch - L."
+        )
+
+    pinch = pd.DataFrame({
+        "athlete": pinch_raw[pinch_name_col].astype(str).str.strip(),
+        "date": parse_sheet_dates(pinch_raw[pinch_date_col]),
+        "player_id": (
+            pinch_raw[pinch_player_id_col].astype(str).str.strip()
+            if pinch_player_id_col else ""
+        ),
+        "team_raw": (
+            pinch_raw[pinch_team_col].astype(str).str.strip()
+            if pinch_team_col else ""
+        ),
+        "left_pinch": (
+            pd.to_numeric(pinch_raw[pinch_left_col], errors="coerce")
+            if pinch_left_col else np.nan
+        ),
+        "right_pinch": (
+            pd.to_numeric(pinch_raw[pinch_right_col], errors="coerce")
+            if pinch_right_col else np.nan
+        ),
+    })
+    pinch["team"] = pinch["team_raw"].map(normalize_team)
+    pinch["name_key"] = pinch["athlete"].map(canonical_name)
+
+    # Each athlete with velocity data is tested on only one hand. Use the
+    # populated hand directly rather than creating bilateral or best-side values.
+    pinch["pinch_strength"] = pinch["right_pinch"].combine_first(
+        pinch["left_pinch"]
+    )
+    pinch["pinch_hand"] = np.select(
+        [
+            pinch["right_pinch"].notna(),
+            pinch["left_pinch"].notna(),
+        ],
+        ["Right", "Left"],
+        default="Unknown",
+    )
+    pinch = pinch[
+        (pinch["athlete"] != "")
+        & (pinch["name_key"] != "")
+    ].dropna(subset=["date", "pinch_strength"])
+    pinch = (
+        pinch.drop(columns=["team_raw"])
+        .sort_values(["athlete", "date"], kind="stable")
+        .reset_index(drop=True)
+    )
 
     # Monthly bat speed. The source repeats monthly_avg_bat_speed on each
     # game row, so retain one final non-null value per hitter and month.
@@ -493,10 +601,10 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
 
     status = (
         f"Loaded {len(jump):,} Jump Data rows, {len(velo):,} FB Velo rows, "
-        f"and {len(bat):,} hitter-month bat-speed rows · "
-        f"{datetime.now().strftime('%I:%M %p').lstrip('0')}"
+        f"{len(pinch):,} Pinch Grip rows, and {len(bat):,} hitter-month "
+        f"bat-speed rows · {datetime.now().strftime('%I:%M %p').lstrip('0')}"
     )
-    return jump, velo, bat, status
+    return jump, velo, bat, pinch, status
 
 
 def build_summary(
@@ -1675,6 +1783,233 @@ def build_bat_within_timeline(player_pairs: pd.DataFrame) -> go.Figure:
     return base_figure_layout(fig, 360)
 
 
+
+
+# -----------------------------------------------------------------------------
+# PINCH GRIP × FB VELO
+# -----------------------------------------------------------------------------
+def build_pinch_summary(
+    pinch: pd.DataFrame,
+    velo: pd.DataFrame,
+    jump: pd.DataFrame,
+    start_date,
+    end_date,
+    team_filter: str,
+    min_velo_records: int,
+    min_pinch_tests: int,
+) -> pd.DataFrame:
+    """Match in-window pinch-grip averages to last in-window YTD FB velo."""
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+
+    pinch_window = pinch[
+        (pinch["date"] >= start) & (pinch["date"] <= end)
+    ].copy()
+    velo_window = velo[
+        (velo["date"] >= start) & (velo["date"] <= end)
+    ].copy()
+
+    pinch_summary = (
+        pinch_window.groupby("name_key", as_index=False)
+        .agg(
+            athlete=("athlete", "first"),
+            pinch_hand=("pinch_hand", "first"),
+            avg_pinch_strength=("pinch_strength", "mean"),
+            pinch_tests=("pinch_strength", "count"),
+            pinch_test_dates=("date", "nunique"),
+            first_pinch_date=("date", "min"),
+            last_pinch_date=("date", "max"),
+        )
+    )
+
+    velo_window = velo_window.sort_values(
+        ["name_key", "date"], kind="stable"
+    )
+    velo_counts = (
+        velo_window.groupby("name_key", as_index=False)
+        .agg(
+            fb_records=("ytd_fb_velo", "count"),
+            first_fb_date=("date", "min"),
+            last_fb_date=("date", "max"),
+        )
+    )
+    latest_ytd = (
+        velo_window.groupby("name_key", as_index=False)
+        .tail(1)[["name_key", "ytd_fb_velo", "date"]]
+        .rename(
+            columns={
+                "ytd_fb_velo": "avg_fb_velo",
+                "date": "ytd_as_of_date",
+            }
+        )
+    )
+    velo_summary = velo_counts.merge(latest_ytd, on="name_key", how="inner")
+
+    jump_team_lookup = (
+        jump.sort_values("date", kind="stable")
+        .groupby("name_key", as_index=False)
+        .tail(1)[["name_key", "team"]]
+        .drop_duplicates("name_key")
+        .rename(columns={"team": "jump_team"})
+    )
+    pinch_team_lookup = (
+        pinch.dropna(subset=["team"])
+        .sort_values("date", kind="stable")
+        .groupby("name_key", as_index=False)
+        .tail(1)[["name_key", "team"]]
+        .drop_duplicates("name_key")
+        .rename(columns={"team": "pinch_team"})
+    )
+
+    summary = velo_summary.merge(pinch_summary, on="name_key", how="inner")
+    summary = summary.merge(jump_team_lookup, on="name_key", how="left")
+    summary = summary.merge(pinch_team_lookup, on="name_key", how="left")
+    summary["team"] = summary["jump_team"].combine_first(
+        summary["pinch_team"]
+    ).fillna("Unassigned")
+    summary = summary.drop(columns=["jump_team", "pinch_team"])
+
+    summary = summary[
+        summary["avg_fb_velo"] >= MIN_LAST_YTD_FB_VELO
+    ].copy()
+    summary = summary[
+        (summary["fb_records"] >= max(1, int(min_velo_records)))
+        & (summary["pinch_tests"] >= max(1, int(min_pinch_tests)))
+    ].copy()
+
+    if team_filter != "All Teams":
+        summary = summary[summary["team"] == team_filter].copy()
+
+    return summary.sort_values(
+        "avg_fb_velo", ascending=False
+    ).reset_index(drop=True)
+
+
+def pinch_correlation_stats(
+    summary: pd.DataFrame,
+    value_col: str,
+) -> tuple[float, float, float, float] | None:
+    work = summary[[value_col, "avg_fb_velo"]].dropna()
+    if len(work) < 2:
+        return None
+    x = work[value_col].to_numpy(dtype=float)
+    y = work["avg_fb_velo"].to_numpy(dtype=float)
+    if np.isclose(np.std(x), 0) or np.isclose(np.std(y), 0):
+        return None
+    slope, intercept = np.polyfit(x, y, 1)
+    r = float(np.corrcoef(x, y)[0, 1])
+    return r, r * r, float(slope), float(intercept)
+
+
+def build_pinch_scatter(
+    summary: pd.DataFrame,
+    show_labels: bool,
+) -> go.Figure:
+    value_col = "avg_pinch_strength"
+    measure_label = "Average pinch strength"
+    work = summary.dropna(subset=[value_col, "avg_fb_velo"]).copy()
+    fig = go.Figure()
+    if work.empty:
+        fig.add_annotation(
+            text="No matched pitchers meet the selected pinch-grip rules.",
+            showarrow=False,
+            font={"size": 15, "color": SUBTEXT},
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 560)
+
+    customdata = np.column_stack([
+        work["athlete"],
+        work["team"],
+        work["pinch_hand"],
+        work["pinch_tests"],
+        work["pinch_test_dates"],
+        work["first_pinch_date"].map(fmt_date),
+        work["last_pinch_date"].map(fmt_date),
+        work["ytd_as_of_date"].map(fmt_date),
+    ])
+    fig.add_trace(go.Scatter(
+        x=work[value_col],
+        y=work["avg_fb_velo"],
+        mode="markers+text" if show_labels else "markers",
+        text=work["athlete"] if show_labels else None,
+        textposition="top center",
+        textfont={"size": 10, "color": NAVY},
+        marker={
+            "size": 13,
+            "color": GREEN,
+            "opacity": 0.88,
+            "line": {"color": "#FFFFFF", "width": 2},
+        },
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Team: %{customdata[1]}<br>"
+            "Tested hand: %{customdata[2]}<br>"
+            "Average pinch strength: %{x:.2f}<br>"
+            "Last YTD FB velo: %{y:.2f} mph<br><br>"
+            "Pinch tests: %{customdata[3]} across %{customdata[4]} dates · "
+            "%{customdata[5]}–%{customdata[6]}<br>"
+            "YTD FB velo as of %{customdata[7]}"
+            "<extra></extra>"
+        ),
+    ))
+
+    stats = pinch_correlation_stats(work, value_col)
+    if stats is not None:
+        r, r2, slope, intercept = stats
+        x_range = np.linspace(
+            work[value_col].min(), work[value_col].max(), 100
+        )
+        fig.add_trace(go.Scatter(
+            x=x_range,
+            y=slope * x_range + intercept,
+            mode="lines",
+            line={"color": NAVY_MID, "width": 2.5, "dash": "dash"},
+            hoverinfo="skip",
+        ))
+        fig.add_annotation(
+            text=f"r = {r:+.2f} · R² = {r2:.2f}",
+            x=0.02,
+            y=0.98,
+            xref="paper",
+            yref="paper",
+            xanchor="left",
+            yanchor="top",
+            showarrow=False,
+            font={"color": NAVY, "size": 13},
+            bgcolor="#FFFFFF",
+            bordercolor=BORDER,
+            borderwidth=1,
+            borderpad=7,
+        )
+
+    fig.update_xaxes(
+        title=measure_label,
+        showgrid=True,
+        gridcolor=GRID,
+        zeroline=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Last YTD FB velocity (mph)",
+        showgrid=True,
+        gridcolor=GRID,
+        zeroline=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 560)
+
+
 # -----------------------------------------------------------------------------
 # APP
 # -----------------------------------------------------------------------------
@@ -1687,12 +2022,12 @@ if refresh:
     load_source_data.clear()
 
 try:
-    jump, velo, bat, status = load_source_data()
+    jump, velo, bat, pinch, status = load_source_data()
 except Exception as exc:
     st.error(f"Could not load data. {exc}")
     st.stop()
 
-all_dates = pd.concat([jump["date"], velo["date"], bat["month"]], ignore_index=True).dropna()
+all_dates = pd.concat([jump["date"], velo["date"], bat["month"], pinch["date"]], ignore_index=True).dropna()
 min_date = all_dates.min().date()
 max_date = all_dates.max().date()
 default_start = max(pd.Timestamp(year=max_date.year, month=1, day=1).date(), min_date)
@@ -1709,7 +2044,11 @@ with st.sidebar:
     else:
         start_date = end_date = selected_dates
 
-    available_teams = set(jump["team"].dropna().unique().tolist()) | set(bat["team"].dropna().unique().tolist())
+    available_teams = (
+        set(jump["team"].dropna().unique().tolist())
+        | set(bat["team"].dropna().unique().tolist())
+        | set(pinch["team"].dropna().unique().tolist())
+    )
     teams = ["All Teams"] + [team for team in INCLUDED_TEAMS if team in available_teams]
     team_filter = st.selectbox("Team", teams)
 
@@ -1732,6 +2071,7 @@ with st.sidebar:
     st.markdown("---")
     min_velo_records = st.number_input("Min FB records", min_value=1, step=1, value=1)
     min_ci_jumps = st.number_input("Min CI jumps", min_value=1, step=1, value=1)
+    min_pinch_tests = st.number_input("Min pinch tests", min_value=1, step=1, value=1)
     show_labels = st.checkbox("Show names")
 
     st.markdown("---")
@@ -1758,6 +2098,17 @@ within_pairs = build_within_individual_pairs(
 )
 within_summary = build_within_individual_summary(within_pairs, int(min_paired_dates))
 
+pinch_summary = build_pinch_summary(
+    pinch=pinch,
+    velo=velo,
+    jump=jump,
+    start_date=start_date,
+    end_date=end_date,
+    team_filter=team_filter,
+    min_velo_records=int(min_velo_records),
+    min_pinch_tests=int(min_pinch_tests),
+)
+
 bat_monthly_pairs = build_bat_monthly_pairs(
     jump=jump,
     bat=bat,
@@ -1783,9 +2134,10 @@ with filter_col:
     )
 st.markdown(f"<div style='color:#667085;font-size:13px;margin:3px 0 20px;'>{html.escape(period_text)}</div>", unsafe_allow_html=True)
 
-overview_tab, within_tab, bat_overview_tab, bat_within_tab = st.tabs([
+overview_tab, within_tab, pinch_tab, bat_overview_tab, bat_within_tab = st.tabs([
     "FB Velo Overview", "FB Velo Within Individual",
-    "Bat Speed Overview", "Bat Speed Within Individual",
+    "Pinch Grip × FB Velo", "Bat Speed Overview",
+    "Bat Speed Within Individual",
 ])
 
 with overview_tab:
@@ -2018,6 +2370,120 @@ with within_tab:
                     "YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
                     "Δ CI": st.column_config.NumberColumn(format="%+.2f N·s"),
                     "Δ FB Velo": st.column_config.NumberColumn(format="%+.2f mph"),
+                },
+            )
+
+
+
+with pinch_tab:
+    pinch_value_col = "avg_pinch_strength"
+    pinch_view = pinch_summary.dropna(
+        subset=[pinch_value_col, "avg_fb_velo"]
+    ).copy()
+    pinch_stats = pinch_correlation_stats(pinch_view, pinch_value_col)
+    n_pinch_pitchers = len(pinch_view)
+    mean_pinch_value = (
+        pinch_view[pinch_value_col].mean()
+        if n_pinch_pitchers else np.nan
+    )
+    mean_pinch_velo = (
+        pinch_view["avg_fb_velo"].mean()
+        if n_pinch_pitchers else np.nan
+    )
+    pinch_r_text = (
+        f"{pinch_stats[0]:+.2f}" if pinch_stats is not None else "—"
+    )
+    pinch_r2_text = (
+        f"{pinch_stats[1]:.2f}" if pinch_stats is not None else "—"
+    )
+
+    cols = st.columns(5)
+    metrics = [
+        ("Pitchers", str(n_pinch_pitchers), BLUE),
+        ("Correlation", pinch_r_text, ACCENT_RED),
+        ("R²", pinch_r2_text, NAVY_MID),
+        ("Last YTD FB Velo", f"{fmt(mean_pinch_velo)} mph", TEAL),
+        ("Average Pinch Strength", fmt(mean_pinch_value), GREEN),
+    ]
+    for column, values in zip(cols, metrics):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    st.caption(
+        "Source: the Google Sheet tab named 'Pinch Grip', using Name, Date, "
+        "Pinch - R, and Pinch - L. Each test contributes whichever hand is "
+        "populated for that athlete; left and right values are not averaged "
+        "together. The athlete's pinch value is the mean of those single-hand "
+        "tests inside the selected date window. Fastball velocity is the same "
+        "final in-window ytd_fb_velo used by the FB Velo tabs; pitchers below "
+        "85 mph are excluded."
+    )
+
+    with st.container(border=True):
+        st.subheader("Pinch Strength vs YTD FB Velo", anchor=False)
+        st.plotly_chart(
+            build_pinch_scatter(
+                pinch_view,
+                show_labels,
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=(
+                f"pinch_scatter_{team_filter}_"
+                f"{start_date}_{end_date}_{min_pinch_tests}"
+            ),
+        )
+
+    with st.container(border=True):
+        st.subheader("Pinch Grip Pitcher Results", anchor=False)
+        if pinch_view.empty:
+            st.info("No matching pitchers.")
+        else:
+            pinch_display = pinch_view[[
+                "athlete",
+                "team",
+                "avg_fb_velo",
+                "ytd_as_of_date",
+                "pinch_hand",
+                "avg_pinch_strength",
+                "pinch_tests",
+                "pinch_test_dates",
+                "first_pinch_date",
+                "last_pinch_date",
+            ]].copy()
+            pinch_display.columns = [
+                "Pitcher",
+                "Team",
+                "Last YTD FB Velo",
+                "YTD FB As Of",
+                "Tested Hand",
+                "Average Pinch Strength",
+                "Pinch Tests",
+                "Pinch Test Dates",
+                "First Pinch",
+                "Last Pinch",
+            ]
+            for date_col in [
+                "YTD FB As Of", "First Pinch", "Last Pinch"
+            ]:
+                pinch_display[date_col] = pinch_display[date_col].map(fmt_date)
+            for value_column in [
+                "Last YTD FB Velo",
+                "Average Pinch Strength",
+            ]:
+                pinch_display[value_column] = pinch_display[value_column].round(2)
+            st.dataframe(
+                pinch_display,
+                hide_index=True,
+                use_container_width=True,
+                height=min(650, 44 + 36 * (len(pinch_display) + 1)),
+                column_config={
+                    "Last YTD FB Velo": st.column_config.NumberColumn(
+                        format="%.2f mph"
+                    ),
+                    "Average Pinch Strength": st.column_config.NumberColumn(
+                        format="%.2f"
+                    ),
                 },
             )
 
