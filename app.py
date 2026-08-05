@@ -16,6 +16,11 @@ Combined model:
   * Multiple linear regression estimates the partial association of CI and
     pinch strength with fastball velocity.
 
+Sprinting:
+  * One final eligible-month monthly_max_sprint_speed observation per player from PP_Sprint.
+  * Mean Peak Power / BM [W/kg] from Jump Data in the same calendar month.
+  * Cross-sectional monthly analysis.
+
 Hitting:
   * One final monthly_avg_bat_speed value per hitter-month.
   * Mean raw CI from the same calendar month.
@@ -49,6 +54,7 @@ LOCAL_SERVICE_ACCOUNT_FILE = Path.home() / "Desktop" / "service_account.json"
 MIN_LAST_YTD_FB_VELO = 85.0
 POTENTIAL_CI_INCREASE = 10.0
 POTENTIAL_PINCH_INCREASE = 10.0
+POTENTIAL_PEAK_POWER_REL_INCREASE = 5.0
 
 # Only these affiliate / roster groups are available in the dashboard.
 INCLUDED_TEAMS = [
@@ -353,8 +359,8 @@ def read_tab(client: gspread.Client, sheet_id: str, tab_name: str) -> pd.DataFra
 
 
 @st.cache_data(ttl=300, show_spinner="Loading Google Sheet data…")
-def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
-    """Load and normalize Jump Data, FB Velo, Pinch Grip, and bat-speed data."""
+def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    """Load Jump Data, FB Velo, Pinch Grip, bat speed, and sprint speed."""
     sheet_id = secret_or_default("SHEET_ID", DEFAULT_SHEET_ID)
     jump_tab = secret_or_default("JUMP_TAB", DEFAULT_JUMP_TAB)
     velo_tab = secret_or_default("VELO_TAB", DEFAULT_VELO_TAB)
@@ -377,11 +383,20 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
     if pinch_raw.empty:
         raise ValueError(f"The '{pinch_tab}' tab did not return any rows.")
 
-    # Jump Data
+    # Jump Data. CI and relative peak power are cleaned independently so
+    # missing values in one metric do not remove valid observations for the other.
     jump_raw.columns = jump_raw.columns.astype(str).str.strip()
     jump_name_col = first_existing(jump_raw.columns.tolist(), ["Athlete", "athlete", "Player", "player", "Name", "name"])
     jump_date_col = first_existing(jump_raw.columns.tolist(), ["Date", "date", "Test Date", "test_date"])
     jump_ci_col = first_existing(jump_raw.columns.tolist(), ["Concentric Impulse [N s]", "Concentric Impulse", "CI"])
+    jump_peak_power_rel_col = first_existing(
+        jump_raw.columns.tolist(),
+        [
+            "Peak Power / BM [W/kg]", "Peak Power / BM",
+            "Peak Power Rel", "Relative Peak Power",
+            "peak_power_rel", "peak power / bm [w/kg]",
+        ],
+    )
     jump_team_col = first_existing(jump_raw.columns.tolist(), ["Team", "team", "Level", "level"])
 
     missing_jump = [
@@ -389,25 +404,43 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
             "athlete name": jump_name_col,
             "date": jump_date_col,
             "concentric impulse": jump_ci_col,
+            "Peak Power / BM [W/kg]": jump_peak_power_rel_col,
         }.items() if col is None
     ]
     if missing_jump:
         raise ValueError(f"Jump Data is missing required column(s): {', '.join(missing_jump)}.")
 
-    jump = pd.DataFrame({
+    jump_base = pd.DataFrame({
         "athlete": jump_raw[jump_name_col].astype(str).str.strip(),
         "date": parse_sheet_dates(jump_raw[jump_date_col]),
         "ci": pd.to_numeric(jump_raw[jump_ci_col], errors="coerce"),
+        "peak_power_rel": pd.to_numeric(
+            jump_raw[jump_peak_power_rel_col], errors="coerce"
+        ),
         "team_raw": jump_raw[jump_team_col].astype(str).str.strip() if jump_team_col else "",
     })
-    jump["team"] = jump["team_raw"].map(normalize_team)
-    jump["name_key"] = jump["athlete"].map(canonical_name)
-    jump = jump[
-        (jump["athlete"] != "") &
-        (jump["name_key"] != "") &
-        (jump["team"].notna())
-    ].dropna(subset=["date", "ci"])
-    jump = jump.drop(columns=["team_raw"]).sort_values(["athlete", "date"]).reset_index(drop=True)
+    jump_base["team"] = jump_base["team_raw"].map(normalize_team)
+    jump_base["name_key"] = jump_base["athlete"].map(canonical_name)
+    jump_base = jump_base[
+        (jump_base["athlete"] != "")
+        & (jump_base["name_key"] != "")
+        & (jump_base["team"].notna())
+    ].copy()
+
+    jump = (
+        jump_base.dropna(subset=["date", "ci"])[
+            ["athlete", "date", "ci", "team", "name_key"]
+        ]
+        .sort_values(["athlete", "date"], kind="stable")
+        .reset_index(drop=True)
+    )
+    jump_power = (
+        jump_base.dropna(subset=["date", "peak_power_rel"])[
+            ["athlete", "date", "peak_power_rel", "team", "name_key"]
+        ]
+        .sort_values(["athlete", "date"], kind="stable")
+        .reset_index(drop=True)
+    )
 
     # FB Velo
     velo_raw.columns = velo_raw.columns.astype(str).str.strip()
@@ -559,6 +592,14 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
             "Monthly Average Bat Speed",
         ],
     )
+    sprint_speed_col = first_existing(
+        bat_raw.columns.tolist(),
+        [
+            "monthly_max_sprint_speed", "Monthly Max Sprint Speed",
+            "monthly max sprint speed", "monthly_max_speed",
+            "Monthly Maximum Sprint Speed",
+        ],
+    )
     bat_team_col = first_existing(
         bat_raw.columns.tolist(),
         ["Team", "team", "Level", "level"],
@@ -575,6 +616,11 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         raise ValueError(
             f"Bat-speed tab is missing required column(s): {', '.join(missing_bat)}. "
             "The default BAT_TAB is 'PP_Sprint'."
+        )
+    if sprint_speed_col is None:
+        raise ValueError(
+            "PP_Sprint is missing monthly_max_sprint_speed, which is required "
+            "for the Sprint Speed Overview tab."
         )
 
     bat = pd.DataFrame({
@@ -606,12 +652,45 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         .reset_index(drop=True)
     )
 
-    status = (
-        f"Loaded {len(jump):,} Jump Data rows, {len(velo):,} FB Velo rows, "
-        f"{len(pinch):,} Pinch Grip rows, and {len(bat):,} hitter-month "
-        f"bat-speed rows · {datetime.now().strftime('%I:%M %p').lstrip('0')}"
+    # Monthly max sprint speed. PP_Sprint repeats the current monthly maximum
+    # on game rows, so retain the final non-null value per player and month.
+    sprint = pd.DataFrame({
+        "athlete": bat_raw[bat_name_col].astype(str).str.strip(),
+        "date": parse_sheet_dates(bat_raw[bat_date_col]),
+        "monthly_max_sprint_speed": pd.to_numeric(
+            bat_raw[sprint_speed_col], errors="coerce"
+        ),
+        "team_raw": (
+            bat_raw[bat_team_col].astype(str).str.strip()
+            if bat_team_col else ""
+        ),
+    })
+    sprint["team"] = sprint["team_raw"].map(normalize_team)
+    sprint["name_key"] = sprint["athlete"].map(canonical_name)
+    sprint = sprint[
+        (sprint["athlete"] != "") & (sprint["name_key"] != "")
+    ].dropna(subset=["date", "monthly_max_sprint_speed"])
+    sprint["month"] = sprint["date"].dt.to_period("M").dt.to_timestamp()
+    sprint = sprint.sort_values(["name_key", "month", "date"], kind="stable")
+    sprint = (
+        sprint.groupby(["name_key", "month"], as_index=False)
+        .tail(1)[[
+            "name_key", "athlete", "month", "date",
+            "monthly_max_sprint_speed", "team",
+        ]]
+        .rename(columns={"date": "sprint_speed_as_of"})
+        .sort_values(["athlete", "month"], kind="stable")
+        .reset_index(drop=True)
     )
-    return jump, velo, bat, pinch, status
+
+    status = (
+        f"Loaded {len(jump):,} CI rows, {len(jump_power):,} relative-power rows, "
+        f"{len(velo):,} FB Velo rows, {len(pinch):,} Pinch Grip rows, "
+        f"{len(sprint):,} player-month sprint-speed source rows, and {len(bat):,} "
+        f"hitter-month bat-speed rows · "
+        f"{datetime.now().strftime('%I:%M %p').lstrip('0')}"
+    )
+    return jump, jump_power, velo, bat, pinch, sprint, status
 
 
 def build_summary(
@@ -1799,6 +1878,328 @@ def build_bat_within_timeline(player_pairs: pd.DataFrame) -> go.Figure:
     return base_figure_layout(fig, 360)
 
 
+
+
+# -----------------------------------------------------------------------------
+# FINAL ELIGIBLE-MONTH SPRINT SPEED × RELATIVE PEAK POWER
+# -----------------------------------------------------------------------------
+def build_sprint_overview_summary(
+    jump_power: pd.DataFrame,
+    sprint: pd.DataFrame,
+    start_date,
+    end_date,
+    team_filter: str,
+    min_power_jumps: int,
+) -> pd.DataFrame:
+    """Create one player-level observation from each player's final eligible month.
+
+    An eligible month must have a final monthly_max_sprint_speed value from
+    PP_Sprint and at least min_power_jumps Peak Power / BM rows in Jump Data.
+    The regression therefore receives exactly one row per player.
+    """
+    start_month = pd.Timestamp(start_date).to_period("M").start_time.normalize()
+    end_month = pd.Timestamp(end_date).to_period("M").start_time.normalize()
+
+    power_window = jump_power.copy()
+    power_window["month"] = (
+        power_window["date"].dt.to_period("M").dt.to_timestamp()
+    )
+    power_window = power_window[
+        (power_window["month"] >= start_month)
+        & (power_window["month"] <= end_month)
+    ]
+    power_monthly = (
+        power_window.groupby(["name_key", "month"], as_index=False)
+        .agg(
+            athlete=("athlete", "first"),
+            avg_peak_power_rel=("peak_power_rel", "mean"),
+            power_jumps=("peak_power_rel", "count"),
+            power_test_dates=("date", "nunique"),
+            first_power_date=("date", "min"),
+            last_power_date=("date", "max"),
+        )
+    )
+
+    team_lookup = (
+        jump_power.sort_values("date")
+        .groupby("name_key", as_index=False)
+        .tail(1)[["name_key", "team"]]
+        .drop_duplicates("name_key")
+        .rename(columns={"team": "current_team"})
+    )
+
+    sprint_window = sprint[
+        (sprint["month"] >= start_month)
+        & (sprint["month"] <= end_month)
+    ].copy()
+
+    eligible = power_monthly.merge(
+        sprint_window,
+        on=["name_key", "month"],
+        how="inner",
+        suffixes=("", "_sprint"),
+    )
+    eligible = eligible.merge(team_lookup, on="name_key", how="left")
+    eligible["team"] = eligible["current_team"].combine_first(
+        eligible["team"]
+    )
+    eligible = eligible.drop(columns=["current_team"])
+    eligible["team"] = eligible["team"].fillna("Unassigned")
+    eligible = eligible[
+        eligible["power_jumps"] >= max(1, int(min_power_jumps))
+    ].copy()
+
+    if team_filter != "All Teams":
+        eligible = eligible[eligible["team"] == team_filter].copy()
+
+    if eligible.empty:
+        eligible["month_label"] = pd.Series(dtype=str)
+        eligible["observation"] = pd.Series(dtype=str)
+        return eligible.reset_index(drop=True)
+
+    # The final eligible month is selected only after all matching and minimum-
+    # data rules are applied. This guarantees one independent player-level row.
+    summary = (
+        eligible.sort_values(
+            ["name_key", "month", "sprint_speed_as_of"],
+            kind="stable",
+        )
+        .groupby("name_key", as_index=False)
+        .tail(1)
+        .copy()
+    )
+    summary["month_label"] = summary["month"].dt.strftime("%b %Y")
+    summary["observation"] = summary["athlete"]
+    return summary.sort_values(
+        ["athlete"], kind="stable"
+    ).reset_index(drop=True)
+
+
+
+def sprint_correlation_stats(
+    pairs: pd.DataFrame,
+) -> tuple[float, float, float, float] | None:
+    if len(pairs) < 2:
+        return None
+    x = pairs["avg_peak_power_rel"].to_numpy(dtype=float)
+    y = pairs["monthly_max_sprint_speed"].to_numpy(dtype=float)
+    if np.isclose(np.std(x), 0) or np.isclose(np.std(y), 0):
+        return None
+    slope, intercept = np.polyfit(x, y, 1)
+    r = float(np.corrcoef(x, y)[0, 1])
+    return r, r * r, float(slope), float(intercept)
+
+
+def sprint_power_band_summary(
+    pairs: pd.DataFrame,
+    band_width: float,
+    sprint_stat: str = "Mean",
+) -> pd.DataFrame:
+    stat = "Median" if str(sprint_stat).strip().lower() == "median" else "Mean"
+    speed_col = f"{stat} Monthly Max Sprint Speed"
+    if pairs.empty:
+        return pd.DataFrame(columns=[
+            "Power band", speed_col, "Players", "Average Peak Power / BM",
+        ])
+
+    width = max(0.1, float(band_width))
+    work = pairs[[
+        "name_key", "avg_peak_power_rel", "monthly_max_sprint_speed"
+    ]].dropna().copy()
+    work["band_start"] = (
+        np.floor(work["avg_peak_power_rel"] / width) * width
+    )
+    grouped = (
+        work.groupby("band_start", as_index=False)
+        .agg(**{
+            speed_col: (
+                "monthly_max_sprint_speed",
+                "median" if stat == "Median" else "mean",
+            ),
+            "Players": ("name_key", "nunique"),
+            "Average Peak Power / BM": ("avg_peak_power_rel", "mean"),
+        })
+        .sort_values("band_start")
+    )
+    grouped["Power band"] = grouped["band_start"].map(
+        lambda lower: f"{lower:.1f}–{lower + width:.1f} W/kg"
+    )
+    grouped[speed_col] = grouped[speed_col].round(2)
+    grouped["Average Peak Power / BM"] = grouped[
+        "Average Peak Power / BM"
+    ].round(2)
+    return grouped[[
+        "Power band", speed_col, "Players", "Average Peak Power / BM",
+    ]]
+
+
+
+def build_sprint_scatter(
+    pairs: pd.DataFrame,
+    show_labels: bool,
+    power_lookup: float | None,
+) -> go.Figure:
+    fig = go.Figure()
+    if pairs.empty:
+        fig.add_annotation(
+            text="No matched players meet the selected rules.",
+            showarrow=False,
+            font={"size": 15, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 560)
+
+    customdata = np.column_stack([
+        pairs["athlete"],
+        pairs["team"],
+        pairs["month_label"],
+        pairs["power_jumps"],
+        pairs["power_test_dates"],
+        pairs["first_power_date"].map(fmt_date),
+        pairs["last_power_date"].map(fmt_date),
+        pairs["sprint_speed_as_of"].map(fmt_date),
+    ])
+    fig.add_trace(go.Scatter(
+        x=pairs["avg_peak_power_rel"],
+        y=pairs["monthly_max_sprint_speed"],
+        mode="markers+text" if show_labels else "markers",
+        text=pairs["observation"] if show_labels else None,
+        textposition="top center",
+        textfont={"size": 9, "color": NAVY},
+        marker={
+            "size": 13,
+            "color": TEAL,
+            "opacity": 0.86,
+            "line": {"color": "#FFFFFF", "width": 2},
+        },
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b> · %{customdata[2]}<br>"
+            "Team: %{customdata[1]}<br>"
+            "Monthly max sprint speed: %{y:.2f} ft/s<br>"
+            "Final-month average Peak Power / BM: %{x:.2f} W/kg<br><br>"
+            "Jump rows: %{customdata[3]} across %{customdata[4]} dates · "
+            "%{customdata[5]}–%{customdata[6]}<br>"
+            "Sprint-speed value as of %{customdata[7]}<extra></extra>"
+        ),
+    ))
+
+    stats = sprint_correlation_stats(pairs)
+    if stats is not None:
+        r, r2, slope, intercept = stats
+        x_range = np.linspace(
+            pairs["avg_peak_power_rel"].min(),
+            pairs["avg_peak_power_rel"].max(),
+            100,
+        )
+        fig.add_trace(go.Scatter(
+            x=x_range,
+            y=slope * x_range + intercept,
+            mode="lines",
+            line={"color": NAVY_MID, "width": 2.5, "dash": "dash"},
+            hoverinfo="skip",
+        ))
+        fig.add_annotation(
+            text=f"r = {r:+.2f} · R² = {r2:.2f}",
+            x=0.02, y=0.98, xref="paper", yref="paper",
+            xanchor="left", yanchor="top", showarrow=False,
+            font={"color": NAVY, "size": 13}, bgcolor="#FFFFFF",
+            bordercolor=BORDER, borderwidth=1, borderpad=7,
+        )
+        if power_lookup is not None and np.isfinite(power_lookup):
+            predicted = slope * float(power_lookup) + intercept
+            fig.add_vline(
+                x=float(power_lookup), line_color=TEAL,
+                line_width=1.5, line_dash="dot",
+            )
+            fig.add_hline(
+                y=predicted, line_color=TEAL,
+                line_width=1.5, line_dash="dot",
+            )
+            fig.add_trace(go.Scatter(
+                x=[float(power_lookup)], y=[predicted], mode="markers",
+                marker={
+                    "size": 15, "color": TEAL, "symbol": "diamond",
+                    "line": {"color": "#FFFFFF", "width": 2},
+                },
+                hovertemplate=(
+                    "<b>Power lookup</b><br>"
+                    "Final-month average Peak Power / BM: %{x:.1f} W/kg<br>"
+                    "Estimated monthly max sprint speed: %{y:.2f} ft/s"
+                    "<extra></extra>"
+                ),
+            ))
+
+    fig.update_xaxes(
+        title="Average Peak Power / BM in final eligible month (W/kg)",
+        showgrid=True, gridcolor=GRID, zeroline=False,
+        linecolor=BORDER, tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Monthly max sprint speed (ft/s)",
+        showgrid=True, gridcolor=GRID, zeroline=False,
+        linecolor=BORDER, tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 560)
+
+
+def build_sprint_band_chart(
+    pairs: pd.DataFrame,
+    band_width: float,
+    sprint_stat: str = "Mean",
+) -> go.Figure:
+    stat = "Median" if str(sprint_stat).strip().lower() == "median" else "Mean"
+    speed_col = f"{stat} Monthly Max Sprint Speed"
+    bands = sprint_power_band_summary(pairs, band_width, stat)
+    fig = go.Figure()
+    if bands.empty:
+        fig.add_annotation(
+            text="No matched players are available for power bands.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 380)
+
+    fig.add_trace(go.Bar(
+        x=bands["Power band"],
+        y=bands[speed_col],
+        marker={"color": TEAL, "line": {"color": NAVY_MID, "width": 0.8}},
+        text=[f"{speed:.1f}" for speed in bands[speed_col]],
+        textposition="outside",
+        cliponaxis=False,
+        customdata=np.column_stack([
+            bands["Players"],
+            bands["Average Peak Power / BM"],
+        ]),
+        hovertemplate=(
+            f"<b>%{{x}}</b><br>{stat} monthly max sprint speed: "
+            "%{y:.2f} ft/s<br>"
+            "Players: %{customdata[0]}<br>"
+            "Mean Peak Power / BM within band: %{customdata[1]:.2f} W/kg"
+            "<extra></extra>"
+        ),
+    ))
+    y_min = max(0, float(bands[speed_col].min()) - 1.5)
+    y_max = float(bands[speed_col].max()) + 1.0
+    fig.update_xaxes(
+        title="Final-month average Peak Power / BM band",
+        showgrid=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title=f"{stat} monthly max sprint speed (ft/s)",
+        range=[y_min, y_max], showgrid=True, gridcolor=GRID,
+        zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 380)
 
 
 # -----------------------------------------------------------------------------
@@ -3056,12 +3457,15 @@ if refresh:
     load_source_data.clear()
 
 try:
-    jump, velo, bat, pinch, status = load_source_data()
+    jump, jump_power, velo, bat, pinch, sprint, status = load_source_data()
 except Exception as exc:
     st.error(f"Could not load data. {exc}")
     st.stop()
 
-all_dates = pd.concat([jump["date"], velo["date"], bat["month"], pinch["date"]], ignore_index=True).dropna()
+all_dates = pd.concat([
+    jump["date"], jump_power["date"], velo["date"], bat["month"],
+    pinch["date"], sprint["month"],
+], ignore_index=True).dropna()
 min_date = all_dates.min().date()
 max_date = all_dates.max().date()
 default_start = max(pd.Timestamp(year=max_date.year, month=1, day=1).date(), min_date)
@@ -3080,8 +3484,10 @@ with st.sidebar:
 
     available_teams = (
         set(jump["team"].dropna().unique().tolist())
+        | set(jump_power["team"].dropna().unique().tolist())
         | set(bat["team"].dropna().unique().tolist())
         | set(pinch["team"].dropna().unique().tolist())
+        | set(sprint["team"].dropna().unique().tolist())
     )
     teams = ["All Teams"] + [team for team in INCLUDED_TEAMS if team in available_teams]
     team_filter = st.selectbox("Team", teams)
@@ -3114,11 +3520,30 @@ with st.sidebar:
         index=0,
         key="ci_band_bat_speed_stat",
     )
+    power_lookup = st.number_input(
+        "Peak Power / BM lookup",
+        min_value=0.0, step=1.0, value=60.0, format="%.1f",
+    )
+    power_band_width = st.selectbox(
+        "Peak Power / BM band",
+        [1.0, 2.0, 2.5, 5.0],
+        index=2,
+        format_func=lambda x: f"{x:g} W/kg",
+    )
+    power_band_sprint_stat = st.selectbox(
+        "Power band sprint speed",
+        ["Mean", "Median"],
+        index=0,
+        key="power_band_sprint_speed_stat",
+    )
 
     st.markdown("---")
     min_velo_records = st.number_input("Min FB records", min_value=1, step=1, value=1)
     min_ci_jumps = st.number_input("Min CI jumps", min_value=1, step=1, value=1)
     min_pinch_tests = st.number_input("Min pinch tests", min_value=1, step=1, value=1)
+    min_power_jumps = st.number_input(
+        "Min relative-power jumps", min_value=1, step=1, value=1
+    )
     show_labels = st.checkbox("Show names")
 
 
@@ -3155,6 +3580,14 @@ bat_monthly_pairs = build_bat_monthly_pairs(
     team_filter=team_filter,
     min_ci_jumps=int(min_ci_jumps),
 )
+sprint_overview_summary = build_sprint_overview_summary(
+    jump_power=jump_power,
+    sprint=sprint,
+    start_date=start_date,
+    end_date=end_date,
+    team_filter=team_filter,
+    min_power_jumps=int(min_power_jumps),
+)
 period_text = f"{fmt_date(start_date)} – {fmt_date(end_date)}"
 title_col, filter_col = st.columns([4, 1])
 with title_col:
@@ -3170,11 +3603,13 @@ st.markdown(f"<div style='color:#667085;font-size:13px;margin:3px 0 20px;'>{html
     overview_tab,
     pinch_overview_tab,
     combined_model_tab,
+    sprint_overview_tab,
     bat_overview_tab,
 ) = st.tabs([
     "FB Velo Overview",
     "Pinch Grip Overview",
     "Combined CI + Pinch Overview",
+    "Sprint Speed Overview",
     "Bat Speed Overview",
 ])
 
@@ -3753,6 +4188,201 @@ with combined_model_tab:
                     ),
                     "Average Pinch": st.column_config.NumberColumn(
                         format="%.2f"
+                    ),
+                },
+            )
+
+
+with sprint_overview_tab:
+    sprint_stats = sprint_correlation_stats(sprint_overview_summary)
+    n_sprint_players = len(sprint_overview_summary)
+    mean_sprint_speed = (
+        sprint_overview_summary["monthly_max_sprint_speed"].mean()
+        if n_sprint_players else np.nan
+    )
+    mean_power_rel = (
+        sprint_overview_summary["avg_peak_power_rel"].mean()
+        if n_sprint_players else np.nan
+    )
+    sprint_r_text = (
+        f"{sprint_stats[0]:+.2f}" if sprint_stats is not None else "—"
+    )
+    potential_sprint_increase = (
+        sprint_stats[2] * POTENTIAL_PEAK_POWER_REL_INCREASE
+        if sprint_stats is not None else np.nan
+    )
+    potential_sprint_text = (
+        f"{potential_sprint_increase:+.2f} ft/s"
+        if pd.notna(potential_sprint_increase) else "—"
+    )
+
+    sprint_r2_text = (
+        f"{sprint_stats[1]:.2f}" if sprint_stats is not None else "—"
+    )
+    top_cols = st.columns(3)
+    top_metrics = [
+        ("Players / Observations", str(n_sprint_players), BLUE),
+        ("Correlation", sprint_r_text, ACCENT_RED),
+        ("R²", sprint_r2_text, NAVY_MID),
+    ]
+    for column, values in zip(top_cols, top_metrics):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    bottom_cols = st.columns(3)
+    bottom_metrics = [
+        (
+            "Monthly Max Sprint Speed",
+            f"{fmt(mean_sprint_speed)} ft/s",
+            TEAL,
+        ),
+        (
+            "Final-Month Avg Peak Power / BM",
+            f"{fmt(mean_power_rel)} W/kg",
+            GREEN,
+        ),
+        (
+            f"Sprint-Speed Association · +{POTENTIAL_PEAK_POWER_REL_INCREASE:.0f} W/kg",
+            potential_sprint_text,
+            NAVY_MID,
+        ),
+    ]
+    for column, values in zip(bottom_cols, bottom_metrics):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    st.caption(
+        "Each observation is one player. The app finds that player’s final eligible "
+        "month in the selected range, uses the final monthly_max_sprint_speed "
+        "value from PP_Sprint, and matches it to mean Peak Power / BM [W/kg] "
+        "from Jump Data in that same month. "
+        "The +5 W/kg card is the selected sample's regression slope × 5 and "
+        "is an association, not a guaranteed individual improvement."
+    )
+
+    estimated_sprint_speed = (
+        sprint_stats[2] * float(power_lookup) + sprint_stats[3]
+        if sprint_stats is not None else np.nan
+    )
+    with st.container(border=True):
+        st.subheader("Relative Peak Power Lookup", anchor=False)
+        lookup_left, lookup_right = st.columns(2)
+        with lookup_left:
+            st.markdown(
+                "<div class='metric-label'>Final-Month Average Peak Power / BM</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div class='lookup-value' style='color:#0A1F44;'>"
+                f"{fmt(power_lookup, 1)} W/kg</div>",
+                unsafe_allow_html=True,
+            )
+        with lookup_right:
+            st.markdown(
+                "<div class='metric-label'>Estimated Monthly Max Sprint Speed</div>",
+                unsafe_allow_html=True,
+            )
+            lookup_value = (
+                f"{fmt(estimated_sprint_speed)} ft/s"
+                if pd.notna(estimated_sprint_speed) else "—"
+            )
+            st.markdown(
+                f"<div class='lookup-value' style='color:#0D7E8A;'>"
+                f"{lookup_value}</div>",
+                unsafe_allow_html=True,
+            )
+
+    with st.container(border=True):
+        st.subheader(
+            f"{power_band_sprint_stat} Monthly Max Sprint Speed by Peak Power / BM Band",
+            anchor=False,
+        )
+        st.plotly_chart(
+            build_sprint_band_chart(
+                sprint_overview_summary,
+                float(power_band_width),
+                power_band_sprint_stat,
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=(
+                f"sprint_power_band_{power_band_width}_{power_band_sprint_stat}_"
+                f"{team_filter}_{start_date}_{end_date}"
+            ),
+        )
+
+    with st.container(border=True):
+        st.subheader(
+            "Final-Month Peak Power / BM vs Monthly Max Sprint Speed",
+            anchor=False,
+        )
+        st.plotly_chart(
+            build_sprint_scatter(
+                sprint_overview_summary,
+                show_labels,
+                float(power_lookup),
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=(
+                f"sprint_scatter_{team_filter}_{start_date}_{end_date}_"
+                f"{show_labels}_{power_lookup}"
+            ),
+        )
+
+    with st.container(border=True):
+        st.subheader("Player Results", anchor=False)
+        if sprint_overview_summary.empty:
+            st.info("No matching players.")
+        else:
+            sprint_display = sprint_overview_summary[[
+                "athlete",
+                "team",
+                "month",
+                "monthly_max_sprint_speed",
+                "sprint_speed_as_of",
+                "avg_peak_power_rel",
+                "power_jumps",
+                "power_test_dates",
+                "first_power_date",
+                "last_power_date",
+            ]].copy()
+            sprint_display.columns = [
+                "Player",
+                "Team",
+                "Month",
+                "Monthly Max Sprint Speed",
+                "Sprint Speed As Of",
+                "Final-Month Avg Peak Power / BM",
+                "Jump Rows",
+                "Jump Test Dates",
+                "First Jump",
+                "Last Jump",
+            ]
+            sprint_display["Month"] = (
+                pd.to_datetime(sprint_display["Month"]).dt.strftime("%b %Y")
+            )
+            for date_col in [
+                "Sprint Speed As Of", "First Jump", "Last Jump"
+            ]:
+                sprint_display[date_col] = sprint_display[date_col].map(fmt_date)
+            sprint_display["Monthly Max Sprint Speed"] = (
+                sprint_display["Monthly Max Sprint Speed"].round(2)
+            )
+            sprint_display["Final-Month Avg Peak Power / BM"] = (
+                sprint_display["Final-Month Avg Peak Power / BM"].round(2)
+            )
+            st.dataframe(
+                sprint_display,
+                hide_index=True,
+                use_container_width=True,
+                height=min(660, 44 + 36 * (len(sprint_display) + 1)),
+                column_config={
+                    "Monthly Max Sprint Speed": st.column_config.NumberColumn(
+                        format="%.2f ft/s"
+                    ),
+                    "Final-Month Avg Peak Power / BM": st.column_config.NumberColumn(
+                        format="%.2f W/kg"
                     ),
                 },
             )
