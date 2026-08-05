@@ -23,9 +23,9 @@ Sprinting:
   * Cross-sectional monthly analysis.
 
 Hitting:
-  * One final monthly_avg_bat_speed value per hitter-month.
-  * Mean raw CI from the same calendar month.
-  * Cross-sectional monthly analysis.
+  * One final eligible-month monthly_avg_bat_speed observation per hitter.
+  * Mean raw CI from Jump Data in that same calendar month.
+  * Only the latest qualifying matched month is retained, giving one observation per hitter.
 """
 from __future__ import annotations
 
@@ -1299,18 +1299,28 @@ def build_bat_monthly_pairs(
     team_filter: str,
     min_ci_jumps: int,
 ) -> pd.DataFrame:
-    """Match calendar-month CI averages to monthly_avg_bat_speed."""
-    start_month = pd.Timestamp(start_date).to_period("M").start_time.normalize()
-    end_month = pd.Timestamp(end_date).to_period("M").start_time.normalize()
+    """Create one hitter-level observation from the latest qualifying month.
 
-    jump_monthly = jump.copy()
-    jump_monthly["month"] = jump_monthly["date"].dt.to_period("M").dt.to_timestamp()
-    jump_monthly = jump_monthly[
-        (jump_monthly["month"] >= start_month)
-        & (jump_monthly["month"] <= end_month)
-    ]
+    A qualifying month must contain a valid final monthly_avg_bat_speed value
+    whose as-of date falls inside the selected dashboard date range and at
+    least min_ci_jumps raw CI rows from Jump Data in that same month and
+    selected date range. After those rules are applied, only each hitter's
+    latest qualifying month is retained, so the regression receives exactly
+    one row per hitter.
+    """
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+
+    # Apply the actual selected dates before assigning Jump Data to months.
+    # This prevents tests outside a partial selected month from contributing.
+    jump_window = jump[
+        (jump["date"] >= start) & (jump["date"] <= end)
+    ].copy()
+    jump_window["month"] = (
+        jump_window["date"].dt.to_period("M").dt.to_timestamp()
+    )
     ci_monthly = (
-        jump_monthly.groupby(["name_key", "month"], as_index=False)
+        jump_window.groupby(["name_key", "month"], as_index=False)
         .agg(
             athlete=("athlete", "first"),
             avg_ci=("ci", "mean"),
@@ -1329,29 +1339,50 @@ def build_bat_monthly_pairs(
         .rename(columns={"team": "current_team"})
     )
 
+    # The bat table already contains one final non-null monthly value per
+    # hitter-month. Require that final value's as-of date to fall inside the
+    # selected dashboard window.
     bat_window = bat[
-        (bat["month"] >= start_month) & (bat["month"] <= end_month)
+        (bat["bat_speed_as_of"] >= start)
+        & (bat["bat_speed_as_of"] <= end)
     ].copy()
-    pairs = ci_monthly.merge(
+
+    eligible = ci_monthly.merge(
         bat_window, on=["name_key", "month"], how="inner"
     )
-    pairs = pairs.merge(team_lookup, on="name_key", how="left")
-    pairs["team"] = pairs["current_team"].combine_first(pairs["team"])
-    pairs = pairs.drop(columns=["current_team"])
-    pairs["team"] = pairs["team"].fillna("Unassigned")
-    pairs = pairs[
-        pairs["ci_jumps"] >= max(1, int(min_ci_jumps))
+    eligible = eligible.merge(team_lookup, on="name_key", how="left")
+    eligible["team"] = eligible["current_team"].combine_first(
+        eligible["team"]
+    )
+    eligible = eligible.drop(columns=["current_team"])
+    eligible["team"] = eligible["team"].fillna("Unassigned")
+    eligible = eligible[
+        eligible["ci_jumps"] >= max(1, int(min_ci_jumps))
     ].copy()
 
     if team_filter != "All Teams":
-        pairs = pairs[pairs["team"] == team_filter].copy()
+        eligible = eligible[eligible["team"] == team_filter].copy()
 
-    pairs["month_label"] = pairs["month"].dt.strftime("%b %Y")
-    pairs["observation"] = (
-        pairs["athlete"] + " · " + pairs["month_label"]
+    if eligible.empty:
+        eligible["month_label"] = pd.Series(dtype=str)
+        eligible["observation"] = pd.Series(dtype=str)
+        return eligible.reset_index(drop=True)
+
+    # Select the latest qualifying month only after matching and minimum-data
+    # rules, preserving one independent cross-sectional observation per hitter.
+    summary = (
+        eligible.sort_values(
+            ["name_key", "month", "bat_speed_as_of"],
+            kind="stable",
+        )
+        .groupby("name_key", as_index=False)
+        .tail(1)
+        .copy()
     )
-    return pairs.sort_values(
-        ["month", "athlete"], kind="stable"
+    summary["month_label"] = summary["month"].dt.strftime("%b %Y")
+    summary["observation"] = summary["athlete"]
+    return summary.sort_values(
+        ["athlete"], kind="stable"
     ).reset_index(drop=True)
 
 
@@ -1378,9 +1409,7 @@ def bat_ci_band_summary(
     speed_col = f"{stat} Monthly Bat Speed"
     if pairs.empty:
         return pd.DataFrame(
-            columns=[
-                "CI band", speed_col, "Hitter-Months", "Hitters", "Average CI"
-            ]
+            columns=["CI band", speed_col, "Hitters", "Average CI"]
         )
 
     width = max(1, int(band_width))
@@ -1396,7 +1425,6 @@ def bat_ci_band_summary(
                     "monthly_avg_bat_speed",
                     "median" if stat == "Median" else "mean",
                 ),
-                "Hitter-Months": ("monthly_avg_bat_speed", "count"),
                 "Hitters": ("name_key", "nunique"),
                 "Average CI": ("avg_ci", "mean"),
             }
@@ -1408,9 +1436,7 @@ def bat_ci_band_summary(
     )
     grouped[speed_col] = grouped[speed_col].round(2)
     grouped["Average CI"] = grouped["Average CI"].round(2)
-    return grouped[
-        ["CI band", speed_col, "Hitter-Months", "Hitters", "Average CI"]
-    ]
+    return grouped[["CI band", speed_col, "Hitters", "Average CI"]]
 
 
 def build_bat_scatter(
@@ -1421,7 +1447,7 @@ def build_bat_scatter(
     fig = go.Figure()
     if pairs.empty:
         fig.add_annotation(
-            text="No matched hitter-months meet the selected rules.",
+            text="No matched hitters meet the selected rules.",
             showarrow=False,
             font={"size": 15, "color": SUBTEXT},
             x=0.5,
@@ -1560,7 +1586,7 @@ def build_bat_band_chart(
     fig = go.Figure()
     if bands.empty:
         fig.add_annotation(
-            text="No matched hitter-months are available for CI bands.",
+            text="No matched hitters are available for CI bands.",
             showarrow=False,
             font={"size": 14, "color": SUBTEXT},
             x=0.5,
@@ -1580,15 +1606,13 @@ def build_bat_band_chart(
         textposition="outside",
         cliponaxis=False,
         customdata=np.column_stack([
-            bands["Hitter-Months"],
             bands["Hitters"],
             bands["Average CI"],
         ]),
         hovertemplate=(
             f"<b>%{{x}}</b><br>{stat} monthly bat speed: %{{y:.2f}} mph<br>"
-            "Hitter-months: %{customdata[0]}<br>"
-            "Hitters: %{customdata[1]}<br>"
-            "Mean CI within band: %{customdata[2]:.2f} N·s"
+            "Hitters: %{customdata[0]}<br>"
+            "Mean CI within band: %{customdata[1]:.2f} N·s"
             "<extra></extra>"
         ),
     ))
@@ -4437,18 +4461,14 @@ with sprint_overview_tab:
 
 with bat_overview_tab:
     bat_stats = bat_correlation_stats(bat_monthly_pairs)
-    n_hitter_months = len(bat_monthly_pairs)
-    n_hitters = (
-        bat_monthly_pairs["name_key"].nunique()
-        if n_hitter_months else 0
-    )
+    n_hitters = len(bat_monthly_pairs)
     mean_bat_speed = (
         bat_monthly_pairs["monthly_avg_bat_speed"].mean()
-        if n_hitter_months else np.nan
+        if n_hitters else np.nan
     )
     mean_monthly_ci = (
         bat_monthly_pairs["avg_ci"].mean()
-        if n_hitter_months else np.nan
+        if n_hitters else np.nan
     )
     bat_r_text = (
         f"{bat_stats[0]:+.2f}" if bat_stats is not None else "—"
@@ -4462,10 +4482,9 @@ with bat_overview_tab:
         if pd.notna(potential_bat_increase) else "—"
     )
 
-    top_cols = st.columns(3)
+    top_cols = st.columns(2)
     top_metrics = [
-        ("Hitter-Months", str(n_hitter_months), BLUE),
-        ("Hitters", str(n_hitters), NAVY_MID),
+        ("Hitters", str(n_hitters), BLUE),
         ("Correlation", bat_r_text, ACCENT_RED),
     ]
     for column, values in zip(top_cols, top_metrics):
@@ -4495,11 +4514,12 @@ with bat_overview_tab:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
     st.caption(
-        "Each observation is one hitter-month: mean raw CI from the "
-        "calendar month matched to the final monthly_avg_bat_speed value "
-        "for that same month. Potential bat-speed increase is the selected "
-        "sample's regression slope × 10 N·s and is not a guaranteed "
-        "individual response."
+        "Each observation is one hitter. The dashboard finds that hitter's "
+        "latest qualifying matched month in the selected range, then pairs the "
+        "month's mean raw CI with its final monthly_avg_bat_speed value. Earlier "
+        "matched months are excluded. Potential bat-speed increase is the selected "
+        "sample's regression slope × 10 N·s and is not a guaranteed individual "
+        "response."
     )
 
     estimated_bat_speed = (
@@ -4573,9 +4593,9 @@ with bat_overview_tab:
         )
 
     with st.container(border=True):
-        st.subheader("Hitter-Month Results", anchor=False)
+        st.subheader("Hitter Results", anchor=False)
         if bat_monthly_pairs.empty:
-            st.info("No matching hitter-months.")
+            st.info("No matching hitters.")
         else:
             bat_display = bat_monthly_pairs[[
                 "athlete",
