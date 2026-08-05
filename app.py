@@ -1640,6 +1640,190 @@ def build_bat_band_chart(
 
 
 
+def bat_ci_band_members(
+    pairs: pd.DataFrame,
+    band_width: int,
+    ci_band: str,
+    bat_stat: str = "Mean",
+) -> tuple[pd.DataFrame, float, str]:
+    """Return all hitters in one CI band and flag them versus that band's mean/median bat speed."""
+    stat = "Median" if str(bat_stat).strip().lower() == "median" else "Mean"
+    width = max(1, int(band_width))
+
+    cols = [
+        "athlete", "team", "month_label", "avg_ci",
+        "monthly_avg_bat_speed",
+    ]
+    if pairs.empty or any(col not in pairs.columns for col in cols):
+        return (
+            pd.DataFrame(columns=cols + ["CI band", "Status", "Difference"]),
+            np.nan,
+            stat,
+        )
+
+    detail = pairs[cols].dropna(
+        subset=["avg_ci", "monthly_avg_bat_speed"]
+    ).copy()
+    detail["band_start"] = np.floor(detail["avg_ci"] / width) * width
+    detail["CI band"] = detail["band_start"].map(
+        lambda lower: f"{lower:.0f}–{lower + width:.0f} N·s"
+    )
+    detail = detail[detail["CI band"] == ci_band].copy()
+    if detail.empty:
+        return detail, np.nan, stat
+
+    reference = (
+        float(detail["monthly_avg_bat_speed"].median())
+        if stat == "Median"
+        else float(detail["monthly_avg_bat_speed"].mean())
+    )
+    detail["Difference"] = detail["monthly_avg_bat_speed"] - reference
+    detail["Status"] = np.where(
+        np.isclose(detail["Difference"], 0, atol=1e-10),
+        f"At {stat.lower()}",
+        np.where(
+            detail["Difference"] > 0,
+            f"Above {stat.lower()}",
+            f"Below {stat.lower()}",
+        ),
+    )
+    detail["Display"] = detail.apply(
+        lambda row: f"{row['athlete']} · {row['avg_ci']:.1f} CI",
+        axis=1,
+    )
+    return (
+        detail.sort_values(
+            "monthly_avg_bat_speed", ascending=False
+        ).reset_index(drop=True),
+        reference,
+        stat,
+    )
+
+
+def build_bat_ci_band_member_chart(
+    pairs: pd.DataFrame,
+    band_width: int,
+    ci_band: str,
+    bat_stat: str = "Mean",
+) -> go.Figure:
+    """Horizontal detail chart for every hitter in a selected CI band."""
+    detail, reference, stat = bat_ci_band_members(
+        pairs, band_width, ci_band, bat_stat
+    )
+    fig = go.Figure()
+
+    if detail.empty:
+        fig.add_annotation(
+            text="No hitters are available in this CI band.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 340)
+
+    status_style = [
+        (f"Above {stat.lower()}", GREEN),
+        (f"At {stat.lower()}", TEAL),
+        (f"Below {stat.lower()}", ACCENT_RED),
+    ]
+    category_order = detail["Display"].tolist()
+
+    for status, color in status_style:
+        sub = detail[detail["Status"] == status].copy()
+        if sub.empty:
+            continue
+        customdata = np.column_stack([
+            sub["athlete"],
+            sub["team"],
+            sub["month_label"],
+            sub["avg_ci"],
+            sub["Difference"],
+            sub["Status"],
+        ])
+        fig.add_trace(go.Bar(
+            x=sub["monthly_avg_bat_speed"],
+            y=sub["Display"],
+            orientation="h",
+            name=status.title(),
+            marker={
+                "color": color,
+                "line": {"color": "#FFFFFF", "width": 1},
+            },
+            text=[
+                f"{value:.2f}"
+                for value in sub["monthly_avg_bat_speed"]
+            ],
+            textposition="outside",
+            cliponaxis=False,
+            customdata=customdata,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Team: %{customdata[1]}<br>"
+                "Matched month: %{customdata[2]}<br>"
+                "Monthly average CI: %{customdata[3]:.2f} N·s<br>"
+                "Monthly average bat speed: %{x:.2f} mph<br>"
+                f"{stat} difference: %{{customdata[4]:+.2f}} mph<br>"
+                "Flag: %{customdata[5]}<extra></extra>"
+            ),
+        ))
+
+    x_min = max(
+        0,
+        float(detail["monthly_avg_bat_speed"].min()) - 2.0,
+    )
+    x_max = float(detail["monthly_avg_bat_speed"].max()) + 1.5
+    fig.add_vline(
+        x=reference,
+        line_color=NAVY_MID,
+        line_width=2,
+        line_dash="dash",
+        annotation_text=f"{stat} {reference:.2f}",
+        annotation_font_color=NAVY_MID,
+        annotation_position="top right",
+    )
+    fig.update_xaxes(
+        title="Monthly average bat speed (mph)",
+        range=[x_min, x_max],
+        showgrid=True,
+        gridcolor=GRID,
+        zeroline=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Hitter · Monthly average CI",
+        categoryorder="array",
+        categoryarray=category_order,
+        autorange="reversed",
+        showgrid=False,
+        linecolor=BORDER,
+        tickfont={"color": TEXT, "size": 12},
+        title_font={"color": SUBTEXT},
+        automargin=True,
+    )
+    fig = base_figure_layout(
+        fig, max(340, len(detail) * 42 + 125)
+    )
+    fig.update_layout(
+        showlegend=True,
+        legend={
+            "orientation": "h",
+            "x": 0,
+            "y": 1.14,
+            "font": {"color": SUBTEXT},
+        },
+        margin={"l": 210, "r": 70, "t": 50, "b": 58},
+    )
+    return fig
+
+
+
 def build_bat_within_pairs(monthly_pairs: pd.DataFrame) -> pd.DataFrame:
     pairs = monthly_pairs.sort_values(
         ["name_key", "month"], kind="stable"
@@ -4572,6 +4756,41 @@ with bat_overview_tab:
                 f"{team_filter}_{start_date}_{end_date}"
             ),
         )
+
+    bat_ci_band_overview = bat_ci_band_summary(
+        bat_monthly_pairs,
+        int(ci_band_width),
+        ci_band_bat_stat,
+    )
+
+    if not bat_ci_band_overview.empty:
+        bat_band_options = bat_ci_band_overview["CI band"].tolist()
+        bat_band_detail_key = "bat_ci_band_detail_selector"
+        if st.session_state.get(bat_band_detail_key) not in bat_band_options:
+            st.session_state[bat_band_detail_key] = bat_band_options[0]
+
+        with st.container(border=True):
+            st.subheader("CI Band Hitters", anchor=False)
+            selected_bat_ci_band = st.selectbox(
+                "Hitter CI band",
+                bat_band_options,
+                key=bat_band_detail_key,
+            )
+            st.plotly_chart(
+                build_bat_ci_band_member_chart(
+                    bat_monthly_pairs,
+                    int(ci_band_width),
+                    selected_bat_ci_band,
+                    ci_band_bat_stat,
+                ),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=(
+                    f"bat_ci_band_detail_{selected_bat_ci_band}_"
+                    f"{ci_band_width}_{ci_band_bat_stat}_{team_filter}_"
+                    f"{start_date}_{end_date}"
+                ),
+            )
 
     with st.container(border=True):
         st.subheader(
