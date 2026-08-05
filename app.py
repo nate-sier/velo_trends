@@ -18,6 +18,7 @@ Combined model:
 
 Sprinting:
   * One final eligible-month monthly_max_sprint_speed observation per player from PP_Sprint.
+  * A sprint month is eligible only when it contains at least 14 distinct valid PP_Sprint data dates.
   * Mean Peak Power / BM [W/kg] from Jump Data in the same calendar month.
   * Cross-sectional monthly analysis.
 
@@ -55,6 +56,7 @@ MIN_LAST_YTD_FB_VELO = 85.0
 POTENTIAL_CI_INCREASE = 10.0
 POTENTIAL_PINCH_INCREASE = 10.0
 POTENTIAL_PEAK_POWER_REL_INCREASE = 5.0
+MIN_SPRINT_MONTH_DATA_DATES = 14
 
 # Only these affiliate / roster groups are available in the dashboard.
 INCLUDED_TEAMS = [
@@ -652,8 +654,10 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         .reset_index(drop=True)
     )
 
-    # Monthly max sprint speed. PP_Sprint repeats the current monthly maximum
-    # on game rows, so retain the final non-null value per player and month.
+    # Monthly max sprint speed. Keep the valid PP_Sprint source rows here so
+    # the selected dashboard date range can be applied before monthly coverage
+    # is calculated. A qualifying month must contain at least 14 DISTINCT data
+    # dates; merely having two sparse records 14 days apart is not sufficient.
     sprint = pd.DataFrame({
         "athlete": bat_raw[bat_name_col].astype(str).str.strip(),
         "date": parse_sheet_dates(bat_raw[bat_date_col]),
@@ -671,22 +675,14 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         (sprint["athlete"] != "") & (sprint["name_key"] != "")
     ].dropna(subset=["date", "monthly_max_sprint_speed"])
     sprint["month"] = sprint["date"].dt.to_period("M").dt.to_timestamp()
-    sprint = sprint.sort_values(["name_key", "month", "date"], kind="stable")
-    sprint = (
-        sprint.groupby(["name_key", "month"], as_index=False)
-        .tail(1)[[
-            "name_key", "athlete", "month", "date",
-            "monthly_max_sprint_speed", "team",
-        ]]
-        .rename(columns={"date": "sprint_speed_as_of"})
-        .sort_values(["athlete", "month"], kind="stable")
-        .reset_index(drop=True)
-    )
+    sprint = sprint.sort_values(
+        ["name_key", "month", "date"], kind="stable"
+    ).reset_index(drop=True)
 
     status = (
         f"Loaded {len(jump):,} CI rows, {len(jump_power):,} relative-power rows, "
         f"{len(velo):,} FB Velo rows, {len(pinch):,} Pinch Grip rows, "
-        f"{len(sprint):,} player-month sprint-speed source rows, and {len(bat):,} "
+        f"{len(sprint):,} valid sprint-speed source rows, and {len(bat):,} "
         f"hitter-month bat-speed rows · "
         f"{datetime.now().strftime('%I:%M %p').lstrip('0')}"
     )
@@ -1893,21 +1889,24 @@ def build_sprint_overview_summary(
 ) -> pd.DataFrame:
     """Create one player-level observation from each player's final eligible month.
 
-    An eligible month must have a final monthly_max_sprint_speed value from
-    PP_Sprint and at least min_power_jumps Peak Power / BM rows in Jump Data.
-    The regression therefore receives exactly one row per player.
+    An eligible month must contain a valid final monthly_max_sprint_speed value,
+    at least 14 distinct PP_Sprint data dates inside the selected dashboard date
+    range, and at least min_power_jumps Peak Power / BM rows from Jump Data in
+    that same month and selected date range. The regression therefore receives
+    exactly one row per player.
     """
-    start_month = pd.Timestamp(start_date).to_period("M").start_time.normalize()
-    end_month = pd.Timestamp(end_date).to_period("M").start_time.normalize()
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
 
-    power_window = jump_power.copy()
+    # Apply the ACTUAL selected dates before assigning rows to calendar months.
+    # This prevents days before the selected start date or after the selected end
+    # date from helping a partial month qualify.
+    power_window = jump_power[
+        (jump_power["date"] >= start) & (jump_power["date"] <= end)
+    ].copy()
     power_window["month"] = (
         power_window["date"].dt.to_period("M").dt.to_timestamp()
     )
-    power_window = power_window[
-        (power_window["month"] >= start_month)
-        & (power_window["month"] <= end_month)
-    ]
     power_monthly = (
         power_window.groupby(["name_key", "month"], as_index=False)
         .agg(
@@ -1929,12 +1928,45 @@ def build_sprint_overview_summary(
     )
 
     sprint_window = sprint[
-        (sprint["month"] >= start_month)
-        & (sprint["month"] <= end_month)
+        (sprint["date"] >= start) & (sprint["date"] <= end)
     ].copy()
+    sprint_window["month"] = (
+        sprint_window["date"].dt.to_period("M").dt.to_timestamp()
+    )
+    sprint_window = sprint_window.sort_values(
+        ["name_key", "month", "date"], kind="stable"
+    )
+
+    sprint_monthly_coverage = (
+        sprint_window.groupby(["name_key", "month"], as_index=False)
+        .agg(
+            first_sprint_date=("date", "min"),
+            last_sprint_date=("date", "max"),
+            sprint_data_dates=("date", "nunique"),
+            sprint_source_rows=("date", "size"),
+        )
+    )
+    sprint_monthly_coverage["sprint_coverage_days"] = (
+        sprint_monthly_coverage["last_sprint_date"]
+        - sprint_monthly_coverage["first_sprint_date"]
+    ).dt.days + 1
+
+    sprint_monthly_final = (
+        sprint_window.groupby(["name_key", "month"], as_index=False)
+        .tail(1)[[
+            "name_key", "athlete", "month", "date",
+            "monthly_max_sprint_speed", "team",
+        ]]
+        .rename(columns={"date": "sprint_speed_as_of"})
+        .merge(
+            sprint_monthly_coverage,
+            on=["name_key", "month"],
+            how="left",
+        )
+    )
 
     eligible = power_monthly.merge(
-        sprint_window,
+        sprint_monthly_final,
         on=["name_key", "month"],
         how="inner",
         suffixes=("", "_sprint"),
@@ -1946,7 +1978,11 @@ def build_sprint_overview_summary(
     eligible = eligible.drop(columns=["current_team"])
     eligible["team"] = eligible["team"].fillna("Unassigned")
     eligible = eligible[
-        eligible["power_jumps"] >= max(1, int(min_power_jumps))
+        (eligible["power_jumps"] >= max(1, int(min_power_jumps)))
+        & (
+            eligible["sprint_data_dates"]
+            >= MIN_SPRINT_MONTH_DATA_DATES
+        )
     ].copy()
 
     if team_filter != "All Teams":
@@ -1957,8 +1993,8 @@ def build_sprint_overview_summary(
         eligible["observation"] = pd.Series(dtype=str)
         return eligible.reset_index(drop=True)
 
-    # The final eligible month is selected only after all matching and minimum-
-    # data rules are applied. This guarantees one independent player-level row.
+    # Select the final qualifying month only after all matching and minimum-data
+    # rules are applied, preserving one independent observation per player.
     summary = (
         eligible.sort_values(
             ["name_key", "month", "sprint_speed_as_of"],
@@ -3464,7 +3500,7 @@ except Exception as exc:
 
 all_dates = pd.concat([
     jump["date"], jump_power["date"], velo["date"], bat["month"],
-    pinch["date"], sprint["month"],
+    pinch["date"], sprint["date"],
 ], ignore_index=True).dropna()
 min_date = all_dates.min().date()
 max_date = all_dates.max().date()
@@ -4253,9 +4289,11 @@ with sprint_overview_tab:
 
     st.caption(
         "Each observation is one player. The app finds that player’s final eligible "
-        "month in the selected range, uses the final monthly_max_sprint_speed "
-        "value from PP_Sprint, and matches it to mean Peak Power / BM [W/kg] "
-        "from Jump Data in that same month. "
+        "month in the selected range. A month is eligible only when it contains "
+        "at least 14 distinct valid PP_Sprint data dates inside the selected date "
+        "range. The app then uses the "
+        "final monthly_max_sprint_speed value and matches it to mean Peak Power "
+        "/ BM [W/kg] from Jump Data in that same month. "
         "The +5 W/kg card is the selected sample's regression slope × 5 and "
         "is an association, not a guaranteed individual improvement."
     )
@@ -4341,6 +4379,10 @@ with sprint_overview_tab:
                 "month",
                 "monthly_max_sprint_speed",
                 "sprint_speed_as_of",
+                "first_sprint_date",
+                "last_sprint_date",
+                "sprint_coverage_days",
+                "sprint_data_dates",
                 "avg_peak_power_rel",
                 "power_jumps",
                 "power_test_dates",
@@ -4353,6 +4395,10 @@ with sprint_overview_tab:
                 "Month",
                 "Monthly Max Sprint Speed",
                 "Sprint Speed As Of",
+                "First Sprint Record",
+                "Last Sprint Record",
+                "Sprint Coverage Days",
+                "Sprint Data Dates",
                 "Final-Month Avg Peak Power / BM",
                 "Jump Rows",
                 "Jump Test Dates",
@@ -4363,7 +4409,8 @@ with sprint_overview_tab:
                 pd.to_datetime(sprint_display["Month"]).dt.strftime("%b %Y")
             )
             for date_col in [
-                "Sprint Speed As Of", "First Jump", "Last Jump"
+                "Sprint Speed As Of", "First Sprint Record",
+                "Last Sprint Record", "First Jump", "Last Jump"
             ]:
                 sprint_display[date_col] = sprint_display[date_col].map(fmt_date)
             sprint_display["Monthly Max Sprint Speed"] = (
