@@ -4795,7 +4795,7 @@ with st.sidebar:
 
     st.markdown("---")
     low_ci_threshold = st.number_input(
-        "S&C low CI threshold", min_value=0.0, step=1.0, value=280.0, format="%.1f"
+        "S&C low CI threshold", min_value=0.0, step=1.0, value=300.0, format="%.1f"
     )
     low_pinch_threshold = st.number_input(
         "S&C low pinch threshold", min_value=0.0, step=1.0, value=40.0, format="%.1f"
