@@ -59,6 +59,10 @@ DEFAULT_PINCH_TAB = "Pinch Grip"
 LOCAL_SERVICE_ACCOUNT_FILE = Path.home() / "Desktop" / "service_account.json"
 MIN_LAST_YTD_FB_VELO = 85.0
 POTENTIAL_CI_INCREASE = 10.0
+FB_VELO_OUTPUT_BUCKET_WIDTH = 2.0
+SPRINT_SPEED_OUTPUT_BUCKET_WIDTH = 0.5
+BAT_SPEED_OUTPUT_BUCKET_WIDTH = 2.0
+EXIT_VELO_OUTPUT_BUCKET_WIDTH = 2.0
 POTENTIAL_PINCH_INCREASE = 10.0
 POTENTIAL_PEAK_POWER_REL_INCREASE = 5.0
 MIN_SPRINT_MONTH_DATA_DATES = 14
@@ -1093,6 +1097,145 @@ def metric_card(title: str, value: str, accent: str) -> str:
       <div class="metric-value">{html.escape(value)}</div>
     </div>
     """
+
+
+def output_bucket_summary(
+    df: pd.DataFrame,
+    output_col: str,
+    testing_col: str,
+    bucket_width: float,
+    output_bucket_label: str,
+    testing_metric_label: str,
+    output_unit: str,
+    testing_unit: str,
+) -> pd.DataFrame:
+    """Summarize the average testing metric within buckets of the output metric."""
+    cols = [output_col, testing_col]
+    if df.empty or any(col not in df.columns for col in cols):
+        return pd.DataFrame(columns=[
+            output_bucket_label,
+            f"Average {testing_metric_label}",
+            "Observations",
+            f"Average {output_bucket_label}",
+        ])
+
+    width = max(float(bucket_width), 1e-9)
+    work = df[cols].dropna().copy()
+    if work.empty:
+        return pd.DataFrame(columns=[
+            output_bucket_label,
+            f"Average {testing_metric_label}",
+            "Observations",
+            f"Average {output_bucket_label}",
+        ])
+
+    work["band_start"] = np.floor(work[output_col] / width) * width
+    grouped = (
+        work.groupby("band_start", as_index=False)
+        .agg(
+            **{
+                f"Average {testing_metric_label}": (testing_col, "mean"),
+                "Observations": (testing_col, "count"),
+                f"Average {output_bucket_label}": (output_col, "mean"),
+            }
+        )
+        .sort_values("band_start")
+        .reset_index(drop=True)
+    )
+
+    def _fmt_bucket(lower: float) -> str:
+        upper = lower + width
+        if float(width).is_integer():
+            return f"{lower:.0f}–{upper:.0f} {output_unit}"
+        return f"{lower:.1f}–{upper:.1f} {output_unit}"
+
+    grouped[output_bucket_label] = grouped["band_start"].map(_fmt_bucket)
+    grouped[f"Average {testing_metric_label}"] = grouped[f"Average {testing_metric_label}"].round(2)
+    grouped[f"Average {output_bucket_label}"] = grouped[f"Average {output_bucket_label}"].round(2)
+    grouped["Observations"] = grouped["Observations"].astype(int)
+    return grouped[[
+        output_bucket_label,
+        f"Average {testing_metric_label}",
+        "Observations",
+        f"Average {output_bucket_label}",
+    ]]
+
+
+def build_output_bucket_chart(
+    df: pd.DataFrame,
+    output_col: str,
+    testing_col: str,
+    bucket_width: float,
+    output_bucket_label: str,
+    testing_metric_label: str,
+    output_axis_title: str,
+    testing_axis_title: str,
+    output_unit: str,
+    empty_text: str,
+    color: str = BLUE,
+) -> go.Figure:
+    bands = output_bucket_summary(
+        df=df,
+        output_col=output_col,
+        testing_col=testing_col,
+        bucket_width=bucket_width,
+        output_bucket_label=output_bucket_label,
+        testing_metric_label=testing_metric_label,
+        output_unit=output_unit,
+        testing_unit="",
+    )
+    value_col = f"Average {testing_metric_label}"
+    output_avg_col = f"Average {output_bucket_label}"
+
+    fig = go.Figure()
+    if bands.empty:
+        fig.add_annotation(
+            text=empty_text,
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 380)
+
+    fig.add_trace(go.Bar(
+        x=bands[output_bucket_label],
+        y=bands[value_col],
+        marker={"color": color, "line": {"color": NAVY_MID, "width": 0.8}},
+        text=[f"{value:.1f}" for value in bands[value_col]],
+        textposition="outside",
+        cliponaxis=False,
+        customdata=np.column_stack([bands["Observations"], bands[output_avg_col]]),
+        hovertemplate=(
+            f"<b>%{{x}}</b><br>Average {testing_metric_label}: %{{y:.2f}}<br>"
+            "Observations: %{customdata[0]}<br>"
+            f"Mean {output_axis_title.lower()}: %{{customdata[1]:.2f}} {output_unit}<extra></extra>"
+        ),
+    ))
+    y_min = max(0, float(bands[value_col].min()) - 1.5)
+    y_max = float(bands[value_col].max()) + 1.25
+    fig.update_xaxes(
+        title=output_axis_title,
+        showgrid=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title=testing_axis_title,
+        range=[y_min, y_max],
+        showgrid=True,
+        gridcolor=GRID,
+        zeroline=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 380)
 
 
 def fisher_mean_correlation(values: pd.Series) -> float:
@@ -4447,6 +4590,28 @@ with overview_tab:
             key=f"ci_band_chart_{ci_band_width}_{ci_band_velo_stat}_{team_filter}_{start_date}_{end_date}",
         )
 
+
+    with st.container(border=True):
+        st.subheader("Average CI by FB Velo Bucket", anchor=False)
+        st.plotly_chart(
+            build_output_bucket_chart(
+                df=summary,
+                output_col="avg_fb_velo",
+                testing_col="avg_ci",
+                bucket_width=FB_VELO_OUTPUT_BUCKET_WIDTH,
+                output_bucket_label="FB velo bucket",
+                testing_metric_label="CI",
+                output_axis_title="Last YTD FB velo bucket",
+                testing_axis_title="Average CI (N·s)",
+                output_unit="mph",
+                empty_text="No matched pitchers are available for FB velo buckets.",
+                color=TEAL,
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"fb_velo_output_bucket_{team_filter}_{start_date}_{end_date}",
+        )
+
     if not ci_band_overview.empty:
         band_options = ci_band_overview["CI band"].tolist()
         band_detail_key = "ci_band_detail_selector"
@@ -4614,6 +4779,28 @@ with pinch_overview_tab:
                 f"pinch_band_chart_{pinch_band_width}_"
                 f"{pinch_band_velo_stat}_{team_filter}_{start_date}_{end_date}"
             ),
+        )
+
+
+    with st.container(border=True):
+        st.subheader("Average Pinch Strength by FB Velo Bucket", anchor=False)
+        st.plotly_chart(
+            build_output_bucket_chart(
+                df=pinch_view,
+                output_col="avg_fb_velo",
+                testing_col="avg_pinch_strength",
+                bucket_width=FB_VELO_OUTPUT_BUCKET_WIDTH,
+                output_bucket_label="FB velo bucket",
+                testing_metric_label="pinch strength",
+                output_axis_title="Last YTD FB velo bucket",
+                testing_axis_title="Average pinch strength",
+                output_unit="mph",
+                empty_text="No matched pitchers are available for FB velo buckets.",
+                color=TEAL,
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"pinch_output_bucket_{team_filter}_{start_date}_{end_date}",
         )
 
     if not pinch_band_overview.empty:
@@ -5060,6 +5247,28 @@ with sprint_overview_tab:
             ),
         )
 
+
+    with st.container(border=True):
+        st.subheader("Average Peak Power / BM by Sprint Speed Bucket", anchor=False)
+        st.plotly_chart(
+            build_output_bucket_chart(
+                df=sprint_overview_summary,
+                output_col="monthly_max_sprint_speed",
+                testing_col="avg_peak_power_rel",
+                bucket_width=SPRINT_SPEED_OUTPUT_BUCKET_WIDTH,
+                output_bucket_label="Sprint speed bucket",
+                testing_metric_label="peak power / BM",
+                output_axis_title="Monthly max sprint speed bucket",
+                testing_axis_title="Average peak power / BM (W/kg)",
+                output_unit="ft/s",
+                empty_text="No matched players are available for sprint-speed buckets.",
+                color=TEAL,
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"sprint_output_bucket_{team_filter}_{start_date}_{end_date}",
+        )
+
     with st.container(border=True):
         st.subheader(
             "Final-Month Peak Power / BM vs Monthly Max Sprint Speed",
@@ -5253,6 +5462,28 @@ with bat_overview_tab:
                 f"bat_ci_band_{ci_band_width}_{ci_band_bat_stat}_"
                 f"{team_filter}_{start_date}_{end_date}"
             ),
+        )
+
+
+    with st.container(border=True):
+        st.subheader("Average CI by Bat Speed Bucket", anchor=False)
+        st.plotly_chart(
+            build_output_bucket_chart(
+                df=bat_monthly_pairs,
+                output_col="monthly_avg_bat_speed",
+                testing_col="avg_ci",
+                bucket_width=BAT_SPEED_OUTPUT_BUCKET_WIDTH,
+                output_bucket_label="Bat speed bucket",
+                testing_metric_label="CI",
+                output_axis_title="Monthly average bat speed bucket",
+                testing_axis_title="Average CI (N·s)",
+                output_unit="mph",
+                empty_text="No matched hitters are available for bat-speed buckets.",
+                color=TEAL,
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"bat_output_bucket_{team_filter}_{start_date}_{end_date}",
         )
 
     bat_ci_band_overview = bat_ci_band_summary(
@@ -5479,6 +5710,28 @@ with exit_velo_overview_tab:
                 f"exit_ci_band_{ci_band_width}_{ci_band_exit_stat}_"
                 f"{team_filter}_{start_date}_{end_date}"
             ),
+        )
+
+
+    with st.container(border=True):
+        st.subheader("Average CI by P80 Exit Velo Bucket", anchor=False)
+        st.plotly_chart(
+            build_output_bucket_chart(
+                df=exit_velo_summary,
+                output_col="ytd_p80_exit_velo",
+                testing_col="avg_ci",
+                bucket_width=EXIT_VELO_OUTPUT_BUCKET_WIDTH,
+                output_bucket_label="P80 exit velo bucket",
+                testing_metric_label="CI",
+                output_axis_title="Final YTD P80 exit velo bucket",
+                testing_axis_title="Average CI (N·s)",
+                output_unit="mph",
+                empty_text="No matched hitters are available for P80 exit-velo buckets.",
+                color=TEAL,
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"exit_output_bucket_{team_filter}_{start_date}_{end_date}",
         )
 
     exit_band_overview = exit_velo_ci_band_summary(
