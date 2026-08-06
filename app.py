@@ -4551,17 +4551,23 @@ def build_sc_opportunity_tables(
     model: dict | None,
     low_ci_threshold: float,
     low_pinch_threshold: float,
+    projected_velo_threshold: float,
     high_ci_threshold: float,
     high_pinch_threshold: float,
-    positive_residual_threshold: float,
-    negative_residual_threshold: float,
-    low_velo_threshold: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    low_actual_velo_threshold: float,
+    throwing_residual_threshold: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Build pitcher-level S&C opportunity and inverse-opportunity tables.
 
-    The model has one row per pitcher. A positive residual means the pitcher
-    throws harder than the combined CI + pinch model predicts; a negative
-    residual means the pitcher throws slower than predicted.
+    S&C opportunity requires all three criteria: low CI, low pinch strength,
+    and combined-model projected velocity below the selected cutoff.
+
+    The inverse list requires high CI and high pinch strength while actual
+    final YTD fastball velocity is below the selected cutoff.
+
+    The throwing-development list requires CI at or above the high-CI cutoff,
+    pinch at or above the low-pinch cutoff, and a model residual at or below
+    the selected negative residual threshold.
     """
     output_columns = [
         "athlete",
@@ -4585,7 +4591,7 @@ def build_sc_opportunity_tables(
         or model["data"].empty
     ):
         empty = pd.DataFrame(columns=output_columns)
-        return empty.copy(), empty.copy()
+        return empty.copy(), empty.copy(), empty.copy()
 
     required_columns = {
         "athlete",
@@ -4612,79 +4618,76 @@ def build_sc_opportunity_tables(
     data["low_pinch_flag"] = (
         data["avg_pinch_strength"] < float(low_pinch_threshold)
     )
-    data["positive_residual_flag"] = (
-        data["residual_fb_velo"] >= float(positive_residual_threshold)
+    data["low_projected_velo_flag"] = (
+        data["predicted_fb_velo"] < float(projected_velo_threshold)
     )
 
     data["high_ci_flag"] = data["avg_ci"] >= float(high_ci_threshold)
     data["high_pinch_flag"] = (
         data["avg_pinch_strength"] >= float(high_pinch_threshold)
     )
-    data["low_velo_flag"] = data["avg_fb_velo"] <= float(low_velo_threshold)
-    data["negative_residual_flag"] = (
-        data["residual_fb_velo"] <= float(negative_residual_threshold)
+    data["low_actual_velo_flag"] = (
+        data["avg_fb_velo"] < float(low_actual_velo_threshold)
+    )
+    data["throwing_ci_flag"] = (
+        data["avg_ci"] > float(high_ci_threshold)
+    )
+    data["throwing_pinch_flag"] = (
+        data["avg_pinch_strength"] > float(low_pinch_threshold)
+    )
+    data["negative_throwing_residual_flag"] = (
+        data["residual_fb_velo"] <= float(throwing_residual_threshold)
     )
 
-    def upside_reasons(row: pd.Series) -> str:
-        reasons: list[str] = []
-        if bool(row["low_ci_flag"]):
-            reasons.append(f"CI < {low_ci_threshold:.0f}")
-        if bool(row["low_pinch_flag"]):
-            reasons.append(f"Pinch < {low_pinch_threshold:.0f}")
-        if bool(row["positive_residual_flag"]):
-            reasons.append(
-                f"Residual >= +{positive_residual_threshold:.1f} mph"
-            )
-        return " | ".join(reasons)
-
-    def inverse_reasons(row: pd.Series) -> str:
-        reasons: list[str] = []
-        if bool(row["high_ci_flag"]):
-            reasons.append(f"CI >= {high_ci_threshold:.0f}")
-        if bool(row["high_pinch_flag"]):
-            reasons.append(f"Pinch >= {high_pinch_threshold:.0f}")
-        if bool(row["low_velo_flag"]):
-            reasons.append(f"FB velo <= {low_velo_threshold:.1f} mph")
-        if bool(row["negative_residual_flag"]):
-            reasons.append(
-                f"Residual <= {negative_residual_threshold:.1f} mph"
-            )
-        return " | ".join(reasons)
-
-    # S&C-upside list: low in either physical metric OR substantially above
-    # the model-predicted velocity despite the current physical profile.
     upside = data.loc[
         data["low_ci_flag"]
-        | data["low_pinch_flag"]
-        | data["positive_residual_flag"]
+        & data["low_pinch_flag"]
+        & data["low_projected_velo_flag"]
     ].copy()
-    upside["reasons"] = upside.apply(upside_reasons, axis=1)
+    upside["reasons"] = (
+        f"CI < {low_ci_threshold:.0f} | "
+        f"Pinch < {low_pinch_threshold:.0f} | "
+        f"Projected FB velo < {projected_velo_threshold:.1f} mph"
+    )
     upside = upside.sort_values(
-        [
-            "positive_residual_flag",
-            "residual_fb_velo",
-            "avg_ci",
-            "avg_pinch_strength",
-        ],
-        ascending=[False, False, True, True],
+        ["predicted_fb_velo", "avg_ci", "avg_pinch_strength"],
+        ascending=[True, True, True],
     )
 
-    # Inverse list: strong in both physical metrics, but either below the
-    # absolute velocity cutoff or meaningfully below model expectation.
     inverse = data.loc[
         data["high_ci_flag"]
         & data["high_pinch_flag"]
-        & (data["low_velo_flag"] | data["negative_residual_flag"])
+        & data["low_actual_velo_flag"]
     ].copy()
-    inverse["reasons"] = inverse.apply(inverse_reasons, axis=1)
+    inverse["reasons"] = (
+        f"CI >= {high_ci_threshold:.0f} | "
+        f"Pinch >= {high_pinch_threshold:.0f} | "
+        f"Actual FB velo < {low_actual_velo_threshold:.1f} mph"
+    )
     inverse = inverse.sort_values(
-        ["avg_fb_velo", "residual_fb_velo"],
-        ascending=[True, True],
+        ["avg_fb_velo", "predicted_fb_velo"],
+        ascending=[True, False],
+    )
+
+    throwing = data.loc[
+        data["throwing_ci_flag"]
+        & data["throwing_pinch_flag"]
+        & data["negative_throwing_residual_flag"]
+    ].copy()
+    throwing["reasons"] = (
+        f"CI > {high_ci_threshold:.0f} | "
+        f"Pinch > {low_pinch_threshold:.0f} | "
+        f"Residual <= {throwing_residual_threshold:.1f} mph"
+    )
+    throwing = throwing.sort_values(
+        ["residual_fb_velo", "avg_ci", "avg_pinch_strength"],
+        ascending=[True, False, False],
     )
 
     return (
         upside[output_columns].reset_index(drop=True),
         inverse[output_columns].reset_index(drop=True),
+        throwing[output_columns].reset_index(drop=True),
     )
 
 
@@ -4809,14 +4812,25 @@ with st.sidebar:
     high_pinch_threshold = st.number_input(
         "S&C high pinch threshold", min_value=0.0, step=1.0, value=50.0, format="%.1f"
     )
-    positive_residual_threshold = st.number_input(
-        "High positive residual", step=0.1, value=1.5, format="%.1f"
+    projected_velo_threshold = st.number_input(
+        "S&C projected FB velo threshold",
+        min_value=0.0,
+        step=0.5,
+        value=94.0,
+        format="%.1f",
     )
-    negative_residual_threshold = st.number_input(
-        "High negative residual", step=0.1, value=-1.5, format="%.1f"
+    low_actual_velo_threshold = st.number_input(
+        "Athletic but low actual FB velo threshold",
+        min_value=0.0,
+        step=0.5,
+        value=94.0,
+        format="%.1f",
     )
-    low_velo_threshold = st.number_input(
-        "Low FB velo threshold", min_value=0.0, step=0.5, value=92.0, format="%.1f"
+    throwing_residual_threshold = st.number_input(
+        "Throwing-development residual threshold",
+        step=0.1,
+        value=-0.5,
+        format="%.1f",
     )
 
 
@@ -4844,15 +4858,15 @@ combined_summary = build_combined_overview_summary(
     pinch_summary,
 )
 combined_model = fit_combined_overview_model(combined_summary)
-sc_upside_table, sc_inverse_table = build_sc_opportunity_tables(
+sc_upside_table, sc_inverse_table, sc_throwing_table = build_sc_opportunity_tables(
     combined_model,
     low_ci_threshold=float(low_ci_threshold),
     low_pinch_threshold=float(low_pinch_threshold),
+    projected_velo_threshold=float(projected_velo_threshold),
     high_ci_threshold=float(high_ci_threshold),
     high_pinch_threshold=float(high_pinch_threshold),
-    positive_residual_threshold=float(positive_residual_threshold),
-    negative_residual_threshold=float(negative_residual_threshold),
-    low_velo_threshold=float(low_velo_threshold),
+    low_actual_velo_threshold=float(low_actual_velo_threshold),
+    throwing_residual_threshold=float(throwing_residual_threshold),
 )
 
 bat_monthly_pairs = build_bat_monthly_pairs(
@@ -6477,11 +6491,12 @@ with exit_velo_overview_tab:
 
 with sc_opportunity_tab:
     st.subheader("S&C Opportunity — Pitchers", anchor=False)
-    sc_counts = st.columns(3)
+    sc_counts = st.columns(4)
     count_values = [
         ("Combined-model pitchers", str(len(combined_model["data"])) if combined_model is not None else "0", BLUE),
-        ("Potential S&C upside", str(len(sc_upside_table)), TEAL),
+        ("S&C development flags", str(len(sc_upside_table)), TEAL),
         ("Athletic but low velo", str(len(sc_inverse_table)), ACCENT_RED),
+        ("Need better throwing", str(len(sc_throwing_table)), NAVY_MID),
     ]
     for column, values in zip(sc_counts, count_values):
         with column:
@@ -6491,13 +6506,9 @@ with sc_opportunity_tab:
         st.info("The combined overview model could not be fit, so the S&C opportunity tab is unavailable for the current filters.")
     else:
         with st.container(border=True):
-            st.subheader("Potential S&C Upside", anchor=False)
-            st.caption(
-                f"Flagged when CI < {float(low_ci_threshold):.0f}, pinch < {float(low_pinch_threshold):.0f}, "
-                f"or residual ≥ +{float(positive_residual_threshold):.1f} mph."
-            )
+            st.subheader("S&C Development Flags", anchor=False)
             if sc_upside_table.empty:
-                st.info("No pitchers met the upside criteria.")
+                st.info("No pitchers met all three S&C development criteria.")
             else:
                 upside_display = sc_upside_table.copy()
                 upside_display.columns = [
@@ -6521,17 +6532,13 @@ with sc_opportunity_tab:
                 )
                 csv_download_button(
                     upside_display,
-                    "Download potential S&C upside CSV",
-                    "sc_upside_pitchers.csv",
+                    "Download S&C development flags CSV",
+                    "sc_development_flags.csv",
                     "download_sc_upside_pitchers",
                 )
 
         with st.container(border=True):
             st.subheader("Athletic but Low Velo", anchor=False)
-            st.caption(
-                f"Flagged when CI ≥ {float(high_ci_threshold):.0f} and pinch ≥ {float(high_pinch_threshold):.0f}, "
-                f"plus FB velo ≤ {float(low_velo_threshold):.1f} mph or residual ≤ {float(negative_residual_threshold):.1f} mph."
-            )
             if sc_inverse_table.empty:
                 st.info("No pitchers met the athletic-but-low-velo criteria.")
             else:
@@ -6560,4 +6567,37 @@ with sc_opportunity_tab:
                     "Download athletic but low velo CSV",
                     "athletic_but_low_velo_pitchers.csv",
                     "download_sc_inverse_pitchers",
+                )
+
+
+        with st.container(border=True):
+            st.subheader("They Need to Get Better at Throwing", anchor=False)
+            if sc_throwing_table.empty:
+                st.info("No pitchers met the throwing-development criteria.")
+            else:
+                throwing_display = sc_throwing_table.copy()
+                throwing_display.columns = [
+                    "Pitcher", "Team", "Actual Final YTD FB Velo", "Predicted FB Velo",
+                    "Residual", "Average CI", "Average Pinch", "Tested Hand", "YTD FB As Of",
+                    "CI Jumps", "Pinch Tests", "Reasons",
+                ]
+                throwing_display["YTD FB As Of"] = throwing_display["YTD FB As Of"].map(fmt_date)
+                st.dataframe(
+                    throwing_display,
+                    hide_index=True,
+                    use_container_width=True,
+                    height=min(660, 44 + 36 * (len(throwing_display) + 1)),
+                    column_config={
+                        "Actual Final YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                        "Predicted FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                        "Residual": st.column_config.NumberColumn(format="%+.2f mph"),
+                        "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                        "Average Pinch": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+                csv_download_button(
+                    throwing_display,
+                    "Download throwing-development CSV",
+                    "throwing_development_pitchers.csv",
+                    "download_throwing_development_pitchers",
                 )
