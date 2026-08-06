@@ -4389,6 +4389,7 @@ with overview_tab:
     mean_velo = summary["avg_fb_velo"].mean() if n_pitchers else np.nan
     mean_ci = summary["avg_ci"].mean() if n_pitchers else np.nan
     r_text = f"{stats[0]:+.2f}" if stats is not None else "—"
+    r2_text = f"{stats[1]:.2f}" if stats is not None else "—"
     potential_velo_increase = stats[2] * POTENTIAL_CI_INCREASE if stats is not None else np.nan
     potential_velo_text = (
         f"{potential_velo_increase:+.2f} mph"
@@ -4396,15 +4397,27 @@ with overview_tab:
         else "—"
     )
 
-    cols = st.columns(5)
-    metric_values = [
+    top_cols = st.columns(3)
+    top_metric_values = [
         ("Pitchers", str(n_pitchers), BLUE),
         ("Correlation", r_text, ACCENT_RED),
+        ("R²", r2_text, NAVY_MID),
+    ]
+    for column, values in zip(top_cols, top_metric_values):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    bottom_cols = st.columns(3)
+    bottom_metric_values = [
         ("Last YTD FB Velo", f"{fmt(mean_velo)} mph", TEAL),
         ("Average CI", f"{fmt(mean_ci)} N·s", GREEN),
-        (f"Potential Velo Increase · +{POTENTIAL_CI_INCREASE:.0f} N·s CI", potential_velo_text, NAVY_MID),
+        (
+            f"Potential Velo Increase · +{POTENTIAL_CI_INCREASE:.0f} N·s CI",
+            potential_velo_text,
+            NAVY_MID,
+        ),
     ]
-    for column, values in zip(cols, metric_values):
+    for column, values in zip(bottom_cols, bottom_metric_values):
         with column:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
@@ -4511,6 +4524,9 @@ with pinch_overview_tab:
     pinch_r_text = (
         f"{pinch_stats[0]:+.2f}" if pinch_stats is not None else "—"
     )
+    pinch_r2_text = (
+        f"{pinch_stats[1]:.2f}" if pinch_stats is not None else "—"
+    )
     potential_pinch_velo = (
         pinch_stats[2] * POTENTIAL_PINCH_INCREASE
         if pinch_stats is not None else np.nan
@@ -4520,10 +4536,18 @@ with pinch_overview_tab:
         if pd.notna(potential_pinch_velo) else "—"
     )
 
-    cols = st.columns(5)
-    metrics = [
+    top_cols = st.columns(3)
+    top_metrics = [
         ("Pitchers", str(n_pinch_pitchers), BLUE),
         ("Correlation", pinch_r_text, ACCENT_RED),
+        ("R²", pinch_r2_text, NAVY_MID),
+    ]
+    for column, values in zip(top_cols, top_metrics):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    bottom_cols = st.columns(3)
+    bottom_metrics = [
         ("Last YTD FB Velo", f"{fmt(mean_pinch_velo)} mph", TEAL),
         ("Average Pinch Strength", fmt(mean_pinch_value), GREEN),
         (
@@ -4532,7 +4556,7 @@ with pinch_overview_tab:
             NAVY_MID,
         ),
     ]
-    for column, values in zip(cols, metrics):
+    for column, values in zip(bottom_cols, bottom_metrics):
         with column:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
