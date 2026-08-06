@@ -1238,6 +1238,191 @@ def build_output_bucket_chart(
     return base_figure_layout(fig, 380)
 
 
+def output_bucket_members(
+    df: pd.DataFrame,
+    output_col: str,
+    testing_col: str,
+    bucket_width: float,
+    selected_bucket: str,
+    output_bucket_label: str,
+    output_unit: str,
+    entity_col: str = "athlete",
+    team_col: str = "team",
+) -> tuple[pd.DataFrame, float]:
+    """Return athletes in one output bucket and flag testing values versus the bucket mean."""
+    required = [entity_col, output_col, testing_col]
+    columns = required + [team_col, output_bucket_label, "Difference", "Status", "Display"]
+    if df.empty or any(col not in df.columns for col in required):
+        return pd.DataFrame(columns=columns), np.nan
+
+    width = max(float(bucket_width), 1e-9)
+    work_cols = list(dict.fromkeys(required + ([team_col] if team_col in df.columns else [])))
+    detail = df[work_cols].dropna(subset=required).copy()
+    if detail.empty:
+        return pd.DataFrame(columns=columns), np.nan
+
+    detail["band_start"] = np.floor(detail[output_col] / width) * width
+
+    def _fmt_bucket(lower: float) -> str:
+        upper = lower + width
+        if float(width).is_integer():
+            return f"{lower:.0f}–{upper:.0f} {output_unit}"
+        return f"{lower:.1f}–{upper:.1f} {output_unit}"
+
+    detail[output_bucket_label] = detail["band_start"].map(_fmt_bucket)
+    detail = detail[detail[output_bucket_label] == selected_bucket].copy()
+    if detail.empty:
+        return detail, np.nan
+
+    if team_col not in detail.columns:
+        detail[team_col] = "Unassigned"
+    detail[team_col] = detail[team_col].fillna("Unassigned")
+
+    reference = float(detail[testing_col].mean())
+    detail["Difference"] = detail[testing_col] - reference
+    detail["Status"] = np.where(
+        np.isclose(detail["Difference"], 0, atol=1e-10),
+        "At mean",
+        np.where(detail["Difference"] > 0, "Above mean", "Below mean"),
+    )
+    detail["Display"] = detail.apply(
+        lambda row: f"{row[entity_col]} · {row[output_col]:.1f} {output_unit}",
+        axis=1,
+    )
+    return (
+        detail.sort_values(testing_col, ascending=False).reset_index(drop=True),
+        reference,
+    )
+
+
+def build_output_bucket_member_chart(
+    df: pd.DataFrame,
+    output_col: str,
+    testing_col: str,
+    bucket_width: float,
+    selected_bucket: str,
+    output_bucket_label: str,
+    output_unit: str,
+    testing_axis_title: str,
+    testing_unit: str,
+    entity_label: str,
+    output_value_label: str,
+    entity_col: str = "athlete",
+    team_col: str = "team",
+) -> go.Figure:
+    """Horizontal athlete chart for one output bucket, using the testing metric as bars."""
+    detail, reference = output_bucket_members(
+        df=df,
+        output_col=output_col,
+        testing_col=testing_col,
+        bucket_width=bucket_width,
+        selected_bucket=selected_bucket,
+        output_bucket_label=output_bucket_label,
+        output_unit=output_unit,
+        entity_col=entity_col,
+        team_col=team_col,
+    )
+    fig = go.Figure()
+
+    if detail.empty:
+        fig.add_annotation(
+            text="No athletes are available in this output bucket.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 340)
+
+    status_style = [
+        ("Above mean", GREEN),
+        ("At mean", TEAL),
+        ("Below mean", ACCENT_RED),
+    ]
+    category_order = detail["Display"].tolist()
+
+    for status, color in status_style:
+        sub = detail[detail["Status"] == status].copy()
+        if sub.empty:
+            continue
+        customdata = np.column_stack([
+            sub[entity_col],
+            sub[team_col],
+            sub[output_col],
+            sub["Difference"],
+            sub["Status"],
+        ])
+        fig.add_trace(go.Bar(
+            x=sub[testing_col],
+            y=sub["Display"],
+            orientation="h",
+            name=status.title(),
+            marker={"color": color, "line": {"color": "#FFFFFF", "width": 1}},
+            text=[f"{value:.2f}" for value in sub[testing_col]],
+            textposition="outside",
+            cliponaxis=False,
+            customdata=customdata,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Team: %{customdata[1]}<br>"
+                f"{output_value_label}: %{{customdata[2]:.2f}} {output_unit}<br>"
+                f"{testing_axis_title}: %{{x:.2f}} {testing_unit}<br>"
+                "Difference from bucket mean: %{customdata[3]:+.2f}<br>"
+                "Flag: %{customdata[4]}<extra></extra>"
+            ),
+        ))
+
+    values = detail[testing_col].to_numpy(dtype=float)
+    data_min = float(np.min(values))
+    data_max = float(np.max(values))
+    span = max(data_max - data_min, abs(reference) * 0.05, 1.0)
+    pad = max(span * 0.18, 0.5)
+    x_min = max(0, data_min - pad)
+    x_max = data_max + pad
+
+    fig.add_vline(
+        x=reference,
+        line_color=NAVY_MID,
+        line_width=2,
+        line_dash="dash",
+        annotation_text=f"Mean {reference:.2f}",
+        annotation_font_color=NAVY_MID,
+        annotation_position="top right",
+    )
+    fig.update_xaxes(
+        title=testing_axis_title,
+        range=[x_min, x_max],
+        showgrid=True,
+        gridcolor=GRID,
+        zeroline=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title=f"{entity_label} · {output_value_label}",
+        categoryorder="array",
+        categoryarray=category_order,
+        autorange="reversed",
+        showgrid=False,
+        linecolor=BORDER,
+        tickfont={"color": TEXT, "size": 12},
+        title_font={"color": SUBTEXT},
+        automargin=True,
+    )
+    fig = base_figure_layout(fig, max(340, len(detail) * 42 + 125))
+    fig.update_layout(
+        showlegend=True,
+        legend={"orientation": "h", "x": 0, "y": 1.14, "font": {"color": SUBTEXT}},
+        margin={"l": 220, "r": 80, "t": 50, "b": 58},
+    )
+    return fig
+
+
 def fisher_mean_correlation(values: pd.Series) -> float:
     """Average correlations on Fisher's z scale rather than raw r."""
     clean = pd.to_numeric(values, errors="coerce").dropna().to_numpy(dtype=float)
@@ -4612,6 +4797,48 @@ with overview_tab:
             key=f"fb_velo_output_bucket_{team_filter}_{start_date}_{end_date}",
         )
 
+
+    fb_output_bands = output_bucket_summary(
+        summary,
+        "avg_fb_velo",
+        "avg_ci",
+        FB_VELO_OUTPUT_BUCKET_WIDTH,
+        "FB velo bucket",
+        "CI",
+        "mph",
+        "N·s",
+    )
+    if not fb_output_bands.empty:
+        fb_output_options = fb_output_bands["FB velo bucket"].tolist()
+        fb_output_key = "fb_velo_output_bucket_detail_selector"
+        if st.session_state.get(fb_output_key) not in fb_output_options:
+            st.session_state[fb_output_key] = fb_output_options[0]
+        with st.container(border=True):
+            st.subheader("FB Velo Bucket Pitchers", anchor=False)
+            selected_fb_output_bucket = st.selectbox(
+                "FB velo bucket",
+                fb_output_options,
+                key=fb_output_key,
+            )
+            st.plotly_chart(
+                build_output_bucket_member_chart(
+                    df=summary,
+                    output_col="avg_fb_velo",
+                    testing_col="avg_ci",
+                    bucket_width=FB_VELO_OUTPUT_BUCKET_WIDTH,
+                    selected_bucket=selected_fb_output_bucket,
+                    output_bucket_label="FB velo bucket",
+                    output_unit="mph",
+                    testing_axis_title="Average CI",
+                    testing_unit="N·s",
+                    entity_label="Pitcher",
+                    output_value_label="Last YTD FB velo",
+                ),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=f"fb_output_detail_{selected_fb_output_bucket}_{team_filter}_{start_date}_{end_date}",
+            )
+
     if not ci_band_overview.empty:
         band_options = ci_band_overview["CI band"].tolist()
         band_detail_key = "ci_band_detail_selector"
@@ -4802,6 +5029,48 @@ with pinch_overview_tab:
             config={"displayModeBar": False},
             key=f"pinch_output_bucket_{team_filter}_{start_date}_{end_date}",
         )
+
+
+    pinch_output_bands = output_bucket_summary(
+        pinch_view,
+        "avg_fb_velo",
+        "avg_pinch_strength",
+        FB_VELO_OUTPUT_BUCKET_WIDTH,
+        "FB velo bucket",
+        "pinch strength",
+        "mph",
+        "",
+    )
+    if not pinch_output_bands.empty:
+        pinch_output_options = pinch_output_bands["FB velo bucket"].tolist()
+        pinch_output_key = "pinch_fb_output_bucket_detail_selector"
+        if st.session_state.get(pinch_output_key) not in pinch_output_options:
+            st.session_state[pinch_output_key] = pinch_output_options[0]
+        with st.container(border=True):
+            st.subheader("FB Velo Bucket Pitchers", anchor=False)
+            selected_pinch_output_bucket = st.selectbox(
+                "Pinch-tab FB velo bucket",
+                pinch_output_options,
+                key=pinch_output_key,
+            )
+            st.plotly_chart(
+                build_output_bucket_member_chart(
+                    df=pinch_view,
+                    output_col="avg_fb_velo",
+                    testing_col="avg_pinch_strength",
+                    bucket_width=FB_VELO_OUTPUT_BUCKET_WIDTH,
+                    selected_bucket=selected_pinch_output_bucket,
+                    output_bucket_label="FB velo bucket",
+                    output_unit="mph",
+                    testing_axis_title="Average pinch strength",
+                    testing_unit="",
+                    entity_label="Pitcher",
+                    output_value_label="Last YTD FB velo",
+                ),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=f"pinch_output_detail_{selected_pinch_output_bucket}_{team_filter}_{start_date}_{end_date}",
+            )
 
     if not pinch_band_overview.empty:
         pinch_band_options = pinch_band_overview["Pinch band"].tolist()
@@ -5269,6 +5538,48 @@ with sprint_overview_tab:
             key=f"sprint_output_bucket_{team_filter}_{start_date}_{end_date}",
         )
 
+
+    sprint_output_bands = output_bucket_summary(
+        sprint_overview_summary,
+        "monthly_max_sprint_speed",
+        "avg_peak_power_rel",
+        SPRINT_SPEED_OUTPUT_BUCKET_WIDTH,
+        "Sprint speed bucket",
+        "peak power / BM",
+        "ft/s",
+        "W/kg",
+    )
+    if not sprint_output_bands.empty:
+        sprint_output_options = sprint_output_bands["Sprint speed bucket"].tolist()
+        sprint_output_key = "sprint_output_bucket_detail_selector"
+        if st.session_state.get(sprint_output_key) not in sprint_output_options:
+            st.session_state[sprint_output_key] = sprint_output_options[0]
+        with st.container(border=True):
+            st.subheader("Sprint Speed Bucket Players", anchor=False)
+            selected_sprint_output_bucket = st.selectbox(
+                "Sprint speed bucket",
+                sprint_output_options,
+                key=sprint_output_key,
+            )
+            st.plotly_chart(
+                build_output_bucket_member_chart(
+                    df=sprint_overview_summary,
+                    output_col="monthly_max_sprint_speed",
+                    testing_col="avg_peak_power_rel",
+                    bucket_width=SPRINT_SPEED_OUTPUT_BUCKET_WIDTH,
+                    selected_bucket=selected_sprint_output_bucket,
+                    output_bucket_label="Sprint speed bucket",
+                    output_unit="ft/s",
+                    testing_axis_title="Average peak power / BM",
+                    testing_unit="W/kg",
+                    entity_label="Player",
+                    output_value_label="Monthly max sprint speed",
+                ),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=f"sprint_output_detail_{selected_sprint_output_bucket}_{team_filter}_{start_date}_{end_date}",
+            )
+
     with st.container(border=True):
         st.subheader(
             "Final-Month Peak Power / BM vs Monthly Max Sprint Speed",
@@ -5485,6 +5796,48 @@ with bat_overview_tab:
             config={"displayModeBar": False},
             key=f"bat_output_bucket_{team_filter}_{start_date}_{end_date}",
         )
+
+
+    bat_output_bands = output_bucket_summary(
+        bat_monthly_pairs,
+        "monthly_avg_bat_speed",
+        "avg_ci",
+        BAT_SPEED_OUTPUT_BUCKET_WIDTH,
+        "Bat speed bucket",
+        "CI",
+        "mph",
+        "N·s",
+    )
+    if not bat_output_bands.empty:
+        bat_output_options = bat_output_bands["Bat speed bucket"].tolist()
+        bat_output_key = "bat_output_bucket_detail_selector"
+        if st.session_state.get(bat_output_key) not in bat_output_options:
+            st.session_state[bat_output_key] = bat_output_options[0]
+        with st.container(border=True):
+            st.subheader("Bat Speed Bucket Hitters", anchor=False)
+            selected_bat_output_bucket = st.selectbox(
+                "Bat speed bucket",
+                bat_output_options,
+                key=bat_output_key,
+            )
+            st.plotly_chart(
+                build_output_bucket_member_chart(
+                    df=bat_monthly_pairs,
+                    output_col="monthly_avg_bat_speed",
+                    testing_col="avg_ci",
+                    bucket_width=BAT_SPEED_OUTPUT_BUCKET_WIDTH,
+                    selected_bucket=selected_bat_output_bucket,
+                    output_bucket_label="Bat speed bucket",
+                    output_unit="mph",
+                    testing_axis_title="Monthly average CI",
+                    testing_unit="N·s",
+                    entity_label="Hitter",
+                    output_value_label="Monthly average bat speed",
+                ),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=f"bat_output_detail_{selected_bat_output_bucket}_{team_filter}_{start_date}_{end_date}",
+            )
 
     bat_ci_band_overview = bat_ci_band_summary(
         bat_monthly_pairs,
@@ -5733,6 +6086,48 @@ with exit_velo_overview_tab:
             config={"displayModeBar": False},
             key=f"exit_output_bucket_{team_filter}_{start_date}_{end_date}",
         )
+
+
+    exit_output_bands = output_bucket_summary(
+        exit_velo_summary,
+        "ytd_p80_exit_velo",
+        "avg_ci",
+        EXIT_VELO_OUTPUT_BUCKET_WIDTH,
+        "P80 exit velo bucket",
+        "CI",
+        "mph",
+        "N·s",
+    )
+    if not exit_output_bands.empty:
+        exit_output_options = exit_output_bands["P80 exit velo bucket"].tolist()
+        exit_output_key = "exit_output_bucket_detail_selector"
+        if st.session_state.get(exit_output_key) not in exit_output_options:
+            st.session_state[exit_output_key] = exit_output_options[0]
+        with st.container(border=True):
+            st.subheader("P80 Exit Velo Bucket Hitters", anchor=False)
+            selected_exit_output_bucket = st.selectbox(
+                "P80 exit velo bucket",
+                exit_output_options,
+                key=exit_output_key,
+            )
+            st.plotly_chart(
+                build_output_bucket_member_chart(
+                    df=exit_velo_summary,
+                    output_col="ytd_p80_exit_velo",
+                    testing_col="avg_ci",
+                    bucket_width=EXIT_VELO_OUTPUT_BUCKET_WIDTH,
+                    selected_bucket=selected_exit_output_bucket,
+                    output_bucket_label="P80 exit velo bucket",
+                    output_unit="mph",
+                    testing_axis_title="Year-to-date average CI",
+                    testing_unit="N·s",
+                    entity_label="Hitter",
+                    output_value_label="Final YTD P80 exit velo",
+                ),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=f"exit_output_detail_{selected_exit_output_bucket}_{team_filter}_{start_date}_{end_date}",
+            )
 
     exit_band_overview = exit_velo_ci_band_summary(
         exit_velo_summary,
