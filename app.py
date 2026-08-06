@@ -4565,9 +4565,8 @@ def build_sc_opportunity_tables(
     The inverse list requires high CI and high pinch strength while actual
     final YTD fastball velocity is below the selected cutoff.
 
-    The throwing-development list requires CI at or above the high-CI cutoff,
-    pinch at or above the low-pinch cutoff, and a model residual at or below
-    the selected negative residual threshold.
+    The throwing-development list requires CI above the high-CI cutoff and
+    a model residual at or below the selected negative residual threshold.
     """
     output_columns = [
         "athlete",
@@ -4632,9 +4631,6 @@ def build_sc_opportunity_tables(
     data["throwing_ci_flag"] = (
         data["avg_ci"] > float(high_ci_threshold)
     )
-    data["throwing_pinch_flag"] = (
-        data["avg_pinch_strength"] > float(low_pinch_threshold)
-    )
     data["negative_throwing_residual_flag"] = (
         data["residual_fb_velo"] <= float(throwing_residual_threshold)
     )
@@ -4671,17 +4667,15 @@ def build_sc_opportunity_tables(
 
     throwing = data.loc[
         data["throwing_ci_flag"]
-        & data["throwing_pinch_flag"]
         & data["negative_throwing_residual_flag"]
     ].copy()
     throwing["reasons"] = (
         f"CI > {high_ci_threshold:.0f} | "
-        f"Pinch > {low_pinch_threshold:.0f} | "
         f"Residual <= {throwing_residual_threshold:.1f} mph"
     )
     throwing = throwing.sort_values(
-        ["residual_fb_velo", "avg_ci", "avg_pinch_strength"],
-        ascending=[True, False, False],
+        ["residual_fb_velo", "avg_ci"],
+        ascending=[True, False],
     )
 
     return (
