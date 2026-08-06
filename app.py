@@ -4681,6 +4681,49 @@ def build_sc_opportunity_tables(
     )
 
 
+def build_projection_gap_table(
+    model: dict | None,
+    threshold: float,
+) -> pd.DataFrame:
+    """Return pitchers projected at or above a cutoff but actually below it."""
+    output_columns = [
+        "athlete",
+        "team",
+        "avg_fb_velo",
+        "predicted_fb_velo",
+        "residual_fb_velo",
+        "avg_ci",
+        "avg_pinch_strength",
+        "pinch_hand",
+        "ytd_as_of_date",
+        "ci_jumps",
+        "pinch_tests",
+        "reasons",
+    ]
+    if (
+        model is None
+        or "data" not in model
+        or model["data"] is None
+        or model["data"].empty
+    ):
+        return pd.DataFrame(columns=output_columns)
+
+    data = model["data"].copy()
+    gap = data.loc[
+        (data["predicted_fb_velo"] >= float(threshold))
+        & (data["avg_fb_velo"] < float(threshold))
+    ].copy()
+    gap["reasons"] = (
+        f"Projected FB velo >= {float(threshold):.1f} mph | "
+        f"Actual FB velo < {float(threshold):.1f} mph"
+    )
+    gap = gap.sort_values(
+        ["predicted_fb_velo", "avg_fb_velo"],
+        ascending=[False, True],
+    )
+    return gap[output_columns].reset_index(drop=True)
+
+
 # -----------------------------------------------------------------------------
 # APP
 # -----------------------------------------------------------------------------
@@ -4845,6 +4888,10 @@ sc_upside_table, sc_projection_gap_table, sc_throwing_table = build_sc_opportuni
     projected_velo_threshold=float(projected_velo_threshold),
     high_ci_threshold=float(high_ci_threshold),
     throwing_residual_threshold=float(throwing_residual_threshold),
+)
+sc_projection_gap_93_table = build_projection_gap_table(
+    combined_model,
+    threshold=93.0,
 )
 
 bat_monthly_pairs = build_bat_monthly_pairs(
@@ -6469,7 +6516,7 @@ with exit_velo_overview_tab:
 
 with sc_opportunity_tab:
     st.subheader("S&C Opportunity — Pitchers", anchor=False)
-    sc_counts = st.columns(4)
+    sc_counts = st.columns(5)
     count_values = [
         ("Combined-model pitchers", str(len(combined_model["data"])) if combined_model is not None else "0", BLUE),
         ("S&C development flags", str(len(sc_upside_table)), TEAL),
@@ -6477,6 +6524,11 @@ with sc_opportunity_tab:
             f"Projected {float(projected_velo_threshold):.0f}+ / actual below",
             str(len(sc_projection_gap_table)),
             ACCENT_RED,
+        ),
+        (
+            "Projected 93+ / actual below",
+            str(len(sc_projection_gap_93_table)),
+            GREEN,
         ),
         ("Need better throwing", str(len(sc_throwing_table)), NAVY_MID),
     ]
@@ -6557,6 +6609,46 @@ with sc_opportunity_tab:
                     "Download projected 94+ but actual below CSV",
                     "projected_94_plus_actual_below_pitchers.csv",
                     "download_sc_projection_gap_pitchers",
+                )
+
+        with st.container(border=True):
+            st.subheader(
+                "Projected 93+ mph but Actual Below 93 mph",
+                anchor=False,
+            )
+            if sc_projection_gap_93_table.empty:
+                st.info(
+                    "No pitchers had projected velocity at or above 93 mph "
+                    "while actual velocity remained below 93 mph."
+                )
+            else:
+                projection_gap_93_display = sc_projection_gap_93_table.copy()
+                projection_gap_93_display.columns = [
+                    "Pitcher", "Team", "Actual Final YTD FB Velo", "Predicted FB Velo",
+                    "Residual", "Average CI", "Average Pinch", "Tested Hand", "YTD FB As Of",
+                    "CI Jumps", "Pinch Tests", "Reasons",
+                ]
+                projection_gap_93_display["YTD FB As Of"] = (
+                    projection_gap_93_display["YTD FB As Of"].map(fmt_date)
+                )
+                st.dataframe(
+                    projection_gap_93_display,
+                    hide_index=True,
+                    use_container_width=True,
+                    height=min(660, 44 + 36 * (len(projection_gap_93_display) + 1)),
+                    column_config={
+                        "Actual Final YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                        "Predicted FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                        "Residual": st.column_config.NumberColumn(format="%+.2f mph"),
+                        "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                        "Average Pinch": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+                csv_download_button(
+                    projection_gap_93_display,
+                    "Download projected 93+ but actual below CSV",
+                    "projected_93_plus_actual_below_pitchers.csv",
+                    "download_sc_projection_gap_93_pitchers",
                 )
 
 
