@@ -3882,11 +3882,6 @@ with overview_tab:
         with column:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
-    st.caption(
-        "Potential velo increase is the current regression slope multiplied by a +10 N·s CI change. "
-        "It reflects the selected sample's association and is not a guaranteed individual response."
-    )
-
     estimated_velo = np.nan
     if stats is not None:
         estimated_velo = stats[2] * float(ci_lookup) + stats[3]
@@ -4014,14 +4009,6 @@ with pinch_overview_tab:
     for column, values in zip(cols, metrics):
         with column:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
-
-    st.caption(
-        "This mirrors the CI overview calculation. Each pitcher contributes "
-        "the mean of the populated Pinch - R or Pinch - L values inside the "
-        "selected window, matched to that pitcher's final in-window "
-        "ytd_fb_velo. The +10 estimate is the sample regression slope × 10 "
-        "pinch-strength units and is not a guaranteed individual response."
-    )
 
     estimated_pinch_velo = (
         pinch_stats[2] * float(pinch_lookup) + pinch_stats[3]
@@ -4207,14 +4194,6 @@ with combined_model_tab:
             with column:
                 st.markdown(metric_card(*metric_values), unsafe_allow_html=True)
 
-        st.caption(
-            "This model is calculated like the overview tabs: each pitcher "
-            "contributes exactly one observation. Average in-window CI and "
-            "average in-window pinch strength are matched to that pitcher's "
-            "final in-window ytd_fb_velo. The coefficients describe partial "
-            "between-pitcher associations and should not be interpreted as "
-            "causal individual velocity gains."
-        )
         if combined_model["n_pitchers"] < 15:
             st.warning(
                 "Fewer than 15 pitchers are included. The model can be shown, "
@@ -4299,12 +4278,6 @@ with combined_model_tab:
         with chart_left:
             with st.container(border=True):
                 st.subheader("Cross-Validated Model Comparison", anchor=False)
-                st.caption(
-                    "Each value leaves one pitcher out, fits the model on all "
-                    "remaining pitchers, and predicts the held-out pitcher. "
-                    "Unlike ordinary in-sample R², adding pinch is not "
-                    "guaranteed to improve this metric."
-                )
                 st.plotly_chart(
                     build_combined_model_comparison_chart(combined_model),
                     use_container_width=True,
@@ -4379,15 +4352,6 @@ with combined_model_tab:
                     "Association per +10": st.column_config.NumberColumn(format="%+.2f mph"),
                 },
             )
-            st.caption(
-                "Pitcher-level equation: final YTD FB velo = "
-                f"{combined_model['intercept']:.4f} + "
-                f"({combined_model['beta_ci']:.4f} × average CI) + "
-                f"({combined_model['beta_pinch']:.4f} × average pinch). "
-                "The intervals are ordinary OLS approximations and are "
-                "especially uncertain with small samples."
-            )
-
         with st.container(border=True):
             st.subheader("Combined Pitcher Results", anchor=False)
             model_data = combined_model["data"]
@@ -4494,17 +4458,6 @@ with sprint_overview_tab:
     for column, values in zip(bottom_cols, bottom_metrics):
         with column:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
-
-    st.caption(
-        "Each observation is one player. The app finds that player’s final eligible "
-        "month in the selected range. A month is eligible only when it contains "
-        "at least 14 distinct valid PP_Sprint data dates inside the selected date "
-        "range. The app then uses the "
-        "final monthly_max_sprint_speed value and matches it to mean Peak Power "
-        "/ BM [W/kg] from Jump Data in that same month. "
-        "The +5 W/kg card is the selected sample's regression slope × 5 and "
-        "is an association, not a guaranteed individual improvement."
-    )
 
     estimated_sprint_speed = (
         sprint_stats[2] * float(power_lookup) + sprint_stats[3]
@@ -4696,15 +4649,6 @@ with bat_overview_tab:
     for column, values in zip(bottom_cols, bottom_metrics):
         with column:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
-
-    st.caption(
-        "Each observation is one hitter. The dashboard finds that hitter's "
-        "latest qualifying matched month in the selected range, then pairs the "
-        "month's mean raw CI with its final monthly_avg_bat_speed value. Earlier "
-        "matched months are excluded. Potential bat-speed increase is the selected "
-        "sample's regression slope × 10 N·s and is not a guaranteed individual "
-        "response."
-    )
 
     estimated_bat_speed = (
         bat_stats[2] * float(ci_lookup) + bat_stats[3]
