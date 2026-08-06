@@ -4553,17 +4553,16 @@ def build_sc_opportunity_tables(
     low_pinch_threshold: float,
     projected_velo_threshold: float,
     high_ci_threshold: float,
-    high_pinch_threshold: float,
-    low_actual_velo_threshold: float,
     throwing_residual_threshold: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Build pitcher-level S&C opportunity and inverse-opportunity tables.
+    """Build pitcher-level S&C development, projection-gap, and throwing tables.
 
-    S&C opportunity requires all three criteria: low CI, low pinch strength,
+    S&C development requires all three criteria: low CI, low pinch strength,
     and combined-model projected velocity below the selected cutoff.
 
-    The inverse list requires high CI and high pinch strength while actual
-    final YTD fastball velocity is below the selected cutoff.
+    The projection-gap list includes every pitcher whose combined-model
+    projected velocity is at or above the selected cutoff while actual final
+    YTD fastball velocity remains below that same cutoff.
 
     The throwing-development list requires CI above the high-CI cutoff and
     a model residual at or below the selected negative residual threshold.
@@ -4621,12 +4620,11 @@ def build_sc_opportunity_tables(
         data["predicted_fb_velo"] < float(projected_velo_threshold)
     )
 
-    data["high_ci_flag"] = data["avg_ci"] >= float(high_ci_threshold)
-    data["high_pinch_flag"] = (
-        data["avg_pinch_strength"] >= float(high_pinch_threshold)
+    data["projected_at_or_above_threshold_flag"] = (
+        data["predicted_fb_velo"] >= float(projected_velo_threshold)
     )
-    data["low_actual_velo_flag"] = (
-        data["avg_fb_velo"] < float(low_actual_velo_threshold)
+    data["actual_below_projected_threshold_flag"] = (
+        data["avg_fb_velo"] < float(projected_velo_threshold)
     )
     data["throwing_ci_flag"] = (
         data["avg_ci"] > float(high_ci_threshold)
@@ -4650,19 +4648,17 @@ def build_sc_opportunity_tables(
         ascending=[True, True, True],
     )
 
-    inverse = data.loc[
-        data["high_ci_flag"]
-        & data["high_pinch_flag"]
-        & data["low_actual_velo_flag"]
+    projection_gap = data.loc[
+        data["projected_at_or_above_threshold_flag"]
+        & data["actual_below_projected_threshold_flag"]
     ].copy()
-    inverse["reasons"] = (
-        f"CI >= {high_ci_threshold:.0f} | "
-        f"Pinch >= {high_pinch_threshold:.0f} | "
-        f"Actual FB velo < {low_actual_velo_threshold:.1f} mph"
+    projection_gap["reasons"] = (
+        f"Projected FB velo >= {projected_velo_threshold:.1f} mph | "
+        f"Actual FB velo < {projected_velo_threshold:.1f} mph"
     )
-    inverse = inverse.sort_values(
-        ["avg_fb_velo", "predicted_fb_velo"],
-        ascending=[True, False],
+    projection_gap = projection_gap.sort_values(
+        ["predicted_fb_velo", "avg_fb_velo"],
+        ascending=[False, True],
     )
 
     throwing = data.loc[
@@ -4680,7 +4676,7 @@ def build_sc_opportunity_tables(
 
     return (
         upside[output_columns].reset_index(drop=True),
-        inverse[output_columns].reset_index(drop=True),
+        projection_gap[output_columns].reset_index(drop=True),
         throwing[output_columns].reset_index(drop=True),
     )
 
@@ -4803,18 +4799,8 @@ with st.sidebar:
     high_ci_threshold = st.number_input(
         "S&C high CI threshold", min_value=0.0, step=1.0, value=330.0, format="%.1f"
     )
-    high_pinch_threshold = st.number_input(
-        "S&C high pinch threshold", min_value=0.0, step=1.0, value=50.0, format="%.1f"
-    )
     projected_velo_threshold = st.number_input(
         "S&C projected FB velo threshold",
-        min_value=0.0,
-        step=0.5,
-        value=94.0,
-        format="%.1f",
-    )
-    low_actual_velo_threshold = st.number_input(
-        "Athletic but low actual FB velo threshold",
         min_value=0.0,
         step=0.5,
         value=94.0,
@@ -4852,14 +4838,12 @@ combined_summary = build_combined_overview_summary(
     pinch_summary,
 )
 combined_model = fit_combined_overview_model(combined_summary)
-sc_upside_table, sc_inverse_table, sc_throwing_table = build_sc_opportunity_tables(
+sc_upside_table, sc_projection_gap_table, sc_throwing_table = build_sc_opportunity_tables(
     combined_model,
     low_ci_threshold=float(low_ci_threshold),
     low_pinch_threshold=float(low_pinch_threshold),
     projected_velo_threshold=float(projected_velo_threshold),
     high_ci_threshold=float(high_ci_threshold),
-    high_pinch_threshold=float(high_pinch_threshold),
-    low_actual_velo_threshold=float(low_actual_velo_threshold),
     throwing_residual_threshold=float(throwing_residual_threshold),
 )
 
@@ -6489,7 +6473,11 @@ with sc_opportunity_tab:
     count_values = [
         ("Combined-model pitchers", str(len(combined_model["data"])) if combined_model is not None else "0", BLUE),
         ("S&C development flags", str(len(sc_upside_table)), TEAL),
-        ("Athletic but low velo", str(len(sc_inverse_table)), ACCENT_RED),
+        (
+            f"Projected {float(projected_velo_threshold):.0f}+ / actual below",
+            str(len(sc_projection_gap_table)),
+            ACCENT_RED,
+        ),
         ("Need better throwing", str(len(sc_throwing_table)), NAVY_MID),
     ]
     for column, values in zip(sc_counts, count_values):
@@ -6532,22 +6520,30 @@ with sc_opportunity_tab:
                 )
 
         with st.container(border=True):
-            st.subheader("Athletic but Low Velo", anchor=False)
-            if sc_inverse_table.empty:
-                st.info("No pitchers met the athletic-but-low-velo criteria.")
+            st.subheader(
+                f"Projected {float(projected_velo_threshold):.0f}+ mph but Actual Below {float(projected_velo_threshold):.0f} mph",
+                anchor=False,
+            )
+            if sc_projection_gap_table.empty:
+                st.info(
+                    "No pitchers had projected velocity at or above the threshold "
+                    "while actual velocity remained below it."
+                )
             else:
-                inverse_display = sc_inverse_table.copy()
-                inverse_display.columns = [
+                projection_gap_display = sc_projection_gap_table.copy()
+                projection_gap_display.columns = [
                     "Pitcher", "Team", "Actual Final YTD FB Velo", "Predicted FB Velo",
                     "Residual", "Average CI", "Average Pinch", "Tested Hand", "YTD FB As Of",
                     "CI Jumps", "Pinch Tests", "Reasons",
                 ]
-                inverse_display["YTD FB As Of"] = inverse_display["YTD FB As Of"].map(fmt_date)
+                projection_gap_display["YTD FB As Of"] = (
+                    projection_gap_display["YTD FB As Of"].map(fmt_date)
+                )
                 st.dataframe(
-                    inverse_display,
+                    projection_gap_display,
                     hide_index=True,
                     use_container_width=True,
-                    height=min(660, 44 + 36 * (len(inverse_display) + 1)),
+                    height=min(660, 44 + 36 * (len(projection_gap_display) + 1)),
                     column_config={
                         "Actual Final YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
                         "Predicted FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
@@ -6557,10 +6553,10 @@ with sc_opportunity_tab:
                     },
                 )
                 csv_download_button(
-                    inverse_display,
-                    "Download athletic but low velo CSV",
-                    "athletic_but_low_velo_pitchers.csv",
-                    "download_sc_inverse_pitchers",
+                    projection_gap_display,
+                    "Download projected 94+ but actual below CSV",
+                    "projected_94_plus_actual_below_pitchers.csv",
+                    "download_sc_projection_gap_pitchers",
                 )
 
 
