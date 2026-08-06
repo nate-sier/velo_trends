@@ -5136,6 +5136,9 @@ with bat_overview_tab:
     bat_r_text = (
         f"{bat_stats[0]:+.2f}" if bat_stats is not None else "—"
     )
+    bat_r2_text = (
+        f"{bat_stats[1]:.2f}" if bat_stats is not None else "—"
+    )
     potential_bat_increase = (
         bat_stats[2] * POTENTIAL_CI_INCREASE
         if bat_stats is not None else np.nan
@@ -5145,10 +5148,11 @@ with bat_overview_tab:
         if pd.notna(potential_bat_increase) else "—"
     )
 
-    top_cols = st.columns(2)
+    top_cols = st.columns(3)
     top_metrics = [
         ("Hitters", str(n_hitters), BLUE),
         ("Correlation", bat_r_text, ACCENT_RED),
+        ("R²", bat_r2_text, NAVY_MID),
     ]
     for column, values in zip(top_cols, top_metrics):
         with column:
@@ -5360,6 +5364,9 @@ with exit_velo_overview_tab:
     exit_r_text = (
         f"{exit_stats[0]:+.2f}" if exit_stats is not None else "—"
     )
+    exit_r2_text = (
+        f"{exit_stats[1]:.2f}" if exit_stats is not None else "—"
+    )
     potential_exit_increase = (
         exit_stats[2] * POTENTIAL_CI_INCREASE
         if exit_stats is not None else np.nan
@@ -5369,10 +5376,11 @@ with exit_velo_overview_tab:
         if pd.notna(potential_exit_increase) else "—"
     )
 
-    top_cols = st.columns(2)
+    top_cols = st.columns(3)
     for column, values in zip(top_cols, [
         ("Hitters", str(n_exit_hitters), BLUE),
         ("Correlation", exit_r_text, ACCENT_RED),
+        ("R²", exit_r2_text, NAVY_MID),
     ]):
         with column:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
