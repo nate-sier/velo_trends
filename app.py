@@ -4526,6 +4526,168 @@ def build_combined_model_comparison_chart(
     return base_figure_layout(fig, 390)
 
 
+
+# -----------------------------------------------------------------------------
+# CSV EXPORTS AND S&C OPPORTUNITY FLAGS
+# -----------------------------------------------------------------------------
+def csv_download_button(
+    df: pd.DataFrame,
+    label: str,
+    filename: str,
+    key: str,
+) -> None:
+    """Render a UTF-8 CSV download button for a displayed results table."""
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label=label,
+        data=csv_bytes,
+        file_name=filename,
+        mime="text/csv",
+        key=key,
+    )
+
+
+def build_sc_opportunity_tables(
+    model: dict | None,
+    low_ci_threshold: float,
+    low_pinch_threshold: float,
+    high_ci_threshold: float,
+    high_pinch_threshold: float,
+    positive_residual_threshold: float,
+    negative_residual_threshold: float,
+    low_velo_threshold: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build pitcher-level S&C opportunity and inverse-opportunity tables.
+
+    The model has one row per pitcher. A positive residual means the pitcher
+    throws harder than the combined CI + pinch model predicts; a negative
+    residual means the pitcher throws slower than predicted.
+    """
+    output_columns = [
+        "athlete",
+        "team",
+        "avg_fb_velo",
+        "predicted_fb_velo",
+        "residual_fb_velo",
+        "avg_ci",
+        "avg_pinch_strength",
+        "pinch_hand",
+        "ytd_as_of_date",
+        "ci_jumps",
+        "pinch_tests",
+        "reasons",
+    ]
+
+    if (
+        model is None
+        or "data" not in model
+        or model["data"] is None
+        or model["data"].empty
+    ):
+        empty = pd.DataFrame(columns=output_columns)
+        return empty.copy(), empty.copy()
+
+    required_columns = {
+        "athlete",
+        "team",
+        "avg_fb_velo",
+        "predicted_fb_velo",
+        "residual_fb_velo",
+        "avg_ci",
+        "avg_pinch_strength",
+        "pinch_hand",
+        "ytd_as_of_date",
+        "ci_jumps",
+        "pinch_tests",
+    }
+    missing = required_columns.difference(model["data"].columns)
+    if missing:
+        raise ValueError(
+            "The combined-model data is missing required S&C opportunity "
+            f"column(s): {', '.join(sorted(missing))}."
+        )
+
+    data = model["data"].copy()
+    data["low_ci_flag"] = data["avg_ci"] < float(low_ci_threshold)
+    data["low_pinch_flag"] = (
+        data["avg_pinch_strength"] < float(low_pinch_threshold)
+    )
+    data["positive_residual_flag"] = (
+        data["residual_fb_velo"] >= float(positive_residual_threshold)
+    )
+
+    data["high_ci_flag"] = data["avg_ci"] >= float(high_ci_threshold)
+    data["high_pinch_flag"] = (
+        data["avg_pinch_strength"] >= float(high_pinch_threshold)
+    )
+    data["low_velo_flag"] = data["avg_fb_velo"] <= float(low_velo_threshold)
+    data["negative_residual_flag"] = (
+        data["residual_fb_velo"] <= float(negative_residual_threshold)
+    )
+
+    def upside_reasons(row: pd.Series) -> str:
+        reasons: list[str] = []
+        if bool(row["low_ci_flag"]):
+            reasons.append(f"CI < {low_ci_threshold:.0f}")
+        if bool(row["low_pinch_flag"]):
+            reasons.append(f"Pinch < {low_pinch_threshold:.0f}")
+        if bool(row["positive_residual_flag"]):
+            reasons.append(
+                f"Residual >= +{positive_residual_threshold:.1f} mph"
+            )
+        return " | ".join(reasons)
+
+    def inverse_reasons(row: pd.Series) -> str:
+        reasons: list[str] = []
+        if bool(row["high_ci_flag"]):
+            reasons.append(f"CI >= {high_ci_threshold:.0f}")
+        if bool(row["high_pinch_flag"]):
+            reasons.append(f"Pinch >= {high_pinch_threshold:.0f}")
+        if bool(row["low_velo_flag"]):
+            reasons.append(f"FB velo <= {low_velo_threshold:.1f} mph")
+        if bool(row["negative_residual_flag"]):
+            reasons.append(
+                f"Residual <= {negative_residual_threshold:.1f} mph"
+            )
+        return " | ".join(reasons)
+
+    # S&C-upside list: low in either physical metric OR substantially above
+    # the model-predicted velocity despite the current physical profile.
+    upside = data.loc[
+        data["low_ci_flag"]
+        | data["low_pinch_flag"]
+        | data["positive_residual_flag"]
+    ].copy()
+    upside["reasons"] = upside.apply(upside_reasons, axis=1)
+    upside = upside.sort_values(
+        [
+            "positive_residual_flag",
+            "residual_fb_velo",
+            "avg_ci",
+            "avg_pinch_strength",
+        ],
+        ascending=[False, False, True, True],
+    )
+
+    # Inverse list: strong in both physical metrics, but either below the
+    # absolute velocity cutoff or meaningfully below model expectation.
+    inverse = data.loc[
+        data["high_ci_flag"]
+        & data["high_pinch_flag"]
+        & (data["low_velo_flag"] | data["negative_residual_flag"])
+    ].copy()
+    inverse["reasons"] = inverse.apply(inverse_reasons, axis=1)
+    inverse = inverse.sort_values(
+        ["avg_fb_velo", "residual_fb_velo"],
+        ascending=[True, True],
+    )
+
+    return (
+        upside[output_columns].reset_index(drop=True),
+        inverse[output_columns].reset_index(drop=True),
+    )
+
+
 # -----------------------------------------------------------------------------
 # APP
 # -----------------------------------------------------------------------------
