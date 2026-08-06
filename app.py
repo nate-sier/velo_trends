@@ -4634,6 +4634,29 @@ with st.sidebar:
     )
     show_labels = st.checkbox("Show names")
 
+    st.markdown("---")
+    low_ci_threshold = st.number_input(
+        "S&C low CI threshold", min_value=0.0, step=1.0, value=280.0, format="%.1f"
+    )
+    low_pinch_threshold = st.number_input(
+        "S&C low pinch threshold", min_value=0.0, step=1.0, value=40.0, format="%.1f"
+    )
+    high_ci_threshold = st.number_input(
+        "S&C high CI threshold", min_value=0.0, step=1.0, value=330.0, format="%.1f"
+    )
+    high_pinch_threshold = st.number_input(
+        "S&C high pinch threshold", min_value=0.0, step=1.0, value=50.0, format="%.1f"
+    )
+    positive_residual_threshold = st.number_input(
+        "High positive residual", step=0.1, value=1.5, format="%.1f"
+    )
+    negative_residual_threshold = st.number_input(
+        "High negative residual", step=0.1, value=-1.5, format="%.1f"
+    )
+    low_velo_threshold = st.number_input(
+        "Low FB velo threshold", min_value=0.0, step=0.5, value=92.0, format="%.1f"
+    )
+
 
 summary = build_summary(
     jump=jump,
@@ -4659,6 +4682,16 @@ combined_summary = build_combined_overview_summary(
     pinch_summary,
 )
 combined_model = fit_combined_overview_model(combined_summary)
+sc_upside_table, sc_inverse_table = build_sc_opportunity_tables(
+    combined_model,
+    low_ci_threshold=float(low_ci_threshold),
+    low_pinch_threshold=float(low_pinch_threshold),
+    high_ci_threshold=float(high_ci_threshold),
+    high_pinch_threshold=float(high_pinch_threshold),
+    positive_residual_threshold=float(positive_residual_threshold),
+    negative_residual_threshold=float(negative_residual_threshold),
+    low_velo_threshold=float(low_velo_threshold),
+)
 
 bat_monthly_pairs = build_bat_monthly_pairs(
     jump=jump,
@@ -4702,6 +4735,7 @@ st.markdown(f"<div style='color:#667085;font-size:13px;margin:3px 0 20px;'>{html
     sprint_overview_tab,
     bat_overview_tab,
     exit_velo_overview_tab,
+    sc_opportunity_tab,
 ) = st.tabs([
     "FB Velo Overview",
     "Pinch Grip Overview",
@@ -4709,6 +4743,7 @@ st.markdown(f"<div style='color:#667085;font-size:13px;margin:3px 0 20px;'>{html
     "Sprint Speed Overview",
     "Bat Speed Overview",
     "P80 Exit Velo Overview",
+    "S&C Opportunity",
 ])
 
 with overview_tab:
@@ -4895,6 +4930,12 @@ with overview_tab:
                     "Last YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
                     "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
                 },
+            )
+            csv_download_button(
+                display,
+                "Download pitcher results CSV",
+                "fb_velo_pitcher_results.csv",
+                "download_fb_velo_pitcher_results",
             )
 
 
@@ -5155,6 +5196,12 @@ with pinch_overview_tab:
                     ),
                 },
             )
+            csv_download_button(
+                pinch_display,
+                "Download pinch pitcher results CSV",
+                "pinch_pitcher_results.csv",
+                "download_pinch_pitcher_results",
+            )
 
 
 
@@ -5358,6 +5405,12 @@ with combined_model_tab:
                     "Association per +10": st.column_config.NumberColumn(format="%+.2f mph"),
                 },
             )
+            csv_download_button(
+                coefficient_table,
+                "Download coefficient table CSV",
+                "combined_model_coefficients.csv",
+                "download_combined_model_coefficients",
+            )
         with st.container(border=True):
             st.subheader("Combined Pitcher Results", anchor=False)
             model_data = combined_model["data"]
@@ -5404,6 +5457,12 @@ with combined_model_tab:
                         format="%.2f"
                     ),
                 },
+            )
+            csv_download_button(
+                combined_display,
+                "Download combined pitcher results CSV",
+                "combined_pitcher_results.csv",
+                "download_combined_pitcher_results",
             )
 
 
@@ -5663,6 +5722,12 @@ with sprint_overview_tab:
                         format="%.2f W/kg"
                     ),
                 },
+            )
+            csv_download_button(
+                sprint_display,
+                "Download sprint results CSV",
+                "sprint_speed_results.csv",
+                "download_sprint_speed_results",
             )
 
 
@@ -5957,6 +6022,12 @@ with bat_overview_tab:
                         ),
                 },
             )
+            csv_download_button(
+                bat_display,
+                "Download bat-speed results CSV",
+                "bat_speed_results.csv",
+                "download_bat_speed_results",
+            )
 
 with exit_velo_overview_tab:
     exit_stats = exit_velo_correlation_stats(exit_velo_summary)
@@ -6233,4 +6304,98 @@ with exit_velo_overview_tab:
                         st.column_config.NumberColumn(format="%.2f N·s"),
                 },
             )
+            csv_download_button(
+                exit_display,
+                "Download P80 exit-velo results CSV",
+                "p80_exit_velo_results.csv",
+                "download_p80_exit_velo_results",
+            )
 
+
+
+with sc_opportunity_tab:
+    st.subheader("S&C Opportunity — Pitchers", anchor=False)
+    sc_counts = st.columns(3)
+    count_values = [
+        ("Combined-model pitchers", str(len(combined_model["data"])) if combined_model is not None else "0", BLUE),
+        ("Potential S&C upside", str(len(sc_upside_table)), TEAL),
+        ("Athletic but low velo", str(len(sc_inverse_table)), ACCENT_RED),
+    ]
+    for column, values in zip(sc_counts, count_values):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    if combined_model is None:
+        st.info("The combined overview model could not be fit, so the S&C opportunity tab is unavailable for the current filters.")
+    else:
+        with st.container(border=True):
+            st.subheader("Potential S&C Upside", anchor=False)
+            st.caption(
+                f"Flagged when CI < {float(low_ci_threshold):.0f}, pinch < {float(low_pinch_threshold):.0f}, "
+                f"or residual ≥ +{float(positive_residual_threshold):.1f} mph."
+            )
+            if sc_upside_table.empty:
+                st.info("No pitchers met the upside criteria.")
+            else:
+                upside_display = sc_upside_table.copy()
+                upside_display.columns = [
+                    "Pitcher", "Team", "Actual Final YTD FB Velo", "Predicted FB Velo",
+                    "Residual", "Average CI", "Average Pinch", "Tested Hand", "YTD FB As Of",
+                    "CI Jumps", "Pinch Tests", "Reasons",
+                ]
+                upside_display["YTD FB As Of"] = upside_display["YTD FB As Of"].map(fmt_date)
+                st.dataframe(
+                    upside_display,
+                    hide_index=True,
+                    use_container_width=True,
+                    height=min(660, 44 + 36 * (len(upside_display) + 1)),
+                    column_config={
+                        "Actual Final YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                        "Predicted FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                        "Residual": st.column_config.NumberColumn(format="%+.2f mph"),
+                        "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                        "Average Pinch": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+                csv_download_button(
+                    upside_display,
+                    "Download potential S&C upside CSV",
+                    "sc_upside_pitchers.csv",
+                    "download_sc_upside_pitchers",
+                )
+
+        with st.container(border=True):
+            st.subheader("Athletic but Low Velo", anchor=False)
+            st.caption(
+                f"Flagged when CI ≥ {float(high_ci_threshold):.0f} and pinch ≥ {float(high_pinch_threshold):.0f}, "
+                f"plus FB velo ≤ {float(low_velo_threshold):.1f} mph or residual ≤ {float(negative_residual_threshold):.1f} mph."
+            )
+            if sc_inverse_table.empty:
+                st.info("No pitchers met the athletic-but-low-velo criteria.")
+            else:
+                inverse_display = sc_inverse_table.copy()
+                inverse_display.columns = [
+                    "Pitcher", "Team", "Actual Final YTD FB Velo", "Predicted FB Velo",
+                    "Residual", "Average CI", "Average Pinch", "Tested Hand", "YTD FB As Of",
+                    "CI Jumps", "Pinch Tests", "Reasons",
+                ]
+                inverse_display["YTD FB As Of"] = inverse_display["YTD FB As Of"].map(fmt_date)
+                st.dataframe(
+                    inverse_display,
+                    hide_index=True,
+                    use_container_width=True,
+                    height=min(660, 44 + 36 * (len(inverse_display) + 1)),
+                    column_config={
+                        "Actual Final YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                        "Predicted FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                        "Residual": st.column_config.NumberColumn(format="%+.2f mph"),
+                        "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                        "Average Pinch": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+                csv_download_button(
+                    inverse_display,
+                    "Download athletic but low velo CSV",
+                    "athletic_but_low_velo_pitchers.csv",
+                    "download_sc_inverse_pitchers",
+                )
