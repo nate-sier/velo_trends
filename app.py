@@ -65,6 +65,7 @@ BAT_SPEED_OUTPUT_BUCKET_WIDTH = 2.0
 EXIT_VELO_OUTPUT_BUCKET_WIDTH = 2.0
 POTENTIAL_PINCH_INCREASE = 10.0
 POTENTIAL_PEAK_POWER_REL_INCREASE = 5.0
+POTENTIAL_PEAK_POWER_INCREASE = 500.0
 MIN_SPRINT_MONTH_DATA_DATES = 14
 
 # Only these affiliate / roster groups are available in the dashboard.
@@ -408,6 +409,13 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
             "peak_power_rel", "peak power / bm [w/kg]",
         ],
     )
+    jump_peak_power_col = first_existing(
+        jump_raw.columns.tolist(),
+        [
+            "Peak Power [W]", "Peak Power", "peak power [w]",
+            "peak_power", "Peak Power W", "Peak Power (W)",
+        ],
+    )
     jump_team_col = first_existing(jump_raw.columns.tolist(), ["Team", "team", "Level", "level"])
 
     missing_jump = [
@@ -416,6 +424,7 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
             "date": jump_date_col,
             "concentric impulse": jump_ci_col,
             "Peak Power / BM [W/kg]": jump_peak_power_rel_col,
+            "Peak Power [W]": jump_peak_power_col,
         }.items() if col is None
     ]
     if missing_jump:
@@ -427,6 +436,9 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         "ci": pd.to_numeric(jump_raw[jump_ci_col], errors="coerce"),
         "peak_power_rel": pd.to_numeric(
             jump_raw[jump_peak_power_rel_col], errors="coerce"
+        ),
+        "peak_power": pd.to_numeric(
+            jump_raw[jump_peak_power_col], errors="coerce"
         ),
         "team_raw": jump_raw[jump_team_col].astype(str).str.strip() if jump_team_col else "",
     })
@@ -446,8 +458,8 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         .reset_index(drop=True)
     )
     jump_power = (
-        jump_base.dropna(subset=["date", "peak_power_rel"])[
-            ["athlete", "date", "peak_power_rel", "team", "name_key"]
+        jump_base.dropna(subset=["date"])[
+            ["athlete", "date", "peak_power", "peak_power_rel", "team", "name_key"]
         ]
         .sort_values(["athlete", "date"], kind="stable")
         .reset_index(drop=True)
@@ -5101,6 +5113,384 @@ def filter_hitter_underperformance_pathways(
     out["reasons"] = [reasons_for_index(i) for i in out.index]
     return out.reset_index(drop=True)
 
+
+def build_power_pitch_summary(
+    jump_power: pd.DataFrame,
+    velo: pd.DataFrame,
+    start_date,
+    end_date,
+    team_filter: str,
+    min_velo_records: int,
+    min_power_jumps: int,
+) -> pd.DataFrame:
+    """Create one pitcher-level row matching average Peak Power to final in-window YTD FB velo."""
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+
+    power_window = jump_power[
+        (jump_power["date"] >= start) & (jump_power["date"] <= end)
+    ].copy()
+    velo_window = velo[
+        (velo["date"] >= start) & (velo["date"] <= end)
+    ].copy()
+
+    team_lookup = (
+        jump_power.sort_values("date")
+        .groupby("name_key", as_index=False)
+        .tail(1)[["name_key", "team"]]
+        .drop_duplicates("name_key")
+    )
+
+    power_summary = (
+        power_window.groupby("name_key", as_index=False)
+        .agg(
+            athlete=("athlete", "first"),
+            avg_peak_power=("peak_power", "mean"),
+            power_jumps=("peak_power", "count"),
+            power_test_dates=("date", "nunique"),
+            first_power_date=("date", "min"),
+            last_power_date=("date", "max"),
+        )
+    )
+
+    velo_window = velo_window.sort_values(["name_key", "date"], kind="stable")
+    velo_counts = (
+        velo_window.groupby("name_key", as_index=False)
+        .agg(
+            fb_records=("ytd_fb_velo", "count"),
+            first_fb_date=("date", "min"),
+            last_fb_date=("date", "max"),
+        )
+    )
+    latest_ytd = (
+        velo_window.groupby("name_key", as_index=False)
+        .tail(1)[["name_key", "ytd_fb_velo", "date"]]
+        .rename(columns={"ytd_fb_velo": "avg_fb_velo", "date": "ytd_as_of_date"})
+    )
+    velo_summary = velo_counts.merge(latest_ytd, on="name_key", how="inner")
+
+    summary = velo_summary.merge(power_summary, on="name_key", how="inner")
+    summary = summary.merge(team_lookup, on="name_key", how="left")
+    summary["team"] = summary["team"].fillna("Unassigned")
+    summary = summary[summary["avg_fb_velo"] >= MIN_LAST_YTD_FB_VELO].copy()
+    summary = summary[
+        (summary["fb_records"] >= max(1, int(min_velo_records)))
+        & (summary["power_jumps"] >= max(1, int(min_power_jumps)))
+    ].copy()
+
+    if team_filter != "All Teams":
+        summary = summary[summary["team"] == team_filter].copy()
+
+    return summary.sort_values("avg_fb_velo", ascending=False).reset_index(drop=True)
+
+
+def power_pitch_correlation_stats(
+    summary: pd.DataFrame,
+) -> tuple[float, float, float, float] | None:
+    if len(summary) < 2:
+        return None
+    work = summary[["avg_peak_power", "avg_fb_velo"]].dropna()
+    if len(work) < 2:
+        return None
+    x = work["avg_peak_power"].to_numpy(dtype=float)
+    y = work["avg_fb_velo"].to_numpy(dtype=float)
+    if np.isclose(np.std(x), 0) or np.isclose(np.std(y), 0):
+        return None
+    slope, intercept = np.polyfit(x, y, 1)
+    r = float(np.corrcoef(x, y)[0, 1])
+    return r, r * r, float(slope), float(intercept)
+
+
+def power_pitch_band_summary(
+    summary: pd.DataFrame,
+    band_width: float,
+    velo_stat: str = "Mean",
+) -> pd.DataFrame:
+    stat = "Median" if str(velo_stat).strip().lower() == "median" else "Mean"
+    velo_col = f"{stat} Last YTD FB Velo"
+    if summary.empty:
+        return pd.DataFrame(columns=[
+            "Peak Power band", velo_col, "Pitchers", "Average Peak Power"
+        ])
+
+    width = max(float(band_width), 1e-9)
+    work = summary[["avg_peak_power", "avg_fb_velo"]].dropna().copy()
+    if work.empty:
+        return pd.DataFrame(columns=[
+            "Peak Power band", velo_col, "Pitchers", "Average Peak Power"
+        ])
+    work["band_start"] = np.floor(work["avg_peak_power"] / width) * width
+    grouped = (
+        work.groupby("band_start", as_index=False)
+        .agg(**{
+            velo_col: ("avg_fb_velo", "median" if stat == "Median" else "mean"),
+            "Pitchers": ("avg_fb_velo", "count"),
+            "Average Peak Power": ("avg_peak_power", "mean"),
+        })
+        .sort_values("band_start")
+    )
+
+    def _label(lower: float) -> str:
+        upper = lower + width
+        return f"{lower:.1f}–{upper:.1f} W"
+
+    grouped["Peak Power band"] = grouped["band_start"].map(_label)
+    grouped[velo_col] = grouped[velo_col].round(2)
+    grouped["Average Peak Power"] = grouped["Average Peak Power"].round(2)
+    grouped["Pitchers"] = grouped["Pitchers"].astype(int)
+    return grouped[["Peak Power band", velo_col, "Pitchers", "Average Peak Power"]]
+
+
+def build_power_pitch_band_chart(
+    summary: pd.DataFrame,
+    band_width: float,
+    velo_stat: str = "Mean",
+) -> go.Figure:
+    stat = "Median" if str(velo_stat).strip().lower() == "median" else "Mean"
+    velo_col = f"{stat} Last YTD FB Velo"
+    bands = power_pitch_band_summary(summary, band_width, stat)
+    fig = go.Figure()
+    if bands.empty:
+        fig.add_annotation(
+            text="No matched pitchers are available for Peak Power bands.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 380)
+
+    fig.add_trace(go.Bar(
+        x=bands["Peak Power band"],
+        y=bands[velo_col],
+        marker={"color": BLUE, "line": {"color": NAVY_MID, "width": 0.8}},
+        text=[f"{v:.1f}" for v in bands[velo_col]],
+        textposition="outside",
+        cliponaxis=False,
+        customdata=np.column_stack([
+            bands["Pitchers"], bands["Average Peak Power"]
+        ]),
+        hovertemplate=(
+            f"<b>%{{x}}</b><br>{stat} last YTD FB velo: %{{y:.2f}} mph<br>"
+            "Pitchers: %{customdata[0]}<br>Mean Peak Power: %{customdata[1]:.2f} W"
+            "<extra></extra>"
+        ),
+    ))
+    y_min = max(0, float(bands[velo_col].min()) - 1.5)
+    y_max = float(bands[velo_col].max()) + 1.25
+    fig.update_xaxes(
+        title="Pitcher average Peak Power [W] band",
+        showgrid=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title=f"{stat} last YTD FB velo (mph)",
+        range=[y_min, y_max], showgrid=True, gridcolor=GRID,
+        zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 380)
+
+
+def power_pitch_band_members(
+    summary: pd.DataFrame,
+    band_width: float,
+    selected_band: str,
+    velo_stat: str = "Mean",
+) -> tuple[pd.DataFrame, float, str]:
+    stat = "Median" if str(velo_stat).strip().lower() == "median" else "Mean"
+    width = max(float(band_width), 1e-9)
+    cols = ["athlete", "team", "avg_peak_power", "avg_fb_velo"]
+    if summary.empty or any(c not in summary.columns for c in cols):
+        return pd.DataFrame(columns=cols + ["Peak Power band", "Status", "Difference"]), np.nan, stat
+
+    detail = summary[cols].dropna().copy()
+    detail["band_start"] = np.floor(detail["avg_peak_power"] / width) * width
+    detail["Peak Power band"] = detail["band_start"].map(
+        lambda lower: f"{lower:.1f}–{lower + width:.1f} W"
+    )
+    detail = detail[detail["Peak Power band"] == selected_band].copy()
+    if detail.empty:
+        return detail, np.nan, stat
+
+    reference = float(detail["avg_fb_velo"].median() if stat == "Median" else detail["avg_fb_velo"].mean())
+    detail["Difference"] = detail["avg_fb_velo"] - reference
+    detail["Status"] = np.where(
+        np.isclose(detail["Difference"], 0, atol=1e-10),
+        f"At {stat.lower()}",
+        np.where(detail["Difference"] > 0, f"Above {stat.lower()}", f"Below {stat.lower()}"),
+    )
+    detail["Display"] = detail.apply(
+        lambda row: f"{row['athlete']} · {row['avg_peak_power']:.1f} W", axis=1
+    )
+    return detail.sort_values("avg_fb_velo", ascending=False).reset_index(drop=True), reference, stat
+
+
+def build_power_pitch_band_member_chart(
+    summary: pd.DataFrame,
+    band_width: float,
+    selected_band: str,
+    velo_stat: str = "Mean",
+) -> go.Figure:
+    detail, reference, stat = power_pitch_band_members(
+        summary, band_width, selected_band, velo_stat
+    )
+    fig = go.Figure()
+    if detail.empty:
+        fig.add_annotation(
+            text="No pitchers are available in this Peak Power band.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 340)
+
+    status_style = [
+        (f"Above {stat.lower()}", GREEN),
+        (f"At {stat.lower()}", TEAL),
+        (f"Below {stat.lower()}", ACCENT_RED),
+    ]
+    category_order = detail["Display"].tolist()
+    for status, color in status_style:
+        sub = detail[detail["Status"] == status]
+        if sub.empty:
+            continue
+        customdata = np.column_stack([
+            sub["athlete"], sub["team"], sub["avg_peak_power"],
+            sub["Difference"], sub["Status"],
+        ])
+        fig.add_trace(go.Bar(
+            x=sub["avg_fb_velo"], y=sub["Display"], orientation="h",
+            name=status.title(),
+            marker={"color": color, "line": {"color": "#FFFFFF", "width": 1}},
+            text=[f"{v:.2f}" for v in sub["avg_fb_velo"]],
+            textposition="outside", cliponaxis=False,
+            customdata=customdata,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>Team: %{customdata[1]}<br>"
+                "Average Peak Power [W]: %{customdata[2]:.2f} W<br>"
+                "Last YTD FB velo: %{x:.2f} mph<br>"
+                f"{stat} difference: %{{customdata[3]:+.2f}} mph<br>"
+                "Flag: %{customdata[4]}<extra></extra>"
+            ),
+        ))
+
+    x_min = max(0, float(detail["avg_fb_velo"].min()) - 1.5)
+    x_max = float(detail["avg_fb_velo"].max()) + 1.25
+    fig.add_vline(
+        x=reference, line_color=NAVY_MID, line_width=2, line_dash="dash",
+        annotation_text=f"{stat} {reference:.2f}",
+        annotation_font_color=NAVY_MID, annotation_position="top right",
+    )
+    fig.update_xaxes(
+        title="Last YTD FB velo (mph)", range=[x_min, x_max],
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Pitcher · Average Peak Power [W]",
+        categoryorder="array", categoryarray=category_order,
+        autorange="reversed", showgrid=False, linecolor=BORDER,
+        tickfont={"color": TEXT, "size": 12}, title_font={"color": SUBTEXT}, automargin=True,
+    )
+    fig = base_figure_layout(fig, max(340, len(detail) * 42 + 125))
+    fig.update_layout(
+        showlegend=True,
+        legend={"orientation": "h", "x": 0, "y": 1.14, "font": {"color": SUBTEXT}},
+        margin={"l": 210, "r": 70, "t": 50, "b": 58},
+    )
+    return fig
+
+
+def build_power_pitch_scatter(
+    summary: pd.DataFrame,
+    show_labels: bool,
+    power_lookup: float | None,
+) -> go.Figure:
+    fig = go.Figure()
+    if summary.empty:
+        fig.add_annotation(
+            text="No matched pitchers meet the selected window and minimum-data rules.",
+            showarrow=False, font={"size": 15, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 560)
+
+    customdata = np.column_stack([
+        summary["athlete"], summary["team"], summary["fb_records"],
+        summary["power_jumps"], summary["power_test_dates"],
+        summary["ytd_as_of_date"].map(fmt_date),
+        summary["first_power_date"].map(fmt_date),
+        summary["last_power_date"].map(fmt_date),
+    ])
+    fig.add_trace(go.Scatter(
+        x=summary["avg_peak_power"], y=summary["avg_fb_velo"],
+        mode="markers+text" if show_labels else "markers",
+        text=summary["athlete"] if show_labels else None,
+        textposition="top center", textfont={"size": 10, "color": NAVY},
+        marker={"size": 13, "color": ACCENT_RED, "opacity": 0.88,
+                "line": {"color": "#FFFFFF", "width": 2}},
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>Team: %{customdata[1]}<br>"
+            "Last YTD FB velo: %{y:.2f} mph<br>"
+            "Average Peak Power [W]: %{x:.2f} W<br><br>"
+            "FB records: %{customdata[2]} · YTD as of %{customdata[5]}<br>"
+            "Power jumps: %{customdata[3]} across %{customdata[4]} test dates · "
+            "%{customdata[6]}–%{customdata[7]}<extra></extra>"
+        ),
+    ))
+
+    stats = power_pitch_correlation_stats(summary)
+    if stats is not None:
+        r, r2, slope, intercept = stats
+        x_range = np.linspace(
+            summary["avg_peak_power"].min(),
+            summary["avg_peak_power"].max(), 100
+        )
+        fig.add_trace(go.Scatter(
+            x=x_range, y=slope * x_range + intercept,
+            mode="lines", line={"color": NAVY_MID, "width": 2.5, "dash": "dash"},
+            hoverinfo="skip",
+        ))
+        fig.add_annotation(
+            text=f"r = {r:+.2f} · R² = {r2:.2f}",
+            x=0.02, y=0.98, xref="paper", yref="paper",
+            xanchor="left", yanchor="top", showarrow=False,
+            font={"color": NAVY, "size": 13}, bgcolor="#FFFFFF",
+            bordercolor=BORDER, borderwidth=1, borderpad=7,
+        )
+        if power_lookup is not None and np.isfinite(power_lookup):
+            predicted = slope * float(power_lookup) + intercept
+            fig.add_vline(x=float(power_lookup), line_color=TEAL, line_width=1.5, line_dash="dot")
+            fig.add_hline(y=predicted, line_color=TEAL, line_width=1.5, line_dash="dot")
+            fig.add_trace(go.Scatter(
+                x=[float(power_lookup)], y=[predicted], mode="markers",
+                marker={"size": 15, "color": TEAL, "symbol": "diamond",
+                        "line": {"color": "#FFFFFF", "width": 2}},
+                hovertemplate=(
+                    "<b>Peak Power lookup</b><br>Average Peak Power [W]: %{x:.1f} W<br>"
+                    "Estimated last YTD FB velo: %{y:.2f} mph<extra></extra>"
+                ),
+            ))
+
+    fig.update_xaxes(
+        title="Average Peak Power [W]", showgrid=True, gridcolor=GRID,
+        zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Last YTD FB velocity (mph)", showgrid=True, gridcolor=GRID,
+        zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 560)
+
 # -----------------------------------------------------------------------------
 # APP
 # -----------------------------------------------------------------------------
@@ -5199,13 +5589,29 @@ with st.sidebar:
         index=0,
         key="power_band_sprint_speed_stat",
     )
+    pitch_power_lookup = st.number_input(
+        "Peak Power [W] lookup",
+        min_value=0.0, step=100.0, value=5000.0, format="%.0f",
+    )
+    pitch_power_band_width = st.selectbox(
+        "Peak Power [W] band",
+        [100.0, 250.0, 500.0, 1000.0],
+        index=1,
+        format_func=lambda x: f"{x:g} W",
+    )
+    power_band_velo_stat = st.selectbox(
+        "Peak Power band FB velo",
+        ["Mean", "Median"],
+        index=0,
+        key="power_band_fb_velo_stat",
+    )
 
     st.markdown("---")
     min_velo_records = st.number_input("Min FB records", min_value=1, step=1, value=1)
     min_ci_jumps = st.number_input("Min CI jumps", min_value=1, step=1, value=1)
     min_pinch_tests = st.number_input("Min pinch tests", min_value=1, step=1, value=1)
     min_power_jumps = st.number_input(
-        "Min relative-power jumps", min_value=1, step=1, value=1
+        "Min power jumps", min_value=1, step=1, value=1
     )
     show_labels = st.checkbox("Show names")
 
@@ -5219,6 +5625,15 @@ summary = build_summary(
     team_filter=team_filter,
     min_velo_records=int(min_velo_records),
     min_ci_jumps=int(min_ci_jumps),
+)
+power_pitch_summary = build_power_pitch_summary(
+    jump_power=jump_power,
+    velo=velo,
+    start_date=start_date,
+    end_date=end_date,
+    team_filter=team_filter,
+    min_velo_records=int(min_velo_records),
+    min_power_jumps=int(min_power_jumps),
 )
 pinch_summary = build_pinch_summary(
     pinch=pinch,
@@ -5274,6 +5689,7 @@ st.markdown(f"<div style='color:#667085;font-size:13px;margin:3px 0 20px;'>{html
 (
     overview_tab,
     pinch_overview_tab,
+    power_pitch_tab,
     combined_model_tab,
     sprint_overview_tab,
     bat_overview_tab,
@@ -5282,6 +5698,7 @@ st.markdown(f"<div style='color:#667085;font-size:13px;margin:3px 0 20px;'>{html
 ) = st.tabs([
     "FB Velo Overview",
     "Pinch Grip Overview",
+    "Peak Power [W] × Pitching Velo",
     "Combined CI + Pinch Overview",
     "Sprint Speed Overview",
     "Bat Speed Overview",
@@ -5746,6 +6163,253 @@ with pinch_overview_tab:
                 "download_pinch_pitcher_results",
             )
 
+
+
+with power_pitch_tab:
+    power_pitch_stats = power_pitch_correlation_stats(power_pitch_summary)
+    n_power_pitchers = len(power_pitch_summary)
+    mean_power_pitch_velo = (
+        power_pitch_summary["avg_fb_velo"].mean() if n_power_pitchers else np.nan
+    )
+    mean_pitch_power = (
+        power_pitch_summary["avg_peak_power"].mean() if n_power_pitchers else np.nan
+    )
+    power_pitch_r_text = (
+        f"{power_pitch_stats[0]:+.2f}" if power_pitch_stats is not None else "—"
+    )
+    power_pitch_r2_text = (
+        f"{power_pitch_stats[1]:.2f}" if power_pitch_stats is not None else "—"
+    )
+    potential_power_velo = (
+        power_pitch_stats[2] * POTENTIAL_PEAK_POWER_INCREASE
+        if power_pitch_stats is not None else np.nan
+    )
+    potential_power_velo_text = (
+        f"{potential_power_velo:+.2f} mph" if pd.notna(potential_power_velo) else "—"
+    )
+
+    top_cols = st.columns(3)
+    for column, values in zip(top_cols, [
+        ("Pitchers", str(n_power_pitchers), BLUE),
+        ("Correlation", power_pitch_r_text, ACCENT_RED),
+        ("R²", power_pitch_r2_text, NAVY_MID),
+    ]):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    bottom_cols = st.columns(3)
+    for column, values in zip(bottom_cols, [
+        ("Last YTD FB Velo", f"{fmt(mean_power_pitch_velo)} mph", TEAL),
+        ("Average Peak Power [W]", f"{fmt(mean_pitch_power)} W", GREEN),
+        (
+            f"Potential Velo Increase · +{POTENTIAL_PEAK_POWER_INCREASE:.0f} W",
+            potential_power_velo_text,
+            NAVY_MID,
+        ),
+    ]):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    estimated_power_pitch_velo = (
+        power_pitch_stats[2] * float(pitch_power_lookup) + power_pitch_stats[3]
+        if power_pitch_stats is not None else np.nan
+    )
+    with st.container(border=True):
+        st.subheader("Peak Power [W] Lookup", anchor=False)
+        lookup_left, lookup_right = st.columns(2)
+        with lookup_left:
+            st.markdown(
+                "<div class='metric-label'>Average Peak Power [W]</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div class='lookup-value' style='color:#0A1F44;'>"
+                f"{fmt(pitch_power_lookup, 1)} W</div>",
+                unsafe_allow_html=True,
+            )
+        with lookup_right:
+            st.markdown(
+                "<div class='metric-label'>Estimated FB Velo</div>",
+                unsafe_allow_html=True,
+            )
+            lookup_value = (
+                f"{fmt(estimated_power_pitch_velo)} mph"
+                if pd.notna(estimated_power_pitch_velo) else "—"
+            )
+            st.markdown(
+                f"<div class='lookup-value' style='color:#0D7E8A;'>"
+                f"{lookup_value}</div>",
+                unsafe_allow_html=True,
+            )
+
+    power_pitch_bands = power_pitch_band_summary(
+        power_pitch_summary,
+        float(pitch_power_band_width),
+        power_band_velo_stat,
+    )
+    with st.container(border=True):
+        st.subheader(
+            f"{power_band_velo_stat} FB Velo by Peak Power [W] Band",
+            anchor=False,
+        )
+        st.plotly_chart(
+            build_power_pitch_band_chart(
+                power_pitch_summary,
+                float(pitch_power_band_width),
+                power_band_velo_stat,
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=(
+                f"power_pitch_band_{pitch_power_band_width}_{power_band_velo_stat}_"
+                f"{team_filter}_{start_date}_{end_date}"
+            ),
+        )
+
+    if not power_pitch_bands.empty:
+        power_pitch_band_options = power_pitch_bands["Peak Power band"].tolist()
+        power_pitch_band_key = "power_pitch_band_detail_selector"
+        if st.session_state.get(power_pitch_band_key) not in power_pitch_band_options:
+            st.session_state[power_pitch_band_key] = power_pitch_band_options[0]
+        with st.container(border=True):
+            st.subheader("Peak Power [W] Band Pitchers", anchor=False)
+            selected_power_pitch_band = st.selectbox(
+                "Peak Power band",
+                power_pitch_band_options,
+                key=power_pitch_band_key,
+            )
+            st.plotly_chart(
+                build_power_pitch_band_member_chart(
+                    power_pitch_summary,
+                    float(pitch_power_band_width),
+                    selected_power_pitch_band,
+                    power_band_velo_stat,
+                ),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=(
+                    f"power_pitch_band_detail_{selected_power_pitch_band}_"
+                    f"{pitch_power_band_width}_{power_band_velo_stat}_{team_filter}_"
+                    f"{start_date}_{end_date}"
+                ),
+            )
+
+    with st.container(border=True):
+        st.subheader("Average Peak Power [W] by FB Velo Bucket", anchor=False)
+        st.plotly_chart(
+            build_output_bucket_chart(
+                df=power_pitch_summary,
+                output_col="avg_fb_velo",
+                testing_col="avg_peak_power",
+                bucket_width=FB_VELO_OUTPUT_BUCKET_WIDTH,
+                output_bucket_label="FB velo bucket",
+                testing_metric_label="peak power",
+                output_axis_title="Last YTD FB velo bucket",
+                testing_axis_title="Average Peak Power [W]",
+                output_unit="mph",
+                empty_text="No matched pitchers are available for FB velo buckets.",
+                color=TEAL,
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"power_pitch_output_bucket_{team_filter}_{start_date}_{end_date}",
+        )
+
+    power_pitch_output_buckets = output_bucket_summary(
+        df=power_pitch_summary,
+        output_col="avg_fb_velo",
+        testing_col="avg_peak_power",
+        bucket_width=FB_VELO_OUTPUT_BUCKET_WIDTH,
+        output_bucket_label="FB velo bucket",
+        testing_metric_label="peak power",
+        output_unit="mph",
+        testing_unit="W",
+    )
+    if not power_pitch_output_buckets.empty:
+        power_pitch_output_options = power_pitch_output_buckets["FB velo bucket"].tolist()
+        power_pitch_output_key = "power_pitch_output_bucket_detail_selector"
+        if st.session_state.get(power_pitch_output_key) not in power_pitch_output_options:
+            st.session_state[power_pitch_output_key] = power_pitch_output_options[0]
+        with st.container(border=True):
+            st.subheader("FB Velo Bucket Pitchers · Peak Power", anchor=False)
+            selected_power_output_bucket = st.selectbox(
+                "FB velo bucket",
+                power_pitch_output_options,
+                key=power_pitch_output_key,
+            )
+            st.plotly_chart(
+                build_output_bucket_member_chart(
+                    df=power_pitch_summary,
+                    output_col="avg_fb_velo",
+                    testing_col="avg_peak_power",
+                    bucket_width=FB_VELO_OUTPUT_BUCKET_WIDTH,
+                    selected_bucket=selected_power_output_bucket,
+                    output_bucket_label="FB velo bucket",
+                    output_unit="mph",
+                    testing_axis_title="Average Peak Power [W]",
+                    testing_unit="W",
+                    entity_label="Pitcher",
+                    output_value_label="Last YTD FB velo",
+                ),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=(
+                    f"power_pitch_output_detail_{selected_power_output_bucket}_"
+                    f"{team_filter}_{start_date}_{end_date}"
+                ),
+            )
+
+    with st.container(border=True):
+        st.subheader("Peak Power [W] vs YTD FB Velo", anchor=False)
+        st.plotly_chart(
+            build_power_pitch_scatter(
+                power_pitch_summary,
+                show_labels,
+                float(pitch_power_lookup),
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=(
+                f"power_pitch_scatter_{team_filter}_{start_date}_{end_date}_"
+                f"{show_labels}_{pitch_power_lookup}"
+            ),
+        )
+
+    with st.container(border=True):
+        st.subheader("Peak Power [W] Pitcher Results", anchor=False)
+        if power_pitch_summary.empty:
+            st.info("No matching pitchers.")
+        else:
+            power_pitch_display = power_pitch_summary[[
+                "athlete", "team", "avg_fb_velo", "ytd_as_of_date",
+                "avg_peak_power", "fb_records", "power_jumps",
+                "power_test_dates", "first_power_date", "last_power_date",
+            ]].copy()
+            power_pitch_display.columns = [
+                "Pitcher", "Team", "Last YTD FB Velo", "YTD FB As Of",
+                "Average Peak Power [W]", "FB Records", "Power Jumps",
+                "Power Test Dates", "First Power Test", "Last Power Test",
+            ]
+            for date_col in ["YTD FB As Of", "First Power Test", "Last Power Test"]:
+                power_pitch_display[date_col] = power_pitch_display[date_col].map(fmt_date)
+            power_pitch_display["Last YTD FB Velo"] = power_pitch_display["Last YTD FB Velo"].round(2)
+            power_pitch_display["Average Peak Power [W]"] = power_pitch_display["Average Peak Power [W]"].round(2)
+            st.dataframe(
+                power_pitch_display,
+                hide_index=True,
+                use_container_width=True,
+                height=min(650, 44 + 36 * (len(power_pitch_display) + 1)),
+                column_config={
+                    "Last YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                    "Average Peak Power [W]": st.column_config.NumberColumn(format="%.2f W"),
+                },
+            )
+            csv_download_button(
+                power_pitch_display,
+                "Download peak-power pitching results CSV",
+                "peak_power_pitching_velo_results.csv",
+                "download_peak_power_pitching_results",
+            )
 
 
 with combined_model_tab:
