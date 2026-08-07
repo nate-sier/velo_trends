@@ -4683,9 +4683,10 @@ def build_sc_opportunity_tables(
 
 def build_projection_gap_table(
     model: dict | None,
-    threshold: float,
+    projected_threshold: float,
+    actual_threshold: float | None = None,
 ) -> pd.DataFrame:
-    """Return pitchers projected at or above a cutoff but actually below it."""
+    """Return pitchers projected above one cutoff but actually below another."""
     output_columns = [
         "athlete",
         "team",
@@ -4708,14 +4709,19 @@ def build_projection_gap_table(
     ):
         return pd.DataFrame(columns=output_columns)
 
+    actual_cutoff = (
+        float(projected_threshold)
+        if actual_threshold is None
+        else float(actual_threshold)
+    )
     data = model["data"].copy()
     gap = data.loc[
-        (data["predicted_fb_velo"] >= float(threshold))
-        & (data["avg_fb_velo"] < float(threshold))
+        (data["predicted_fb_velo"] >= float(projected_threshold))
+        & (data["avg_fb_velo"] < actual_cutoff)
     ].copy()
     gap["reasons"] = (
-        f"Projected FB velo >= {float(threshold):.1f} mph | "
-        f"Actual FB velo < {float(threshold):.1f} mph"
+        f"Projected FB velo >= {float(projected_threshold):.1f} mph | "
+        f"Actual FB velo < {actual_cutoff:.1f} mph"
     )
     gap = gap.sort_values(
         ["predicted_fb_velo", "avg_fb_velo"],
@@ -4876,6 +4882,225 @@ def build_hitter_sc_opportunity_tables(
     )
 
 
+
+
+def build_pitcher_custom_category(
+    model: dict | None,
+    criteria: list[dict],
+) -> pd.DataFrame:
+    """Filter combined-model pitchers using only enabled category criteria."""
+    output_columns = [
+        "athlete", "team", "avg_fb_velo", "predicted_fb_velo",
+        "residual_fb_velo", "avg_ci", "avg_pinch_strength", "pinch_hand",
+        "ytd_as_of_date", "ci_jumps", "pinch_tests", "reasons",
+    ]
+    if model is None or model.get("data") is None or model["data"].empty:
+        return pd.DataFrame(columns=output_columns)
+
+    data = model["data"].copy()
+    active = [c for c in criteria if c.get("enabled", False)]
+    mask = pd.Series(True, index=data.index)
+
+    op_map = {
+        "lt": lambda s, v: s.lt(v),
+        "le": lambda s, v: s.le(v),
+        "gt": lambda s, v: s.gt(v),
+        "ge": lambda s, v: s.ge(v),
+    }
+    symbol_map = {"lt": "<", "le": "≤", "gt": ">", "ge": "≥"}
+
+    reason_parts = []
+    for criterion in active:
+        column = criterion["column"]
+        operator = criterion["operator"]
+        value = float(criterion["value"])
+        if column not in data.columns:
+            continue
+        criterion_mask = op_map[operator](data[column], value).fillna(False)
+        mask &= criterion_mask
+        decimals = int(criterion.get("decimals", 1))
+        unit = criterion.get("unit", "")
+        label = criterion.get("label", column)
+        reason_parts.append(
+            f"{label} {symbol_map[operator]} {value:.{decimals}f}{unit}"
+        )
+
+    result = data.loc[mask].copy()
+    result["reasons"] = " | ".join(reason_parts) if reason_parts else "No criteria enabled"
+    sort_col = "residual_fb_velo" if "residual_fb_velo" in result.columns else "avg_fb_velo"
+    if not result.empty:
+        result = result.sort_values(sort_col, ascending=True, na_position="last")
+    return result[output_columns].reset_index(drop=True)
+
+
+def build_hitter_opportunity_base(
+    bat_pairs: pd.DataFrame,
+    exit_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    """Create one merged hitter row with CI, output, projections, and residuals."""
+    output_columns = [
+        "athlete", "team", "month", "monthly_avg_ci", "monthly_avg_bat_speed",
+        "predicted_bat_speed", "bat_speed_residual", "exit_velo_as_of",
+        "ytd_avg_ci", "ytd_p80_exit_velo", "predicted_p80_exit_velo",
+        "p80_exit_velo_residual",
+    ]
+    bat_stats = bat_correlation_stats(bat_pairs)
+    exit_stats = exit_velo_correlation_stats(exit_summary)
+
+    if bat_pairs.empty:
+        bat_work = pd.DataFrame(columns=[
+            "name_key", "bat_athlete", "bat_team", "month", "monthly_avg_ci",
+            "monthly_avg_bat_speed", "predicted_bat_speed", "bat_speed_residual",
+        ])
+    else:
+        bat_work = bat_pairs[[
+            "name_key", "athlete", "team", "month", "avg_ci", "monthly_avg_bat_speed",
+        ]].copy().rename(columns={
+            "athlete": "bat_athlete", "team": "bat_team", "avg_ci": "monthly_avg_ci",
+        })
+        if bat_stats is not None:
+            bat_work["predicted_bat_speed"] = bat_stats[2] * bat_work["monthly_avg_ci"] + bat_stats[3]
+            bat_work["bat_speed_residual"] = bat_work["monthly_avg_bat_speed"] - bat_work["predicted_bat_speed"]
+        else:
+            bat_work["predicted_bat_speed"] = np.nan
+            bat_work["bat_speed_residual"] = np.nan
+
+    if exit_summary.empty:
+        exit_work = pd.DataFrame(columns=[
+            "name_key", "exit_athlete", "exit_team", "exit_velo_as_of", "ytd_avg_ci",
+            "ytd_p80_exit_velo", "predicted_p80_exit_velo", "p80_exit_velo_residual",
+        ])
+    else:
+        exit_work = exit_summary[[
+            "name_key", "athlete", "team", "exit_velo_as_of", "avg_ci", "ytd_p80_exit_velo",
+        ]].copy().rename(columns={
+            "athlete": "exit_athlete", "team": "exit_team", "avg_ci": "ytd_avg_ci",
+        })
+        if exit_stats is not None:
+            exit_work["predicted_p80_exit_velo"] = exit_stats[2] * exit_work["ytd_avg_ci"] + exit_stats[3]
+            exit_work["p80_exit_velo_residual"] = exit_work["ytd_p80_exit_velo"] - exit_work["predicted_p80_exit_velo"]
+        else:
+            exit_work["predicted_p80_exit_velo"] = np.nan
+            exit_work["p80_exit_velo_residual"] = np.nan
+
+    combined = bat_work.merge(exit_work, on="name_key", how="outer")
+    if combined.empty:
+        return pd.DataFrame(columns=output_columns)
+    combined["athlete"] = combined.get("bat_athlete").combine_first(combined.get("exit_athlete"))
+    combined["team"] = combined.get("bat_team").combine_first(combined.get("exit_team"))
+    for col in output_columns:
+        if col not in combined.columns:
+            combined[col] = np.nan
+    return combined[output_columns].reset_index(drop=True)
+
+
+def filter_hitter_custom_category(
+    base: pd.DataFrame,
+    criteria: list[dict],
+    mode: str = "all",
+) -> pd.DataFrame:
+    """Filter hitter rows with ANY or ALL enabled criteria."""
+    output_columns = list(base.columns) + (["reasons"] if "reasons" not in base.columns else [])
+    if base.empty:
+        return pd.DataFrame(columns=output_columns)
+    active = [c for c in criteria if c.get("enabled", False)]
+    if not active:
+        out = base.copy()
+        out["reasons"] = "No criteria enabled"
+        return out
+
+    op_map = {
+        "lt": lambda s, v: s.lt(v), "le": lambda s, v: s.le(v),
+        "gt": lambda s, v: s.gt(v), "ge": lambda s, v: s.ge(v),
+    }
+    symbol_map = {"lt": "<", "le": "≤", "gt": ">", "ge": "≥"}
+    masks = []
+    for c in active:
+        masks.append(op_map[c["operator"]](base[c["column"]], float(c["value"])).fillna(False))
+    combined_mask = masks[0].copy()
+    for m in masks[1:]:
+        combined_mask = (combined_mask & m) if mode == "all" else (combined_mask | m)
+    out = base.loc[combined_mask].copy()
+
+    def row_reason(row) -> str:
+        matched = []
+        for c in active:
+            val = row.get(c["column"])
+            if pd.isna(val):
+                continue
+            passed = bool(op_map[c["operator"]](pd.Series([val]), float(c["value"])).iloc[0])
+            if passed:
+                decimals = int(c.get("decimals", 1))
+                unit = c.get("unit", "")
+                matched.append(
+                    f"{c.get('label', c['column'])} {symbol_map[c['operator']]} "
+                    f"{float(c['value']):.{decimals}f}{unit}"
+                )
+        return " | ".join(matched)
+    out["reasons"] = out.apply(row_reason, axis=1)
+    return out.reset_index(drop=True)
+
+
+def filter_hitter_underperformance_pathways(
+    base: pd.DataFrame,
+    use_bat_path: bool,
+    bat_require_ci: bool,
+    bat_ci_min: float,
+    bat_require_residual: bool,
+    bat_residual_max: float,
+    use_exit_path: bool,
+    exit_require_ci: bool,
+    exit_ci_min: float,
+    exit_require_residual: bool,
+    exit_residual_max: float,
+    pathway_mode: str = "any",
+) -> pd.DataFrame:
+    """Filter hitter underperformance using configurable bat and P80 pathways."""
+    if base.empty:
+        return base.assign(reasons=pd.Series(dtype=str))
+
+    pathways = []
+    pathway_reasons = []
+
+    if use_bat_path:
+        m = pd.Series(True, index=base.index)
+        parts = []
+        if bat_require_ci:
+            m &= base["monthly_avg_ci"].ge(float(bat_ci_min)).fillna(False)
+            parts.append(f"Monthly CI ≥ {bat_ci_min:.0f}")
+        if bat_require_residual:
+            m &= base["bat_speed_residual"].le(float(bat_residual_max)).fillna(False)
+            parts.append(f"Bat residual ≤ {bat_residual_max:.1f} mph")
+        pathways.append(m)
+        pathway_reasons.append((m, "Bat: " + " | ".join(parts) if parts else "Bat pathway"))
+
+    if use_exit_path:
+        m = pd.Series(True, index=base.index)
+        parts = []
+        if exit_require_ci:
+            m &= base["ytd_avg_ci"].ge(float(exit_ci_min)).fillna(False)
+            parts.append(f"YTD CI ≥ {exit_ci_min:.0f}")
+        if exit_require_residual:
+            m &= base["p80_exit_velo_residual"].le(float(exit_residual_max)).fillna(False)
+            parts.append(f"P80 residual ≤ {exit_residual_max:.1f} mph")
+        pathways.append(m)
+        pathway_reasons.append((m, "P80: " + " | ".join(parts) if parts else "P80 pathway"))
+
+    if not pathways:
+        out = base.copy()
+        out["reasons"] = "No pathways enabled"
+        return out
+
+    final = pathways[0].copy()
+    for m in pathways[1:]:
+        final = (final & m) if pathway_mode == "all" else (final | m)
+    out = base.loc[final].copy()
+
+    def reasons_for_index(index) -> str:
+        return " || ".join(reason for mask, reason in pathway_reasons if bool(mask.loc[index]))
+    out["reasons"] = [reasons_for_index(i) for i in out.index]
+    return out.reset_index(drop=True)
+
 # -----------------------------------------------------------------------------
 # APP
 # -----------------------------------------------------------------------------
@@ -4984,35 +5209,6 @@ with st.sidebar:
     )
     show_labels = st.checkbox("Show names")
 
-    st.markdown("---")
-    low_ci_threshold = st.number_input(
-        "S&C low CI threshold", min_value=0.0, step=1.0, value=300.0, format="%.1f"
-    )
-    low_pinch_threshold = st.number_input(
-        "S&C low pinch threshold", min_value=0.0, step=1.0, value=40.0, format="%.1f"
-    )
-    high_ci_threshold = st.number_input(
-        "S&C high CI threshold", min_value=0.0, step=1.0, value=330.0, format="%.1f"
-    )
-    projected_velo_threshold = st.number_input(
-        "S&C projected FB velo threshold",
-        min_value=0.0,
-        step=0.5,
-        value=94.0,
-        format="%.1f",
-    )
-    throwing_residual_threshold = st.number_input(
-        "Throwing-development residual threshold",
-        step=0.1,
-        value=-0.5,
-        format="%.1f",
-    )
-    hitter_residual_threshold = st.number_input(
-        "Hitter underperformance residual threshold",
-        step=0.1,
-        value=-1.0,
-        format="%.1f",
-    )
 
 
 summary = build_summary(
@@ -5039,18 +5235,6 @@ combined_summary = build_combined_overview_summary(
     pinch_summary,
 )
 combined_model = fit_combined_overview_model(combined_summary)
-sc_upside_table, sc_projection_gap_table, sc_throwing_table = build_sc_opportunity_tables(
-    combined_model,
-    low_ci_threshold=float(low_ci_threshold),
-    low_pinch_threshold=float(low_pinch_threshold),
-    projected_velo_threshold=float(projected_velo_threshold),
-    high_ci_threshold=float(high_ci_threshold),
-    throwing_residual_threshold=float(throwing_residual_threshold),
-)
-sc_projection_gap_93_table = build_projection_gap_table(
-    combined_model,
-    threshold=93.0,
-)
 
 bat_monthly_pairs = build_bat_monthly_pairs(
     jump=jump,
@@ -5075,12 +5259,6 @@ exit_velo_summary = build_exit_velo_summary(
     end_date=end_date,
     team_filter=team_filter,
     min_ci_jumps=int(min_ci_jumps),
-)
-hitter_sc_table, hitter_underperforming_ci_table = build_hitter_sc_opportunity_tables(
-    bat_pairs=bat_monthly_pairs,
-    exit_summary=exit_velo_summary,
-    low_ci_threshold=float(low_ci_threshold),
-    residual_threshold=float(hitter_residual_threshold),
 )
 period_text = f"{fmt_date(start_date)} – {fmt_date(end_date)}"
 title_col, filter_col = st.columns([4, 1])
@@ -6678,265 +6856,191 @@ with exit_velo_overview_tab:
 
 
 
+
 with sc_opportunity_tab:
     st.subheader("S&C Opportunity — Pitchers", anchor=False)
-    sc_counts = st.columns(5)
-    count_values = [
-        ("Combined-model pitchers", str(len(combined_model["data"])) if combined_model is not None else "0", BLUE),
-        ("S&C development flags", str(len(sc_upside_table)), TEAL),
-        (
-            f"Projected {float(projected_velo_threshold):.0f}+ / actual below",
-            str(len(sc_projection_gap_table)),
-            ACCENT_RED,
-        ),
-        (
-            "Projected 93+ / actual below",
-            str(len(sc_projection_gap_93_table)),
-            GREEN,
-        ),
-        ("Need better throwing", str(len(sc_throwing_table)), NAVY_MID),
-    ]
-    for column, values in zip(sc_counts, count_values):
-        with column:
-            st.markdown(metric_card(*values), unsafe_allow_html=True)
-
     if combined_model is None:
-        st.info("The combined overview model could not be fit, so the S&C opportunity tab is unavailable for the current filters.")
+        st.info(
+            "The combined overview model could not be fit, so the pitcher "
+            "opportunity tables are unavailable for the current filters."
+        )
     else:
+        st.markdown(
+            metric_card("Combined-model pitchers", str(len(combined_model["data"])), BLUE),
+            unsafe_allow_html=True,
+        )
+
         with st.container(border=True):
             st.subheader("S&C Development Flags", anchor=False)
+            toggle_cols = st.columns(3)
+            with toggle_cols[0]:
+                dev_use_ci = st.checkbox("Require low CI", value=True, key="dev_use_ci")
+                dev_ci_threshold = st.slider("Maximum CI", 220.0, 360.0, 300.0, 5.0, key="sc_dev_ci_slider")
+            with toggle_cols[1]:
+                dev_use_pinch = st.checkbox("Require low pinch", value=True, key="dev_use_pinch")
+                dev_pinch_threshold = st.slider("Maximum pinch strength", 20.0, 65.0, 40.0, 1.0, key="sc_dev_pinch_slider")
+            with toggle_cols[2]:
+                dev_use_projected = st.checkbox("Require low projected velo", value=True, key="dev_use_projected")
+                dev_projected_velo_threshold = st.slider("Maximum projected FB velo", 85.0, 100.0, 94.0, 0.5, key="sc_dev_projected_velo_slider")
+            extra_cols = st.columns(2)
+            with extra_cols[0]:
+                dev_use_actual = st.checkbox("Also require low actual velo", value=False, key="dev_use_actual")
+                dev_actual_max = st.slider("Maximum actual FB velo", 85.0, 100.0, 94.0, 0.5, key="dev_actual_max")
+            with extra_cols[1]:
+                dev_use_residual = st.checkbox("Also require negative residual", value=False, key="dev_use_residual")
+                dev_residual_max = st.slider("Maximum residual", -5.0, 2.0, -0.5, 0.1, key="dev_residual_max")
+            sc_upside_table = build_pitcher_custom_category(combined_model, [
+                {"enabled": dev_use_ci, "column": "avg_ci", "operator": "lt", "value": dev_ci_threshold, "label": "CI", "decimals": 0},
+                {"enabled": dev_use_pinch, "column": "avg_pinch_strength", "operator": "lt", "value": dev_pinch_threshold, "label": "Pinch", "decimals": 0},
+                {"enabled": dev_use_projected, "column": "predicted_fb_velo", "operator": "lt", "value": dev_projected_velo_threshold, "label": "Projected FB velo", "unit": " mph"},
+                {"enabled": dev_use_actual, "column": "avg_fb_velo", "operator": "lt", "value": dev_actual_max, "label": "Actual FB velo", "unit": " mph"},
+                {"enabled": dev_use_residual, "column": "residual_fb_velo", "operator": "le", "value": dev_residual_max, "label": "Residual", "unit": " mph"},
+            ])
+            st.caption(f"{len(sc_upside_table)} pitchers meet all enabled criteria.")
             if sc_upside_table.empty:
-                st.info("No pitchers met all three S&C development criteria.")
+                st.info("No pitchers met the enabled S&C development criteria.")
             else:
                 upside_display = sc_upside_table.copy()
-                upside_display.columns = [
-                    "Pitcher", "Team", "Actual Final YTD FB Velo", "Predicted FB Velo",
-                    "Residual", "Average CI", "Average Pinch", "Tested Hand", "YTD FB As Of",
-                    "CI Jumps", "Pinch Tests", "Reasons",
-                ]
+                upside_display.columns = ["Pitcher", "Team", "Actual Final YTD FB Velo", "Predicted FB Velo", "Residual", "Average CI", "Average Pinch", "Tested Hand", "YTD FB As Of", "CI Jumps", "Pinch Tests", "Reasons"]
                 upside_display["YTD FB As Of"] = upside_display["YTD FB As Of"].map(fmt_date)
-                st.dataframe(
-                    upside_display,
-                    hide_index=True,
-                    use_container_width=True,
-                    height=min(660, 44 + 36 * (len(upside_display) + 1)),
-                    column_config={
-                        "Actual Final YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                        "Predicted FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                        "Residual": st.column_config.NumberColumn(format="%+.2f mph"),
-                        "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
-                        "Average Pinch": st.column_config.NumberColumn(format="%.2f"),
-                    },
-                )
-                csv_download_button(
-                    upside_display,
-                    "Download S&C development flags CSV",
-                    "sc_development_flags.csv",
-                    "download_sc_upside_pitchers",
-                )
+                st.dataframe(upside_display, hide_index=True, use_container_width=True, height=min(660, 44 + 36 * (len(upside_display) + 1)), column_config={
+                    "Actual Final YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"), "Predicted FB Velo": st.column_config.NumberColumn(format="%.2f mph"), "Residual": st.column_config.NumberColumn(format="%+.2f mph"), "Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Average Pinch": st.column_config.NumberColumn(format="%.2f")})
+                csv_download_button(upside_display, "Download S&C development flags CSV", "sc_development_flags.csv", "download_sc_upside_pitchers")
 
-        with st.container(border=True):
-            st.subheader(
-                f"Projected {float(projected_velo_threshold):.0f}+ mph but Actual Below {float(projected_velo_threshold):.0f} mph",
-                anchor=False,
-            )
-            if sc_projection_gap_table.empty:
-                st.info(
-                    "No pitchers had projected velocity at or above the threshold "
-                    "while actual velocity remained below it."
-                )
-            else:
-                projection_gap_display = sc_projection_gap_table.copy()
-                projection_gap_display.columns = [
-                    "Pitcher", "Team", "Actual Final YTD FB Velo", "Predicted FB Velo",
-                    "Residual", "Average CI", "Average Pinch", "Tested Hand", "YTD FB As Of",
-                    "CI Jumps", "Pinch Tests", "Reasons",
-                ]
-                projection_gap_display["YTD FB As Of"] = (
-                    projection_gap_display["YTD FB As Of"].map(fmt_date)
-                )
-                st.dataframe(
-                    projection_gap_display,
-                    hide_index=True,
-                    use_container_width=True,
-                    height=min(660, 44 + 36 * (len(projection_gap_display) + 1)),
-                    column_config={
-                        "Actual Final YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                        "Predicted FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                        "Residual": st.column_config.NumberColumn(format="%+.2f mph"),
-                        "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
-                        "Average Pinch": st.column_config.NumberColumn(format="%.2f"),
-                    },
-                )
-                csv_download_button(
-                    projection_gap_display,
-                    "Download projected 94+ but actual below CSV",
-                    "projected_94_plus_actual_below_pitchers.csv",
-                    "download_sc_projection_gap_pitchers",
-                )
+        def render_projection_gap_section(title, prefix, default_cutoff):
+            with st.container(border=True):
+                st.subheader(title, anchor=False)
+                cols = st.columns(4)
+                with cols[0]:
+                    use_projected = st.checkbox("Require projected velo", value=True, key=f"{prefix}_use_projected")
+                    projected_min = st.slider("Minimum projected FB velo", 85.0, 100.0, float(default_cutoff), 0.5, key=f"{prefix}_projected_min")
+                with cols[1]:
+                    use_actual = st.checkbox("Require actual velo", value=True, key=f"{prefix}_use_actual")
+                    actual_max = st.slider("Maximum actual FB velo", 85.0, 100.0, float(default_cutoff), 0.5, key=f"{prefix}_actual_max")
+                with cols[2]:
+                    use_ci = st.checkbox("Also require low CI", value=False, key=f"{prefix}_use_ci")
+                    ci_max = st.slider("Maximum CI", 220.0, 380.0, 300.0, 5.0, key=f"{prefix}_ci_max")
+                with cols[3]:
+                    use_pinch = st.checkbox("Also require low pinch", value=False, key=f"{prefix}_use_pinch")
+                    pinch_max = st.slider("Maximum pinch", 20.0, 65.0, 40.0, 1.0, key=f"{prefix}_pinch_max")
+                table = build_pitcher_custom_category(combined_model, [
+                    {"enabled": use_projected, "column": "predicted_fb_velo", "operator": "ge", "value": projected_min, "label": "Projected FB velo", "unit": " mph"},
+                    {"enabled": use_actual, "column": "avg_fb_velo", "operator": "lt", "value": actual_max, "label": "Actual FB velo", "unit": " mph"},
+                    {"enabled": use_ci, "column": "avg_ci", "operator": "lt", "value": ci_max, "label": "CI", "decimals": 0},
+                    {"enabled": use_pinch, "column": "avg_pinch_strength", "operator": "lt", "value": pinch_max, "label": "Pinch", "decimals": 0},
+                ])
+                st.caption(f"{len(table)} pitchers meet all enabled criteria.")
+                if table.empty:
+                    st.info("No pitchers met the enabled criteria.")
+                else:
+                    display = table.copy()
+                    display.columns = ["Pitcher", "Team", "Actual Final YTD FB Velo", "Predicted FB Velo", "Residual", "Average CI", "Average Pinch", "Tested Hand", "YTD FB As Of", "CI Jumps", "Pinch Tests", "Reasons"]
+                    display["YTD FB As Of"] = display["YTD FB As Of"].map(fmt_date)
+                    st.dataframe(display, hide_index=True, use_container_width=True, height=min(660, 44 + 36 * (len(display) + 1)), column_config={
+                        "Actual Final YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"), "Predicted FB Velo": st.column_config.NumberColumn(format="%.2f mph"), "Residual": st.column_config.NumberColumn(format="%+.2f mph"), "Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Average Pinch": st.column_config.NumberColumn(format="%.2f")})
+                    csv_download_button(display, "Download projected-versus-actual CSV", f"{prefix}_pitchers.csv", f"download_{prefix}_pitchers")
 
-        with st.container(border=True):
-            st.subheader(
-                "Projected 93+ mph but Actual Below 93 mph",
-                anchor=False,
-            )
-            if sc_projection_gap_93_table.empty:
-                st.info(
-                    "No pitchers had projected velocity at or above 93 mph "
-                    "while actual velocity remained below 93 mph."
-                )
-            else:
-                projection_gap_93_display = sc_projection_gap_93_table.copy()
-                projection_gap_93_display.columns = [
-                    "Pitcher", "Team", "Actual Final YTD FB Velo", "Predicted FB Velo",
-                    "Residual", "Average CI", "Average Pinch", "Tested Hand", "YTD FB As Of",
-                    "CI Jumps", "Pinch Tests", "Reasons",
-                ]
-                projection_gap_93_display["YTD FB As Of"] = (
-                    projection_gap_93_display["YTD FB As Of"].map(fmt_date)
-                )
-                st.dataframe(
-                    projection_gap_93_display,
-                    hide_index=True,
-                    use_container_width=True,
-                    height=min(660, 44 + 36 * (len(projection_gap_93_display) + 1)),
-                    column_config={
-                        "Actual Final YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                        "Predicted FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                        "Residual": st.column_config.NumberColumn(format="%+.2f mph"),
-                        "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
-                        "Average Pinch": st.column_config.NumberColumn(format="%.2f"),
-                    },
-                )
-                csv_download_button(
-                    projection_gap_93_display,
-                    "Download projected 93+ but actual below CSV",
-                    "projected_93_plus_actual_below_pitchers.csv",
-                    "download_sc_projection_gap_93_pitchers",
-                )
-
+        render_projection_gap_section("Projected-Velo Opportunity — 94 mph Setup", "gap94", 94.0)
+        render_projection_gap_section("Projected-Velo Opportunity — 93 mph Setup", "gap93", 93.0)
 
         with st.container(border=True):
             st.subheader("They Need to Get Better at Throwing", anchor=False)
+            cols = st.columns(3)
+            with cols[0]:
+                throwing_use_ci = st.checkbox("Require high CI", value=True, key="throwing_use_ci")
+                throwing_ci_threshold = st.slider("Minimum CI", 250.0, 400.0, 330.0, 5.0, key="throwing_ci_slider")
+            with cols[1]:
+                throwing_use_residual = st.checkbox("Require negative residual", value=True, key="throwing_use_residual")
+                throwing_residual_threshold = st.slider("Maximum velocity residual", -5.0, 0.0, -0.5, 0.1, key="throwing_residual_slider")
+            with cols[2]:
+                throwing_use_pinch = st.checkbox("Also require minimum pinch", value=False, key="throwing_use_pinch")
+                throwing_pinch_threshold = st.slider("Minimum pinch strength", 20.0, 65.0, 40.0, 1.0, key="throwing_pinch_slider")
+            sc_throwing_table = build_pitcher_custom_category(combined_model, [
+                {"enabled": throwing_use_ci, "column": "avg_ci", "operator": "gt", "value": throwing_ci_threshold, "label": "CI", "decimals": 0},
+                {"enabled": throwing_use_residual, "column": "residual_fb_velo", "operator": "le", "value": throwing_residual_threshold, "label": "Residual", "unit": " mph"},
+                {"enabled": throwing_use_pinch, "column": "avg_pinch_strength", "operator": "ge", "value": throwing_pinch_threshold, "label": "Pinch", "decimals": 0},
+            ])
+            st.caption(f"{len(sc_throwing_table)} pitchers meet all enabled criteria.")
             if sc_throwing_table.empty:
-                st.info("No pitchers met the throwing-development criteria.")
+                st.info("No pitchers met the enabled throwing-development criteria.")
             else:
                 throwing_display = sc_throwing_table.copy()
-                throwing_display.columns = [
-                    "Pitcher", "Team", "Actual Final YTD FB Velo", "Predicted FB Velo",
-                    "Residual", "Average CI", "Average Pinch", "Tested Hand", "YTD FB As Of",
-                    "CI Jumps", "Pinch Tests", "Reasons",
-                ]
+                throwing_display.columns = ["Pitcher", "Team", "Actual Final YTD FB Velo", "Predicted FB Velo", "Residual", "Average CI", "Average Pinch", "Tested Hand", "YTD FB As Of", "CI Jumps", "Pinch Tests", "Reasons"]
                 throwing_display["YTD FB As Of"] = throwing_display["YTD FB As Of"].map(fmt_date)
-                st.dataframe(
-                    throwing_display,
-                    hide_index=True,
-                    use_container_width=True,
-                    height=min(660, 44 + 36 * (len(throwing_display) + 1)),
-                    column_config={
-                        "Actual Final YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                        "Predicted FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                        "Residual": st.column_config.NumberColumn(format="%+.2f mph"),
-                        "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
-                        "Average Pinch": st.column_config.NumberColumn(format="%.2f"),
-                    },
-                )
-                csv_download_button(
-                    throwing_display,
-                    "Download throwing-development CSV",
-                    "throwing_development_pitchers.csv",
-                    "download_throwing_development_pitchers",
-                )
+                st.dataframe(throwing_display, hide_index=True, use_container_width=True, height=min(660, 44 + 36 * (len(throwing_display) + 1)), column_config={
+                    "Actual Final YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"), "Predicted FB Velo": st.column_config.NumberColumn(format="%.2f mph"), "Residual": st.column_config.NumberColumn(format="%+.2f mph"), "Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Average Pinch": st.column_config.NumberColumn(format="%.2f")})
+                csv_download_button(throwing_display, "Download throwing-development CSV", "throwing_development_pitchers.csv", "download_throwing_development_pitchers")
 
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     st.subheader("S&C Opportunity — Hitters", anchor=False)
-    hitter_count_cols = st.columns(2)
-    for column, values in zip(hitter_count_cols, [
-        ("Hitters needing more S&C work", str(len(hitter_sc_table)), TEAL),
-        ("Hitters underperforming CI", str(len(hitter_underperforming_ci_table)), ACCENT_RED),
-    ]):
-        with column:
-            st.markdown(metric_card(*values), unsafe_allow_html=True)
+    hitter_base = build_hitter_opportunity_base(bat_monthly_pairs, exit_velo_summary)
 
     with st.container(border=True):
         st.subheader("Hitters Needing More S&C Work", anchor=False)
+        mode = st.radio("How should enabled criteria combine?", ["Any enabled criterion", "All enabled criteria"], horizontal=True, key="hitter_sc_mode")
+        cols = st.columns(4)
+        with cols[0]:
+            use_month_ci = st.checkbox("Use monthly CI", value=True, key="hsc_use_month_ci")
+            month_ci_max = st.slider("Maximum monthly CI", 220.0, 360.0, 300.0, 5.0, key="hsc_month_ci")
+        with cols[1]:
+            use_ytd_ci = st.checkbox("Use YTD CI", value=True, key="hsc_use_ytd_ci")
+            ytd_ci_max = st.slider("Maximum YTD CI", 220.0, 360.0, 300.0, 5.0, key="hsc_ytd_ci")
+        with cols[2]:
+            use_bat_speed = st.checkbox("Also use bat speed", value=False, key="hsc_use_bat")
+            bat_speed_max = st.slider("Maximum monthly bat speed", 55.0, 85.0, 70.0, 0.5, key="hsc_bat_max")
+        with cols[3]:
+            use_exit = st.checkbox("Also use P80 exit velo", value=False, key="hsc_use_exit")
+            exit_max = st.slider("Maximum P80 exit velo", 75.0, 110.0, 95.0, 0.5, key="hsc_exit_max")
+        hitter_sc_table = filter_hitter_custom_category(hitter_base, [
+            {"enabled": use_month_ci, "column": "monthly_avg_ci", "operator": "lt", "value": month_ci_max, "label": "Monthly CI", "decimals": 0},
+            {"enabled": use_ytd_ci, "column": "ytd_avg_ci", "operator": "lt", "value": ytd_ci_max, "label": "YTD CI", "decimals": 0},
+            {"enabled": use_bat_speed, "column": "monthly_avg_bat_speed", "operator": "lt", "value": bat_speed_max, "label": "Bat speed", "unit": " mph"},
+            {"enabled": use_exit, "column": "ytd_p80_exit_velo", "operator": "lt", "value": exit_max, "label": "P80 exit velo", "unit": " mph"},
+        ], mode="any" if mode.startswith("Any") else "all")
+        st.caption(f"{len(hitter_sc_table)} hitters meet the enabled criteria.")
         if hitter_sc_table.empty:
-            st.info("No hitters had matched CI below the current S&C low-CI threshold.")
+            st.info("No hitters met the enabled S&C-development criteria.")
         else:
             hitter_sc_display = hitter_sc_table.copy()
-            hitter_sc_display.columns = [
-                "Hitter", "Team", "Bat-Speed Month", "Monthly Average CI",
-                "Monthly Avg Bat Speed", "Projected Bat Speed", "Bat-Speed Residual",
-                "P80 Exit Velo As Of", "YTD Average CI", "Final YTD P80 Exit Velo",
-                "Projected P80 Exit Velo", "P80 Exit-Velo Residual", "Reasons",
-            ]
-            hitter_sc_display["Bat-Speed Month"] = pd.to_datetime(
-                hitter_sc_display["Bat-Speed Month"], errors="coerce"
-            ).dt.strftime("%b %Y")
-            hitter_sc_display["P80 Exit Velo As Of"] = hitter_sc_display[
-                "P80 Exit Velo As Of"
-            ].map(fmt_date)
-            st.dataframe(
-                hitter_sc_display,
-                hide_index=True,
-                use_container_width=True,
-                height=min(660, 44 + 36 * (len(hitter_sc_display) + 1)),
-                column_config={
-                    "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
-                    "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
-                    "Projected Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
-                    "Bat-Speed Residual": st.column_config.NumberColumn(format="%+.2f mph"),
-                    "YTD Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
-                    "Final YTD P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                    "Projected P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                    "P80 Exit-Velo Residual": st.column_config.NumberColumn(format="%+.2f mph"),
-                },
-            )
-            csv_download_button(
-                hitter_sc_display,
-                "Download hitter S&C development CSV",
-                "hitter_sc_development.csv",
-                "download_hitter_sc_development",
-            )
+            hitter_sc_display.columns = ["Hitter", "Team", "Bat-Speed Month", "Monthly Average CI", "Monthly Avg Bat Speed", "Projected Bat Speed", "Bat-Speed Residual", "P80 Exit Velo As Of", "YTD Average CI", "Final YTD P80 Exit Velo", "Projected P80 Exit Velo", "P80 Exit-Velo Residual", "Reasons"]
+            hitter_sc_display["Bat-Speed Month"] = pd.to_datetime(hitter_sc_display["Bat-Speed Month"], errors="coerce").dt.strftime("%b %Y")
+            hitter_sc_display["P80 Exit Velo As Of"] = hitter_sc_display["P80 Exit Velo As Of"].map(fmt_date)
+            st.dataframe(hitter_sc_display, hide_index=True, use_container_width=True, height=min(660, 44 + 36 * (len(hitter_sc_display) + 1)), column_config={
+                "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Projected Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Bat-Speed Residual": st.column_config.NumberColumn(format="%+.2f mph"), "YTD Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Final YTD P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "Projected P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "P80 Exit-Velo Residual": st.column_config.NumberColumn(format="%+.2f mph")})
+            csv_download_button(hitter_sc_display, "Download hitter S&C development CSV", "hitter_sc_development.csv", "download_hitter_sc_development")
 
     with st.container(border=True):
         st.subheader("Hitters Underperforming Their CI", anchor=False)
+        pathway_mode = st.radio("How should the bat-speed and P80 pathways combine?", ["Either pathway", "Both pathways"], horizontal=True, key="hitter_under_path_mode")
+        pathway_cols = st.columns(2)
+        with pathway_cols[0]:
+            st.markdown("**Bat-speed pathway**")
+            use_bat_path = st.checkbox("Enable bat-speed pathway", value=True, key="hu_use_bat_path")
+            bat_require_ci = st.checkbox("Require minimum monthly CI", value=True, key="hu_bat_require_ci")
+            bat_ci_min = st.slider("Minimum monthly CI", 220.0, 380.0, 300.0, 5.0, key="hu_bat_ci_min")
+            bat_require_residual = st.checkbox("Require negative bat-speed residual", value=True, key="hu_bat_require_resid")
+            bat_resid_max = st.slider("Maximum bat-speed residual", -5.0, 1.0, -1.0, 0.1, key="hu_bat_resid_max")
+        with pathway_cols[1]:
+            st.markdown("**P80 exit-velo pathway**")
+            use_exit_path = st.checkbox("Enable P80 pathway", value=True, key="hu_use_exit_path")
+            exit_require_ci = st.checkbox("Require minimum YTD CI", value=True, key="hu_exit_require_ci")
+            exit_ci_min = st.slider("Minimum YTD CI", 220.0, 380.0, 300.0, 5.0, key="hu_exit_ci_min")
+            exit_require_residual = st.checkbox("Require negative P80 residual", value=True, key="hu_exit_require_resid")
+            exit_resid_max = st.slider("Maximum P80 residual", -5.0, 1.0, -1.0, 0.1, key="hu_exit_resid_max")
+        hitter_underperforming_ci_table = filter_hitter_underperformance_pathways(
+            hitter_base, use_bat_path, bat_require_ci, bat_ci_min, bat_require_residual, bat_resid_max,
+            use_exit_path, exit_require_ci, exit_ci_min, exit_require_residual, exit_resid_max,
+            pathway_mode="any" if pathway_mode.startswith("Either") else "all",
+        )
+        st.caption(f"{len(hitter_underperforming_ci_table)} hitters meet the enabled underperformance pathways.")
         if hitter_underperforming_ci_table.empty:
-            st.info("No hitters met the current CI-underperformance criteria.")
+            st.info("No hitters met the enabled CI-underperformance criteria.")
         else:
             hitter_under_display = hitter_underperforming_ci_table.copy()
-            hitter_under_display.columns = [
-                "Hitter", "Team", "Bat-Speed Month", "Monthly Average CI",
-                "Monthly Avg Bat Speed", "Projected Bat Speed", "Bat-Speed Residual",
-                "P80 Exit Velo As Of", "YTD Average CI", "Final YTD P80 Exit Velo",
-                "Projected P80 Exit Velo", "P80 Exit-Velo Residual", "Reasons",
-            ]
-            hitter_under_display["Bat-Speed Month"] = pd.to_datetime(
-                hitter_under_display["Bat-Speed Month"], errors="coerce"
-            ).dt.strftime("%b %Y")
-            hitter_under_display["P80 Exit Velo As Of"] = hitter_under_display[
-                "P80 Exit Velo As Of"
-            ].map(fmt_date)
-            st.dataframe(
-                hitter_under_display,
-                hide_index=True,
-                use_container_width=True,
-                height=min(660, 44 + 36 * (len(hitter_under_display) + 1)),
-                column_config={
-                    "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
-                    "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
-                    "Projected Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
-                    "Bat-Speed Residual": st.column_config.NumberColumn(format="%+.2f mph"),
-                    "YTD Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
-                    "Final YTD P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                    "Projected P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                    "P80 Exit-Velo Residual": st.column_config.NumberColumn(format="%+.2f mph"),
-                },
-            )
-            csv_download_button(
-                hitter_under_display,
-                "Download hitters underperforming CI CSV",
-                "hitters_underperforming_ci.csv",
-                "download_hitters_underperforming_ci",
-            )
+            hitter_under_display.columns = ["Hitter", "Team", "Bat-Speed Month", "Monthly Average CI", "Monthly Avg Bat Speed", "Projected Bat Speed", "Bat-Speed Residual", "P80 Exit Velo As Of", "YTD Average CI", "Final YTD P80 Exit Velo", "Projected P80 Exit Velo", "P80 Exit-Velo Residual", "Reasons"]
+            hitter_under_display["Bat-Speed Month"] = pd.to_datetime(hitter_under_display["Bat-Speed Month"], errors="coerce").dt.strftime("%b %Y")
+            hitter_under_display["P80 Exit Velo As Of"] = hitter_under_display["P80 Exit Velo As Of"].map(fmt_date)
+            st.dataframe(hitter_under_display, hide_index=True, use_container_width=True, height=min(660, 44 + 36 * (len(hitter_under_display) + 1)), column_config={
+                "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Projected Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Bat-Speed Residual": st.column_config.NumberColumn(format="%+.2f mph"), "YTD Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Final YTD P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "Projected P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "P80 Exit-Velo Residual": st.column_config.NumberColumn(format="%+.2f mph")})
+            csv_download_button(hitter_under_display, "Download hitters underperforming CI CSV", "hitters_underperforming_ci.csv", "download_hitters_underperforming_ci")
 
