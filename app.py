@@ -4724,6 +4724,158 @@ def build_projection_gap_table(
     return gap[output_columns].reset_index(drop=True)
 
 
+def build_hitter_sc_opportunity_tables(
+    bat_pairs: pd.DataFrame,
+    exit_summary: pd.DataFrame,
+    low_ci_threshold: float,
+    residual_threshold: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build hitter S&C-development and CI-underperformance tables.
+
+    The S&C-development table flags hitters whose matched CI is below the
+    selected low-CI threshold in either the latest qualifying bat-speed month
+    or the YTD P80 exit-velocity observation.
+
+    The underperformance table flags hitters with CI at or above that threshold
+    whose actual bat speed or P80 exit velocity is at least the selected amount
+    below the value predicted by the corresponding CI-only regression.
+    """
+    output_columns = [
+        "athlete", "team", "month", "monthly_avg_ci", "monthly_avg_bat_speed",
+        "predicted_bat_speed", "bat_speed_residual", "exit_velo_as_of",
+        "ytd_avg_ci", "ytd_p80_exit_velo", "predicted_p80_exit_velo",
+        "p80_exit_velo_residual", "reasons",
+    ]
+
+    bat_stats = bat_correlation_stats(bat_pairs)
+    exit_stats = exit_velo_correlation_stats(exit_summary)
+
+    if bat_pairs.empty:
+        bat_work = pd.DataFrame(columns=[
+            "name_key", "bat_athlete", "bat_team", "month", "monthly_avg_ci",
+            "monthly_avg_bat_speed", "predicted_bat_speed", "bat_speed_residual",
+        ])
+    else:
+        bat_work = bat_pairs[[
+            "name_key", "athlete", "team", "month", "avg_ci",
+            "monthly_avg_bat_speed",
+        ]].copy().rename(columns={
+            "athlete": "bat_athlete",
+            "team": "bat_team",
+            "avg_ci": "monthly_avg_ci",
+        })
+        if bat_stats is not None:
+            bat_work["predicted_bat_speed"] = (
+                bat_stats[2] * bat_work["monthly_avg_ci"] + bat_stats[3]
+            )
+            bat_work["bat_speed_residual"] = (
+                bat_work["monthly_avg_bat_speed"] - bat_work["predicted_bat_speed"]
+            )
+        else:
+            bat_work["predicted_bat_speed"] = np.nan
+            bat_work["bat_speed_residual"] = np.nan
+
+    if exit_summary.empty:
+        exit_work = pd.DataFrame(columns=[
+            "name_key", "exit_athlete", "exit_team", "exit_velo_as_of",
+            "ytd_avg_ci", "ytd_p80_exit_velo", "predicted_p80_exit_velo",
+            "p80_exit_velo_residual",
+        ])
+    else:
+        exit_work = exit_summary[[
+            "name_key", "athlete", "team", "exit_velo_as_of", "avg_ci",
+            "ytd_p80_exit_velo",
+        ]].copy().rename(columns={
+            "athlete": "exit_athlete",
+            "team": "exit_team",
+            "avg_ci": "ytd_avg_ci",
+        })
+        if exit_stats is not None:
+            exit_work["predicted_p80_exit_velo"] = (
+                exit_stats[2] * exit_work["ytd_avg_ci"] + exit_stats[3]
+            )
+            exit_work["p80_exit_velo_residual"] = (
+                exit_work["ytd_p80_exit_velo"] - exit_work["predicted_p80_exit_velo"]
+            )
+        else:
+            exit_work["predicted_p80_exit_velo"] = np.nan
+            exit_work["p80_exit_velo_residual"] = np.nan
+
+    combined = bat_work.merge(exit_work, on="name_key", how="outer")
+    if combined.empty:
+        empty = pd.DataFrame(columns=output_columns)
+        return empty.copy(), empty.copy()
+
+    combined["athlete"] = combined.get("bat_athlete").combine_first(
+        combined.get("exit_athlete")
+    )
+    combined["team"] = combined.get("bat_team").combine_first(
+        combined.get("exit_team")
+    )
+
+    monthly_low = combined["monthly_avg_ci"].lt(float(low_ci_threshold)).fillna(False)
+    ytd_low = combined["ytd_avg_ci"].lt(float(low_ci_threshold)).fillna(False)
+    monthly_adequate = combined["monthly_avg_ci"].ge(float(low_ci_threshold)).fillna(False)
+    ytd_adequate = combined["ytd_avg_ci"].ge(float(low_ci_threshold)).fillna(False)
+    bat_under = combined["bat_speed_residual"].le(float(residual_threshold)).fillna(False)
+    exit_under = combined["p80_exit_velo_residual"].le(float(residual_threshold)).fillna(False)
+
+    sc_development = combined.loc[monthly_low | ytd_low].copy()
+    def _sc_reason(row) -> str:
+        reasons = []
+        if pd.notna(row.get("monthly_avg_ci")) and row["monthly_avg_ci"] < float(low_ci_threshold):
+            reasons.append(f"Monthly CI < {low_ci_threshold:.0f}")
+        if pd.notna(row.get("ytd_avg_ci")) and row["ytd_avg_ci"] < float(low_ci_threshold):
+            reasons.append(f"YTD CI < {low_ci_threshold:.0f}")
+        return " | ".join(reasons)
+    sc_development["reasons"] = sc_development.apply(_sc_reason, axis=1)
+
+    underperforming = combined.loc[
+        (monthly_adequate & bat_under) | (ytd_adequate & exit_under)
+    ].copy()
+    def _under_reason(row) -> str:
+        reasons = []
+        if (
+            pd.notna(row.get("monthly_avg_ci"))
+            and row["monthly_avg_ci"] >= float(low_ci_threshold)
+            and pd.notna(row.get("bat_speed_residual"))
+            and row["bat_speed_residual"] <= float(residual_threshold)
+        ):
+            reasons.append(f"Bat-speed residual <= {residual_threshold:.1f} mph")
+        if (
+            pd.notna(row.get("ytd_avg_ci"))
+            and row["ytd_avg_ci"] >= float(low_ci_threshold)
+            and pd.notna(row.get("p80_exit_velo_residual"))
+            and row["p80_exit_velo_residual"] <= float(residual_threshold)
+        ):
+            reasons.append(f"P80 exit-velo residual <= {residual_threshold:.1f} mph")
+        return " | ".join(reasons)
+    underperforming["reasons"] = underperforming.apply(_under_reason, axis=1)
+
+    sc_development = sc_development.sort_values(
+        ["monthly_avg_ci", "ytd_avg_ci"], ascending=[True, True], na_position="last"
+    )
+    underperforming["worst_residual"] = underperforming[[
+        "bat_speed_residual", "p80_exit_velo_residual"
+    ]].min(axis=1, skipna=True)
+    underperforming = underperforming.sort_values(
+        "worst_residual", ascending=True, na_position="last"
+    ).drop(columns=["worst_residual"])
+
+    for frame in (sc_development, underperforming):
+        if "month" in frame.columns:
+            frame["month"] = pd.to_datetime(frame["month"], errors="coerce")
+        if "exit_velo_as_of" in frame.columns:
+            frame["exit_velo_as_of"] = pd.to_datetime(
+                frame["exit_velo_as_of"], errors="coerce"
+            )
+
+    return (
+        sc_development[output_columns].reset_index(drop=True),
+        underperforming[output_columns].reset_index(drop=True),
+    )
+
+
 # -----------------------------------------------------------------------------
 # APP
 # -----------------------------------------------------------------------------
@@ -4855,6 +5007,12 @@ with st.sidebar:
         value=-0.5,
         format="%.1f",
     )
+    hitter_residual_threshold = st.number_input(
+        "Hitter underperformance residual threshold",
+        step=0.1,
+        value=-1.0,
+        format="%.1f",
+    )
 
 
 summary = build_summary(
@@ -4917,6 +5075,12 @@ exit_velo_summary = build_exit_velo_summary(
     end_date=end_date,
     team_filter=team_filter,
     min_ci_jumps=int(min_ci_jumps),
+)
+hitter_sc_table, hitter_underperforming_ci_table = build_hitter_sc_opportunity_tables(
+    bat_pairs=bat_monthly_pairs,
+    exit_summary=exit_velo_summary,
+    low_ci_threshold=float(low_ci_threshold),
+    residual_threshold=float(hitter_residual_threshold),
 )
 period_text = f"{fmt_date(start_date)} – {fmt_date(end_date)}"
 title_col, filter_col = st.columns([4, 1])
@@ -6683,3 +6847,96 @@ with sc_opportunity_tab:
                     "throwing_development_pitchers.csv",
                     "download_throwing_development_pitchers",
                 )
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    st.subheader("S&C Opportunity — Hitters", anchor=False)
+    hitter_count_cols = st.columns(2)
+    for column, values in zip(hitter_count_cols, [
+        ("Hitters needing more S&C work", str(len(hitter_sc_table)), TEAL),
+        ("Hitters underperforming CI", str(len(hitter_underperforming_ci_table)), ACCENT_RED),
+    ]):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    with st.container(border=True):
+        st.subheader("Hitters Needing More S&C Work", anchor=False)
+        if hitter_sc_table.empty:
+            st.info("No hitters had matched CI below the current S&C low-CI threshold.")
+        else:
+            hitter_sc_display = hitter_sc_table.copy()
+            hitter_sc_display.columns = [
+                "Hitter", "Team", "Bat-Speed Month", "Monthly Average CI",
+                "Monthly Avg Bat Speed", "Projected Bat Speed", "Bat-Speed Residual",
+                "P80 Exit Velo As Of", "YTD Average CI", "Final YTD P80 Exit Velo",
+                "Projected P80 Exit Velo", "P80 Exit-Velo Residual", "Reasons",
+            ]
+            hitter_sc_display["Bat-Speed Month"] = pd.to_datetime(
+                hitter_sc_display["Bat-Speed Month"], errors="coerce"
+            ).dt.strftime("%b %Y")
+            hitter_sc_display["P80 Exit Velo As Of"] = hitter_sc_display[
+                "P80 Exit Velo As Of"
+            ].map(fmt_date)
+            st.dataframe(
+                hitter_sc_display,
+                hide_index=True,
+                use_container_width=True,
+                height=min(660, 44 + 36 * (len(hitter_sc_display) + 1)),
+                column_config={
+                    "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                    "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
+                    "Projected Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
+                    "Bat-Speed Residual": st.column_config.NumberColumn(format="%+.2f mph"),
+                    "YTD Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                    "Final YTD P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                    "Projected P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                    "P80 Exit-Velo Residual": st.column_config.NumberColumn(format="%+.2f mph"),
+                },
+            )
+            csv_download_button(
+                hitter_sc_display,
+                "Download hitter S&C development CSV",
+                "hitter_sc_development.csv",
+                "download_hitter_sc_development",
+            )
+
+    with st.container(border=True):
+        st.subheader("Hitters Underperforming Their CI", anchor=False)
+        if hitter_underperforming_ci_table.empty:
+            st.info("No hitters met the current CI-underperformance criteria.")
+        else:
+            hitter_under_display = hitter_underperforming_ci_table.copy()
+            hitter_under_display.columns = [
+                "Hitter", "Team", "Bat-Speed Month", "Monthly Average CI",
+                "Monthly Avg Bat Speed", "Projected Bat Speed", "Bat-Speed Residual",
+                "P80 Exit Velo As Of", "YTD Average CI", "Final YTD P80 Exit Velo",
+                "Projected P80 Exit Velo", "P80 Exit-Velo Residual", "Reasons",
+            ]
+            hitter_under_display["Bat-Speed Month"] = pd.to_datetime(
+                hitter_under_display["Bat-Speed Month"], errors="coerce"
+            ).dt.strftime("%b %Y")
+            hitter_under_display["P80 Exit Velo As Of"] = hitter_under_display[
+                "P80 Exit Velo As Of"
+            ].map(fmt_date)
+            st.dataframe(
+                hitter_under_display,
+                hide_index=True,
+                use_container_width=True,
+                height=min(660, 44 + 36 * (len(hitter_under_display) + 1)),
+                column_config={
+                    "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                    "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
+                    "Projected Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
+                    "Bat-Speed Residual": st.column_config.NumberColumn(format="%+.2f mph"),
+                    "YTD Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                    "Final YTD P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                    "Projected P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                    "P80 Exit-Velo Residual": st.column_config.NumberColumn(format="%+.2f mph"),
+                },
+            )
+            csv_download_button(
+                hitter_under_display,
+                "Download hitters underperforming CI CSV",
+                "hitters_underperforming_ci.csv",
+                "download_hitters_underperforming_ci",
+            )
+
