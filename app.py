@@ -3083,6 +3083,116 @@ def sprint_correlation_stats(
     return r, r * r, float(slope), float(intercept)
 
 
+def build_sprint_residual_summary(pairs: pd.DataFrame) -> pd.DataFrame:
+    """Add predicted sprint speed and residuals from relative peak power."""
+    columns = list(pairs.columns) + [
+        "predicted_sprint_speed",
+        "sprint_speed_residual",
+        "abs_sprint_speed_residual",
+    ]
+    if pairs.empty:
+        return pd.DataFrame(columns=columns)
+
+    stats = sprint_correlation_stats(pairs)
+    if stats is None:
+        return pd.DataFrame(columns=columns)
+
+    _, _, slope, intercept = stats
+    work = pairs.dropna(
+        subset=["avg_peak_power_rel", "monthly_max_sprint_speed"]
+    ).copy()
+    work["predicted_sprint_speed"] = (
+        slope * work["avg_peak_power_rel"] + intercept
+    )
+    work["sprint_speed_residual"] = (
+        work["monthly_max_sprint_speed"] - work["predicted_sprint_speed"]
+    )
+    work["abs_sprint_speed_residual"] = work[
+        "sprint_speed_residual"
+    ].abs()
+    return work.sort_values(
+        "sprint_speed_residual", ascending=True
+    ).reset_index(drop=True)
+
+
+def build_sprint_residual_chart(pairs: pd.DataFrame) -> go.Figure:
+    residuals = build_sprint_residual_summary(pairs)
+    fig = go.Figure()
+    if residuals.empty:
+        fig.add_annotation(
+            text="Sprint-speed residuals could not be calculated.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 480)
+
+    residuals = residuals.sort_values(
+        "sprint_speed_residual", ascending=True
+    ).copy()
+    colors = [
+        TEAL if value >= 0 else ACCENT_RED
+        for value in residuals["sprint_speed_residual"]
+    ]
+    customdata = np.column_stack([
+        residuals["team"],
+        residuals["month_label"],
+        residuals["avg_peak_power_rel"],
+        residuals["monthly_max_sprint_speed"],
+        residuals["predicted_sprint_speed"],
+    ])
+    fig.add_trace(go.Bar(
+        x=residuals["sprint_speed_residual"],
+        y=residuals["athlete"],
+        orientation="h",
+        marker={"color": colors},
+        text=[f"{value:+.2f}" for value in residuals["sprint_speed_residual"]],
+        textposition="outside",
+        cliponaxis=False,
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Team: %{customdata[0]}<br>"
+            "Month: %{customdata[1]}<br>"
+            "Relative peak power: %{customdata[2]:.2f} W/kg<br>"
+            "Actual sprint speed: %{customdata[3]:.2f} ft/s<br>"
+            "Predicted sprint speed: %{customdata[4]:.2f} ft/s<br>"
+            "Residual: %{x:+.2f} ft/s<extra></extra>"
+        ),
+    ))
+    fig.add_vline(
+        x=0,
+        line_color=NAVY_MID,
+        line_width=1.5,
+        line_dash="dash",
+    )
+    max_abs = float(residuals["sprint_speed_residual"].abs().max())
+    pad = max(0.15, max_abs * 0.18)
+    fig.update_xaxes(
+        title="Sprint speed residual: actual − predicted (ft/s)",
+        range=[-max_abs - pad, max_abs + pad],
+        showgrid=True,
+        gridcolor=GRID,
+        zeroline=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="",
+        showgrid=False,
+        linecolor=BORDER,
+        tickfont={"color": SUBTEXT},
+    )
+    height = max(460, min(1200, 160 + 28 * len(residuals)))
+    return base_figure_layout(fig, height)
+
+
 def sprint_power_band_summary(
     pairs: pd.DataFrame,
     band_width: float,
@@ -6864,6 +6974,102 @@ with sprint_overview_tab:
                 f"{show_labels}_{power_lookup}"
             ),
         )
+
+    sprint_residuals = build_sprint_residual_summary(
+        sprint_overview_summary
+    )
+    with st.container(border=True):
+        st.subheader("Relative Peak Power → Sprint Speed Residuals", anchor=False)
+        if sprint_residuals.empty:
+            st.info("Residuals could not be calculated for the current filters.")
+        else:
+            sprint_residual_mae = float(
+                sprint_residuals["abs_sprint_speed_residual"].mean()
+            )
+            sprint_residual_rmse = float(np.sqrt(np.mean(
+                sprint_residuals["sprint_speed_residual"] ** 2
+            )))
+            sprint_positive = int(
+                (sprint_residuals["sprint_speed_residual"] > 0).sum()
+            )
+            sprint_negative = int(
+                (sprint_residuals["sprint_speed_residual"] < 0).sum()
+            )
+
+            residual_metric_cols = st.columns(4)
+            residual_metric_values = [
+                ("Mean Absolute Residual", f"{sprint_residual_mae:.2f} ft/s", TEAL),
+                ("Residual RMSE", f"{sprint_residual_rmse:.2f} ft/s", NAVY_MID),
+                ("Faster Than Predicted", str(sprint_positive), GREEN),
+                ("Slower Than Predicted", str(sprint_negative), ACCENT_RED),
+            ]
+            for column, values in zip(
+                residual_metric_cols, residual_metric_values
+            ):
+                with column:
+                    st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+            st.plotly_chart(
+                build_sprint_residual_chart(sprint_overview_summary),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=(
+                    f"sprint_residual_chart_{team_filter}_{start_date}_{end_date}_"
+                    f"{min_power_jumps}"
+                ),
+            )
+
+            sprint_residual_display = sprint_residuals[[
+                "athlete",
+                "team",
+                "month",
+                "avg_peak_power_rel",
+                "monthly_max_sprint_speed",
+                "predicted_sprint_speed",
+                "sprint_speed_residual",
+                "abs_sprint_speed_residual",
+            ]].copy()
+            sprint_residual_display.columns = [
+                "Player",
+                "Team",
+                "Month",
+                "Final-Month Avg Peak Power / BM",
+                "Actual Monthly Max Sprint Speed",
+                "Predicted Sprint Speed",
+                "Residual",
+                "Absolute Residual",
+            ]
+            sprint_residual_display["Month"] = (
+                pd.to_datetime(sprint_residual_display["Month"])
+                .dt.strftime("%b %Y")
+            )
+            st.dataframe(
+                sprint_residual_display,
+                hide_index=True,
+                use_container_width=True,
+                height=min(
+                    660,
+                    44 + 36 * (len(sprint_residual_display) + 1),
+                ),
+                column_config={
+                    "Final-Month Avg Peak Power / BM":
+                        st.column_config.NumberColumn(format="%.2f W/kg"),
+                    "Actual Monthly Max Sprint Speed":
+                        st.column_config.NumberColumn(format="%.2f ft/s"),
+                    "Predicted Sprint Speed":
+                        st.column_config.NumberColumn(format="%.2f ft/s"),
+                    "Residual":
+                        st.column_config.NumberColumn(format="%+.2f ft/s"),
+                    "Absolute Residual":
+                        st.column_config.NumberColumn(format="%.2f ft/s"),
+                },
+            )
+            csv_download_button(
+                sprint_residual_display,
+                "Download sprint residuals CSV",
+                "relative_peak_power_sprint_speed_residuals.csv",
+                "download_sprint_residuals",
+            )
 
     with st.container(border=True):
         st.subheader("Player Results", anchor=False)
