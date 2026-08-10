@@ -35,6 +35,7 @@ Exit velocity:
 from __future__ import annotations
 
 import html
+import hmac
 import os
 import re
 import unicodedata
@@ -5602,8 +5603,69 @@ def build_power_pitch_scatter(
     return base_figure_layout(fig, 560)
 
 # -----------------------------------------------------------------------------
+# PASSWORD AUTHENTICATION
+# -----------------------------------------------------------------------------
+def require_password() -> None:
+    """Block the dashboard until the correct Streamlit secret is entered."""
+    try:
+        configured_password = st.secrets.get("APP_PASSWORD")
+    except Exception:
+        configured_password = None
+
+    # Optional local fallback: APP_PASSWORD environment variable.
+    if not configured_password:
+        configured_password = os.environ.get("APP_PASSWORD")
+
+    # Fail closed: never expose the app if the password was not configured.
+    if not configured_password:
+        st.error(
+            "APP_PASSWORD is not configured. Add APP_PASSWORD to this app's "
+            "Streamlit Secrets before using the dashboard."
+        )
+        st.stop()
+
+    if st.session_state.get("password_correct", False):
+        return
+
+    def _check_password() -> None:
+        entered_password = str(st.session_state.get("app_password_input", ""))
+        if hmac.compare_digest(entered_password, str(configured_password)):
+            st.session_state["password_correct"] = True
+            st.session_state.pop("app_password_input", None)
+        else:
+            st.session_state["password_correct"] = False
+
+    st.markdown(
+        "<div style='max-width:520px;margin:10vh auto 0;'>",
+        unsafe_allow_html=True,
+    )
+    st.title("Performance × CI")
+    st.write("Enter the app password to continue.")
+    with st.form("app_password_form", clear_on_submit=False):
+        st.text_input(
+            "Password",
+            type="password",
+            key="app_password_input",
+        )
+        submitted = st.form_submit_button("Log in", use_container_width=True, type="primary")
+
+    if submitted:
+        _check_password()
+        if st.session_state.get("password_correct", False):
+            st.rerun()
+
+    if st.session_state.get("password_correct") is False:
+        st.error("Incorrect password.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.stop()
+
+
+# -----------------------------------------------------------------------------
 # APP
 # -----------------------------------------------------------------------------
+require_password()
+
 with st.sidebar:
     st.markdown("<div style='height:4px;width:42px;border-radius:999px;background:#C8102E;margin:2px 0 16px;'></div>", unsafe_allow_html=True)
     st.markdown("<h2 style='color:#FFFFFF;margin:0 0 18px;font-size:27px;letter-spacing:-.03em;'>Performance × CI</h2>", unsafe_allow_html=True)
@@ -7913,4 +7975,3 @@ with sc_opportunity_tab:
             st.dataframe(hitter_under_display, hide_index=True, use_container_width=True, height=min(660, 44 + 36 * (len(hitter_under_display) + 1)), column_config={
                 "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Projected Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Bat-Speed Residual": st.column_config.NumberColumn(format="%+.2f mph"), "YTD Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Final YTD P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "Projected P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "P80 Exit-Velo Residual": st.column_config.NumberColumn(format="%+.2f mph")})
             csv_download_button(hitter_under_display, "Download hitters underperforming CI CSV", "hitters_underperforming_ci.csv", "download_hitters_underperforming_ci")
-
