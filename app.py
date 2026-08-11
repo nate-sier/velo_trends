@@ -1,36 +1,7 @@
 """
 Performance × CI — Streamlit deployment-ready dashboard.
 
-Pitching:
-  * Last in-window ytd_fb_velo matched to mean in-window raw CI.
-  * Pitchers below 85 mph are excluded.
 
-Pinch grip:
-  * Pinch Grip tab uses Name, Date, Pinch - R, and Pinch - L.
-  * Each row contributes the one populated hand as that athlete's pinch value.
-  * Overview mirrors CI: mean in-window pinch matched to last in-window ytd_fb_velo.
-
-Combined model:
-  * One cross-sectional row per pitcher, matching average in-window CI and
-    average in-window pinch strength to the final in-window ytd_fb_velo.
-  * Multiple linear regression estimates the partial association of CI and
-    pinch strength with fastball velocity.
-
-Sprinting:
-  * One final eligible-month monthly_max_sprint_speed observation per player from PP_Sprint.
-  * A sprint month is eligible only when it contains at least 14 distinct valid PP_Sprint data dates.
-  * Mean Peak Power / BM [W/kg] from Jump Data in the same calendar month.
-  * Cross-sectional monthly analysis.
-
-Hitting:
-  * One final eligible-month monthly_avg_bat_speed observation per hitter.
-  * Mean raw CI from Jump Data in that same calendar month.
-  * Only the latest qualifying matched month is retained, giving one observation per hitter.
-
-Exit velocity:
-  * Current `p90 EV` from the Nats Hitting tab.
-  * Mean raw CI from January 1 through the selected dashboard end date.
-  * Exactly one observation per hitter.
 """
 from __future__ import annotations
 
