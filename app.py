@@ -28,8 +28,8 @@ Hitting:
   * Only the latest qualifying matched month is retained, giving one observation per hitter.
 
 Exit velocity:
-  * Final in-window ytd_p80_exit_velo from PP_Sprint.
-  * Mean raw CI from January 1 through that exit-velocity as-of date.
+  * Current `p90 EV` from the Nats Hitting tab.
+  * Mean raw CI from January 1 through the selected dashboard end date.
   * Exactly one observation per hitter.
 """
 from __future__ import annotations
@@ -56,6 +56,7 @@ DEFAULT_SHEET_ID = "1CF2n3fAt8jALZK6HIC80Un20ITScfSMZd4kXM4ZPMSo"
 DEFAULT_JUMP_TAB = "Jump Data"
 DEFAULT_VELO_TAB = "FB Velo"
 DEFAULT_BAT_TAB = "PP_Sprint"
+DEFAULT_EXIT_TAB = "Nats Hitting"
 DEFAULT_PINCH_TAB = "Pinch Grip"
 LOCAL_SERVICE_ACCOUNT_FILE = Path.home() / "Desktop" / "service_account.json"
 MIN_LAST_YTD_FB_VELO = 85.0
@@ -378,6 +379,7 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
     jump_tab = secret_or_default("JUMP_TAB", DEFAULT_JUMP_TAB)
     velo_tab = secret_or_default("VELO_TAB", DEFAULT_VELO_TAB)
     bat_tab = secret_or_default("BAT_TAB", DEFAULT_BAT_TAB)
+    exit_tab = secret_or_default("EXIT_TAB", DEFAULT_EXIT_TAB)
     pinch_tab = secret_or_default("PINCH_TAB", DEFAULT_PINCH_TAB)
 
     creds = get_credentials()
@@ -385,6 +387,7 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
     jump_raw = read_tab(client, sheet_id, jump_tab)
     velo_raw = read_tab(client, sheet_id, velo_tab)
     bat_raw = read_tab(client, sheet_id, bat_tab)
+    exit_raw = read_tab(client, sheet_id, exit_tab)
     pinch_raw = read_tab(client, sheet_id, pinch_tab)
 
     if jump_raw.empty:
@@ -393,6 +396,8 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         raise ValueError(f"The '{velo_tab}' tab did not return any rows.")
     if bat_raw.empty:
         raise ValueError(f"The '{bat_tab}' tab did not return any rows.")
+    if exit_raw.empty:
+        raise ValueError(f"The '{exit_tab}' tab did not return any rows.")
     if pinch_raw.empty:
         raise ValueError(f"The '{pinch_tab}' tab did not return any rows.")
 
@@ -624,14 +629,6 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
             "Monthly Maximum Sprint Speed",
         ],
     )
-    exit_velo_col = first_existing(
-        bat_raw.columns.tolist(),
-        [
-            "ytd_p80_exit_velo", "YTD P80 Exit Velo",
-            "YTD_P80_Exit_Velo", "ytd p80 exit velo",
-            "YTD 80th Percentile Exit Velo",
-        ],
-    )
     bat_team_col = first_existing(
         bat_raw.columns.tolist(),
         ["Team", "team", "Level", "level"],
@@ -654,11 +651,7 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
             "PP_Sprint is missing monthly_max_sprint_speed, which is required "
             "for the Sprint Speed Overview tab."
         )
-    if exit_velo_col is None:
-        raise ValueError(
-            "PP_Sprint is missing ytd_p80_exit_velo, which is required "
-            "for the P80 Exit Velo Overview tab."
-        )
+
 
     bat = pd.DataFrame({
         "hitter": bat_raw[bat_name_col].astype(str).str.strip(),
@@ -689,27 +682,73 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         .reset_index(drop=True)
     )
 
-    # YTD 80th-percentile exit velocity. Retain the valid source rows so the
-    # selected date window can determine each hitter's final YTD value.
+    # P90 exit velocity from the dedicated Nats Hitting tab. The supplied
+    # structure has one current row per hitter and no game date. Match by name;
+    # current Jump Data team assignment remains the source of truth downstream.
+    exit_raw.columns = exit_raw.columns.astype(str).str.strip()
+    exit_name_col = first_existing(
+        exit_raw.columns.tolist(),
+        [
+            "name", "Name", "hitter", "Hitter", "batter", "Batter",
+            "athlete", "Athlete", "player", "Player",
+        ],
+    )
+    exit_p90_col = first_existing(
+        exit_raw.columns.tolist(),
+        [
+            "p90 EV", "P90 EV", "p90_ev", "P90 Exit Velo",
+            "P90 Exit Velocity", "p90 exit velo", "p90 exit velocity",
+        ],
+    )
+    exit_level_col = first_existing(
+        exit_raw.columns.tolist(),
+        [
+            "levelofplay_lk", "LevelOfPlay_Lk", "Level of Play",
+            "Level", "level", "Team", "team",
+        ],
+    )
+
+    missing_exit = [
+        label for label, col in {
+            "hitter name": exit_name_col,
+            "p90 EV": exit_p90_col,
+        }.items() if col is None
+    ]
+    if missing_exit:
+        raise ValueError(
+            f"Nats Hitting is missing required column(s): {', '.join(missing_exit)}. "
+            "Expected at least 'name' and 'p90 EV'."
+        )
+
+    level_to_team = {
+        "MLB": "Washington",
+        "AAA": "Rochester",
+        "AA": "Harrisburg",
+        "A+": "Wilmington",
+        "A": "Fredericksburg",
+        "FCL": "FCL",
+        "DSL": "DSL",
+        "REHAB": "REHAB",
+    }
     exit_velo = pd.DataFrame({
-        "hitter": bat_raw[bat_name_col].astype(str).str.strip(),
-        "date": parse_sheet_dates(bat_raw[bat_date_col]),
-        "ytd_p80_exit_velo": pd.to_numeric(
-            bat_raw[exit_velo_col], errors="coerce"
-        ),
+        "hitter": exit_raw[exit_name_col].astype(str).str.strip(),
+        "p90_exit_velo": pd.to_numeric(exit_raw[exit_p90_col], errors="coerce"),
         "team_raw": (
-            bat_raw[bat_team_col].astype(str).str.strip()
-            if bat_team_col else ""
+            exit_raw[exit_level_col].astype(str).str.strip()
+            if exit_level_col else ""
         ),
     })
-    exit_velo["team"] = exit_velo["team_raw"].map(normalize_team)
+    exit_velo["team"] = exit_velo["team_raw"].map(
+        lambda value: level_to_team.get(str(value).strip().upper())
+    )
     exit_velo["name_key"] = exit_velo["hitter"].map(canonical_name)
     exit_velo = exit_velo[
         (exit_velo["hitter"] != "") & (exit_velo["name_key"] != "")
-    ].dropna(subset=["date", "ytd_p80_exit_velo"])
+    ].dropna(subset=["p90_exit_velo"])
     exit_velo = (
         exit_velo.drop(columns=["team_raw"])
-        .sort_values(["name_key", "date"], kind="stable")
+        .drop_duplicates("name_key", keep="last")
+        .sort_values("hitter", kind="stable")
         .reset_index(drop=True)
     )
 
@@ -742,7 +781,7 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         f"Loaded {len(jump):,} CI rows, {len(jump_power):,} relative-power rows, "
         f"{len(velo):,} FB Velo rows, {len(pinch):,} Pinch Grip rows, "
         f"{len(sprint):,} valid sprint-speed rows, {len(bat):,} hitter-month "
-        f"bat-speed rows, and {len(exit_velo):,} valid P80 exit-velocity rows · "
+        f"bat-speed rows, and {len(exit_velo):,} valid P90 exit-velocity rows from Nats Hitting · "
         f"{datetime.now().strftime('%I:%M %p').lstrip('0')}"
     )
     return jump, jump_power, velo, bat, pinch, sprint, exit_velo, status
@@ -2468,7 +2507,7 @@ def build_bat_within_timeline(player_pairs: pd.DataFrame) -> go.Figure:
 
 
 # -----------------------------------------------------------------------------
-# YTD P80 EXIT VELOCITY × YEAR-TO-DATE CI
+# P90 EXIT VELOCITY × YEAR-TO-DATE CI
 # -----------------------------------------------------------------------------
 def build_exit_velo_summary(
     jump: pd.DataFrame,
@@ -2478,46 +2517,35 @@ def build_exit_velo_summary(
     team_filter: str,
     min_ci_jumps: int,
 ) -> pd.DataFrame:
-    """Create one final YTD P80 exit-velocity observation per hitter.
+    """Create one P90 exit-velocity observation per hitter.
 
-    The selected dashboard window determines each hitter's final eligible
-    ytd_p80_exit_velo record. CI is then averaged from January 1 of that
-    record's calendar year through the record's as-of date. This preserves
-    one cross-sectional observation per hitter and avoids using CI tests that
-    occurred after the outcome value.
+    Nats Hitting supplies one current ``p90 EV`` value per hitter and no
+    observation date. To preserve the prior year-to-date CI comparison without
+    inventing a P90 measurement date, CI is averaged from January 1 through
+    the selected dashboard end date.
     """
-    start = pd.Timestamp(start_date).normalize()
     end = pd.Timestamp(end_date).normalize()
+    year = int(end.year)
 
-    exit_window = exit_velo[
-        (exit_velo["date"] >= start) & (exit_velo["date"] <= end)
-    ].copy()
-    if exit_window.empty:
-        return pd.DataFrame(columns=[
-            "name_key", "athlete", "team", "year",
-            "ytd_p80_exit_velo", "exit_velo_as_of", "exit_velo_records",
-            "avg_ci", "ci_jumps", "ci_test_dates",
-            "first_ci_date", "last_ci_date", "observation",
-        ])
+    columns = [
+        "name_key", "athlete", "team", "year",
+        "p90_exit_velo", "exit_velo_as_of", "exit_velo_records",
+        "avg_ci", "ci_jumps", "ci_test_dates",
+        "first_ci_date", "last_ci_date", "observation",
+    ]
+    if exit_velo.empty:
+        return pd.DataFrame(columns=columns)
 
-    exit_window = exit_window.sort_values(
-        ["name_key", "date"], kind="stable"
-    )
-    exit_counts = (
-        exit_window.groupby("name_key", as_index=False)
-        .agg(exit_velo_records=("ytd_p80_exit_velo", "count"))
-    )
-    latest_exit = (
-        exit_window.groupby("name_key", as_index=False)
-        .tail(1)[[
-            "name_key", "hitter", "team", "date", "ytd_p80_exit_velo",
-        ]]
-        .rename(columns={"date": "exit_velo_as_of"})
-        .merge(exit_counts, on="name_key", how="left")
-    )
-    latest_exit["year"] = latest_exit["exit_velo_as_of"].dt.year
+    current_exit = exit_velo[[
+        "name_key", "hitter", "team", "p90_exit_velo",
+    ]].dropna(subset=["p90_exit_velo"]).copy()
+    current_exit = current_exit.drop_duplicates("name_key", keep="last")
+    current_exit["year"] = year
+    # Retain the existing downstream date field, but it now means CI through
+    # this selected date; it is not a fabricated P90 measurement date.
+    current_exit["exit_velo_as_of"] = end
+    current_exit["exit_velo_records"] = 1
 
-    # Use the current Jump Data team assignment, matching the other overview tabs.
     team_lookup = (
         jump.sort_values("date")
         .groupby("name_key", as_index=False)
@@ -2526,19 +2554,11 @@ def build_exit_velo_summary(
         .rename(columns={"team": "current_team"})
     )
 
-    jump_year = jump.copy()
-    jump_year["year"] = jump_year["date"].dt.year
-    ci_candidates = jump_year.merge(
-        latest_exit[["name_key", "year", "exit_velo_as_of"]],
-        on=["name_key", "year"],
-        how="inner",
-    )
-    ci_candidates = ci_candidates[
-        ci_candidates["date"] <= ci_candidates["exit_velo_as_of"]
+    ci_candidates = jump[
+        (jump["date"].dt.year == year) & (jump["date"] <= end)
     ].copy()
-
     ci_summary = (
-        ci_candidates.groupby(["name_key", "year"], as_index=False)
+        ci_candidates.groupby("name_key", as_index=False)
         .agg(
             athlete=("athlete", "first"),
             avg_ci=("ci", "mean"),
@@ -2549,9 +2569,7 @@ def build_exit_velo_summary(
         )
     )
 
-    summary = latest_exit.merge(
-        ci_summary, on=["name_key", "year"], how="inner"
-    )
+    summary = current_exit.merge(ci_summary, on="name_key", how="inner")
     summary = summary.merge(team_lookup, on="name_key", how="left")
     summary["team"] = summary["current_team"].combine_first(summary["team"])
     summary = summary.drop(columns=["current_team"])
@@ -2567,7 +2585,7 @@ def build_exit_velo_summary(
         summary["athlete"] + " · " + summary["year"].astype(str)
     )
     return summary.sort_values(
-        "ytd_p80_exit_velo", ascending=False
+        "p90_exit_velo", ascending=False
     ).reset_index(drop=True)
 
 
@@ -2577,7 +2595,7 @@ def exit_velo_correlation_stats(
     if len(summary) < 2:
         return None
     x = summary["avg_ci"].to_numpy(dtype=float)
-    y = summary["ytd_p80_exit_velo"].to_numpy(dtype=float)
+    y = summary["p90_exit_velo"].to_numpy(dtype=float)
     if np.isclose(np.std(x), 0) or np.isclose(np.std(y), 0):
         return None
     slope, intercept = np.polyfit(x, y, 1)
@@ -2591,7 +2609,7 @@ def exit_velo_ci_band_summary(
     exit_stat: str = "Mean",
 ) -> pd.DataFrame:
     stat = "Median" if str(exit_stat).strip().lower() == "median" else "Mean"
-    velo_col = f"{stat} Final YTD P80 Exit Velo"
+    velo_col = f"{stat} P90 Exit Velo"
     if summary.empty:
         return pd.DataFrame(columns=[
             "CI band", velo_col, "Hitters", "Average CI",
@@ -2599,14 +2617,14 @@ def exit_velo_ci_band_summary(
 
     width = max(1, int(band_width))
     work = summary[[
-        "name_key", "avg_ci", "ytd_p80_exit_velo",
+        "name_key", "avg_ci", "p90_exit_velo",
     ]].dropna().copy()
     work["band_start"] = np.floor(work["avg_ci"] / width) * width
     grouped = (
         work.groupby("band_start", as_index=False)
         .agg(**{
             velo_col: (
-                "ytd_p80_exit_velo",
+                "p90_exit_velo",
                 "median" if stat == "Median" else "mean",
             ),
             "Hitters": ("name_key", "nunique"),
@@ -2652,7 +2670,7 @@ def build_exit_velo_scatter(
     ])
     fig.add_trace(go.Scatter(
         x=summary["avg_ci"],
-        y=summary["ytd_p80_exit_velo"],
+        y=summary["p90_exit_velo"],
         mode="markers+text" if show_labels else "markers",
         text=summary["athlete"] if show_labels else None,
         textposition="top center",
@@ -2666,10 +2684,10 @@ def build_exit_velo_scatter(
             "<b>%{customdata[0]}</b><br>"
             "Team: %{customdata[1]}<br>"
             "Calendar year: %{customdata[2]}<br>"
-            "Final YTD P80 exit velo: %{y:.2f} mph<br>"
+            "P90 exit velo: %{y:.2f} mph<br>"
             "YTD average CI: %{x:.2f} N·s<br><br>"
-            "Exit-velo records in selected window: %{customdata[3]}<br>"
-            "Exit velo as of %{customdata[4]}<br>"
+            "P90 source rows: %{customdata[3]}<br>"
+            "CI through %{customdata[4]}<br>"
             "CI jumps: %{customdata[5]} across %{customdata[6]} dates · "
             "%{customdata[7]}–%{customdata[8]}<extra></extra>"
         ),
@@ -2714,7 +2732,7 @@ def build_exit_velo_scatter(
                 hovertemplate=(
                     "<b>CI lookup</b><br>"
                     "YTD average CI: %{x:.1f} N·s<br>"
-                    "Estimated final YTD P80 exit velo: %{y:.2f} mph"
+                    "Estimated P90 exit velo: %{y:.2f} mph"
                     "<extra></extra>"
                 ),
             ))
@@ -2726,7 +2744,7 @@ def build_exit_velo_scatter(
         title_font={"color": SUBTEXT},
     )
     fig.update_yaxes(
-        title="Final YTD P80 exit velocity (mph)",
+        title="P90 exit velocity (mph)",
         showgrid=True, gridcolor=GRID, zeroline=False,
         linecolor=BORDER, tickfont={"color": SUBTEXT},
         title_font={"color": SUBTEXT},
@@ -2740,7 +2758,7 @@ def build_exit_velo_band_chart(
     exit_stat: str = "Mean",
 ) -> go.Figure:
     stat = "Median" if str(exit_stat).strip().lower() == "median" else "Mean"
-    velo_col = f"{stat} Final YTD P80 Exit Velo"
+    velo_col = f"{stat} P90 Exit Velo"
     bands = exit_velo_ci_band_summary(summary, band_width, stat)
     fig = go.Figure()
     if bands.empty:
@@ -2764,7 +2782,7 @@ def build_exit_velo_band_chart(
             bands["Hitters"], bands["Average CI"],
         ]),
         hovertemplate=(
-            f"<b>%{{x}}</b><br>{stat} final YTD P80 exit velo: "
+            f"<b>%{{x}}</b><br>{stat} P90 exit velo: "
             "%{y:.2f} mph<br>Hitters: %{customdata[0]}<br>"
             "Mean CI within band: %{customdata[1]:.2f} N·s"
             "<extra></extra>"
@@ -2778,7 +2796,7 @@ def build_exit_velo_band_chart(
         title_font={"color": SUBTEXT},
     )
     fig.update_yaxes(
-        title=f"{stat} final YTD P80 exit velocity (mph)",
+        title=f"{stat} P90 exit velocity (mph)",
         range=[y_min, y_max], showgrid=True, gridcolor=GRID,
         zeroline=False, linecolor=BORDER,
         tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
@@ -2795,7 +2813,7 @@ def exit_velo_ci_band_members(
     stat = "Median" if str(exit_stat).strip().lower() == "median" else "Mean"
     width = max(1, int(band_width))
     cols = [
-        "athlete", "team", "year", "avg_ci", "ytd_p80_exit_velo",
+        "athlete", "team", "year", "avg_ci", "p90_exit_velo",
         "exit_velo_as_of",
     ]
     if summary.empty or any(col not in summary.columns for col in cols):
@@ -2806,7 +2824,7 @@ def exit_velo_ci_band_members(
         )
 
     detail = summary[cols].dropna(
-        subset=["avg_ci", "ytd_p80_exit_velo"]
+        subset=["avg_ci", "p90_exit_velo"]
     ).copy()
     detail["band_start"] = np.floor(detail["avg_ci"] / width) * width
     detail["CI band"] = detail["band_start"].map(
@@ -2817,11 +2835,11 @@ def exit_velo_ci_band_members(
         return detail, np.nan, stat
 
     reference = (
-        float(detail["ytd_p80_exit_velo"].median())
+        float(detail["p90_exit_velo"].median())
         if stat == "Median"
-        else float(detail["ytd_p80_exit_velo"].mean())
+        else float(detail["p90_exit_velo"].mean())
     )
-    detail["Difference"] = detail["ytd_p80_exit_velo"] - reference
+    detail["Difference"] = detail["p90_exit_velo"] - reference
     detail["Status"] = np.where(
         np.isclose(detail["Difference"], 0, atol=1e-10),
         f"At {stat.lower()}",
@@ -2837,7 +2855,7 @@ def exit_velo_ci_band_members(
     )
     return (
         detail.sort_values(
-            "ytd_p80_exit_velo", ascending=False
+            "p90_exit_velo", ascending=False
         ).reset_index(drop=True),
         reference,
         stat,
@@ -2881,12 +2899,12 @@ def build_exit_velo_ci_band_member_chart(
             sub["exit_velo_as_of"].map(fmt_date),
         ])
         fig.add_trace(go.Bar(
-            x=sub["ytd_p80_exit_velo"],
+            x=sub["p90_exit_velo"],
             y=sub["Display"],
             orientation="h",
             name=status.title(),
             marker={"color": color, "line": {"color": "#FFFFFF", "width": 1}},
-            text=[f"{value:.2f}" for value in sub["ytd_p80_exit_velo"]],
+            text=[f"{value:.2f}" for value in sub["p90_exit_velo"]],
             textposition="outside", cliponaxis=False,
             customdata=customdata,
             hovertemplate=(
@@ -2894,15 +2912,15 @@ def build_exit_velo_ci_band_member_chart(
                 "Team: %{customdata[1]}<br>"
                 "Calendar year: %{customdata[2]}<br>"
                 "YTD average CI: %{customdata[3]:.2f} N·s<br>"
-                "Final YTD P80 exit velo: %{x:.2f} mph<br>"
-                "Exit velo as of %{customdata[6]}<br>"
+                "P90 exit velo: %{x:.2f} mph<br>"
+                "CI through %{customdata[6]}<br>"
                 f"{stat} difference: %{{customdata[4]:+.2f}} mph<br>"
                 "Flag: %{customdata[5]}<extra></extra>"
             ),
         ))
 
-    x_min = max(0, float(detail["ytd_p80_exit_velo"].min()) - 2.0)
-    x_max = float(detail["ytd_p80_exit_velo"].max()) + 1.5
+    x_min = max(0, float(detail["p90_exit_velo"].min()) - 2.0)
+    x_max = float(detail["p90_exit_velo"].max()) + 1.5
     fig.add_vline(
         x=reference, line_color=NAVY_MID, line_width=2,
         line_dash="dash", annotation_text=f"{stat} {reference:.2f}",
@@ -2910,7 +2928,7 @@ def build_exit_velo_ci_band_member_chart(
         annotation_position="top right",
     )
     fig.update_xaxes(
-        title="Final YTD P80 exit velocity (mph)",
+        title="P90 exit velocity (mph)",
         range=[x_min, x_max], showgrid=True, gridcolor=GRID,
         zeroline=False, linecolor=BORDER,
         tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
@@ -4863,17 +4881,17 @@ def build_hitter_sc_opportunity_tables(
 
     The S&C-development table flags hitters whose matched CI is below the
     selected low-CI threshold in either the latest qualifying bat-speed month
-    or the YTD P80 exit-velocity observation.
+    or the P90 exit-velocity observation.
 
     The underperformance table flags hitters with CI at or above that threshold
-    whose actual bat speed or P80 exit velocity is at least the selected amount
+    whose actual bat speed or P90 exit velocity is at least the selected amount
     below the value predicted by the corresponding CI-only regression.
     """
     output_columns = [
         "athlete", "team", "month", "monthly_avg_ci", "monthly_avg_bat_speed",
         "predicted_bat_speed", "bat_speed_residual", "exit_velo_as_of",
-        "ytd_avg_ci", "ytd_p80_exit_velo", "predicted_p80_exit_velo",
-        "p80_exit_velo_residual", "reasons",
+        "ytd_avg_ci", "p90_exit_velo", "predicted_p90_exit_velo",
+        "p90_exit_velo_residual", "reasons",
     ]
 
     bat_stats = bat_correlation_stats(bat_pairs)
@@ -4907,28 +4925,28 @@ def build_hitter_sc_opportunity_tables(
     if exit_summary.empty:
         exit_work = pd.DataFrame(columns=[
             "name_key", "exit_athlete", "exit_team", "exit_velo_as_of",
-            "ytd_avg_ci", "ytd_p80_exit_velo", "predicted_p80_exit_velo",
-            "p80_exit_velo_residual",
+            "ytd_avg_ci", "p90_exit_velo", "predicted_p90_exit_velo",
+            "p90_exit_velo_residual",
         ])
     else:
         exit_work = exit_summary[[
             "name_key", "athlete", "team", "exit_velo_as_of", "avg_ci",
-            "ytd_p80_exit_velo",
+            "p90_exit_velo",
         ]].copy().rename(columns={
             "athlete": "exit_athlete",
             "team": "exit_team",
             "avg_ci": "ytd_avg_ci",
         })
         if exit_stats is not None:
-            exit_work["predicted_p80_exit_velo"] = (
+            exit_work["predicted_p90_exit_velo"] = (
                 exit_stats[2] * exit_work["ytd_avg_ci"] + exit_stats[3]
             )
-            exit_work["p80_exit_velo_residual"] = (
-                exit_work["ytd_p80_exit_velo"] - exit_work["predicted_p80_exit_velo"]
+            exit_work["p90_exit_velo_residual"] = (
+                exit_work["p90_exit_velo"] - exit_work["predicted_p90_exit_velo"]
             )
         else:
-            exit_work["predicted_p80_exit_velo"] = np.nan
-            exit_work["p80_exit_velo_residual"] = np.nan
+            exit_work["predicted_p90_exit_velo"] = np.nan
+            exit_work["p90_exit_velo_residual"] = np.nan
 
     combined = bat_work.merge(exit_work, on="name_key", how="outer")
     if combined.empty:
@@ -4947,7 +4965,7 @@ def build_hitter_sc_opportunity_tables(
     monthly_adequate = combined["monthly_avg_ci"].ge(float(low_ci_threshold)).fillna(False)
     ytd_adequate = combined["ytd_avg_ci"].ge(float(low_ci_threshold)).fillna(False)
     bat_under = combined["bat_speed_residual"].le(float(residual_threshold)).fillna(False)
-    exit_under = combined["p80_exit_velo_residual"].le(float(residual_threshold)).fillna(False)
+    exit_under = combined["p90_exit_velo_residual"].le(float(residual_threshold)).fillna(False)
 
     sc_development = combined.loc[monthly_low | ytd_low].copy()
     def _sc_reason(row) -> str:
@@ -4974,10 +4992,10 @@ def build_hitter_sc_opportunity_tables(
         if (
             pd.notna(row.get("ytd_avg_ci"))
             and row["ytd_avg_ci"] >= float(low_ci_threshold)
-            and pd.notna(row.get("p80_exit_velo_residual"))
-            and row["p80_exit_velo_residual"] <= float(residual_threshold)
+            and pd.notna(row.get("p90_exit_velo_residual"))
+            and row["p90_exit_velo_residual"] <= float(residual_threshold)
         ):
-            reasons.append(f"P80 exit-velo residual <= {residual_threshold:.1f} mph")
+            reasons.append(f"P90 exit-velo residual <= {residual_threshold:.1f} mph")
         return " | ".join(reasons)
     underperforming["reasons"] = underperforming.apply(_under_reason, axis=1)
 
@@ -4985,7 +5003,7 @@ def build_hitter_sc_opportunity_tables(
         ["monthly_avg_ci", "ytd_avg_ci"], ascending=[True, True], na_position="last"
     )
     underperforming["worst_residual"] = underperforming[[
-        "bat_speed_residual", "p80_exit_velo_residual"
+        "bat_speed_residual", "p90_exit_velo_residual"
     ]].min(axis=1, skipna=True)
     underperforming = underperforming.sort_values(
         "worst_residual", ascending=True, na_position="last"
@@ -5064,8 +5082,8 @@ def build_hitter_opportunity_base(
     output_columns = [
         "athlete", "team", "month", "monthly_avg_ci", "monthly_avg_bat_speed",
         "predicted_bat_speed", "bat_speed_residual", "exit_velo_as_of",
-        "ytd_avg_ci", "ytd_p80_exit_velo", "predicted_p80_exit_velo",
-        "p80_exit_velo_residual",
+        "ytd_avg_ci", "p90_exit_velo", "predicted_p90_exit_velo",
+        "p90_exit_velo_residual",
     ]
     bat_stats = bat_correlation_stats(bat_pairs)
     exit_stats = exit_velo_correlation_stats(exit_summary)
@@ -5091,20 +5109,20 @@ def build_hitter_opportunity_base(
     if exit_summary.empty:
         exit_work = pd.DataFrame(columns=[
             "name_key", "exit_athlete", "exit_team", "exit_velo_as_of", "ytd_avg_ci",
-            "ytd_p80_exit_velo", "predicted_p80_exit_velo", "p80_exit_velo_residual",
+            "p90_exit_velo", "predicted_p90_exit_velo", "p90_exit_velo_residual",
         ])
     else:
         exit_work = exit_summary[[
-            "name_key", "athlete", "team", "exit_velo_as_of", "avg_ci", "ytd_p80_exit_velo",
+            "name_key", "athlete", "team", "exit_velo_as_of", "avg_ci", "p90_exit_velo",
         ]].copy().rename(columns={
             "athlete": "exit_athlete", "team": "exit_team", "avg_ci": "ytd_avg_ci",
         })
         if exit_stats is not None:
-            exit_work["predicted_p80_exit_velo"] = exit_stats[2] * exit_work["ytd_avg_ci"] + exit_stats[3]
-            exit_work["p80_exit_velo_residual"] = exit_work["ytd_p80_exit_velo"] - exit_work["predicted_p80_exit_velo"]
+            exit_work["predicted_p90_exit_velo"] = exit_stats[2] * exit_work["ytd_avg_ci"] + exit_stats[3]
+            exit_work["p90_exit_velo_residual"] = exit_work["p90_exit_velo"] - exit_work["predicted_p90_exit_velo"]
         else:
-            exit_work["predicted_p80_exit_velo"] = np.nan
-            exit_work["p80_exit_velo_residual"] = np.nan
+            exit_work["predicted_p90_exit_velo"] = np.nan
+            exit_work["p90_exit_velo_residual"] = np.nan
 
     combined = bat_work.merge(exit_work, on="name_key", how="outer")
     if combined.empty:
@@ -5178,7 +5196,7 @@ def filter_hitter_underperformance_pathways(
     exit_residual_max: float,
     pathway_mode: str = "any",
 ) -> pd.DataFrame:
-    """Filter hitter underperformance using configurable bat and P80 pathways."""
+    """Filter hitter underperformance using configurable bat and P90 pathways."""
     if base.empty:
         return base.assign(reasons=pd.Series(dtype=str))
 
@@ -5204,10 +5222,10 @@ def filter_hitter_underperformance_pathways(
             m &= base["ytd_avg_ci"].ge(float(exit_ci_min)).fillna(False)
             parts.append(f"YTD CI ≥ {exit_ci_min:.0f}")
         if exit_require_residual:
-            m &= base["p80_exit_velo_residual"].le(float(exit_residual_max)).fillna(False)
-            parts.append(f"P80 residual ≤ {exit_residual_max:.1f} mph")
+            m &= base["p90_exit_velo_residual"].le(float(exit_residual_max)).fillna(False)
+            parts.append(f"P90 residual ≤ {exit_residual_max:.1f} mph")
         pathways.append(m)
-        pathway_reasons.append((m, "P80: " + " | ".join(parts) if parts else "P80 pathway"))
+        pathway_reasons.append((m, "P90: " + " | ".join(parts) if parts else "P90 pathway"))
 
     if not pathways:
         out = base.copy()
@@ -5682,7 +5700,7 @@ except Exception as exc:
 
 all_dates = pd.concat([
     jump["date"], jump_power["date"], velo["date"], bat["month"],
-    pinch["date"], sprint["date"], exit_velo["date"],
+    pinch["date"], sprint["date"],
 ], ignore_index=True).dropna()
 min_date = all_dates.min().date()
 max_date = all_dates.max().date()
@@ -5740,10 +5758,10 @@ with st.sidebar:
         key="ci_band_bat_speed_stat",
     )
     ci_band_exit_stat = st.selectbox(
-        "CI band P80 exit velo",
+        "CI band P90 exit velo",
         ["Mean", "Median"],
         index=0,
-        key="ci_band_p80_exit_velo_stat",
+        key="ci_band_p90_exit_velo_stat",
     )
     power_lookup = st.number_input(
         "Peak Power / BM lookup",
@@ -5874,7 +5892,7 @@ st.markdown(f"<div style='color:#667085;font-size:13px;margin:3px 0 20px;'>{html
     "Combined CI + Pinch Overview",
     "Sprint Speed Overview",
     "Bat Speed Overview",
-    "P80 Exit Velo Overview",
+    "P90 Exit Velo Overview",
     "S&C Opportunity",
 ])
 
@@ -7508,7 +7526,7 @@ with exit_velo_overview_tab:
     exit_stats = exit_velo_correlation_stats(exit_velo_summary)
     n_exit_hitters = len(exit_velo_summary)
     mean_exit_velo = (
-        exit_velo_summary["ytd_p80_exit_velo"].mean()
+        exit_velo_summary["p90_exit_velo"].mean()
         if n_exit_hitters else np.nan
     )
     mean_yearly_ci = (
@@ -7542,7 +7560,7 @@ with exit_velo_overview_tab:
     bottom_cols = st.columns(3)
     for column, values in zip(bottom_cols, [
         (
-            "Final YTD P80 Exit Velo",
+            "P90 Exit Velo",
             f"{fmt(mean_exit_velo)} mph",
             TEAL,
         ),
@@ -7579,7 +7597,7 @@ with exit_velo_overview_tab:
             )
         with lookup_right:
             st.markdown(
-                "<div class='metric-label'>Estimated Final YTD P80 Exit Velo</div>",
+                "<div class='metric-label'>Estimated P90 Exit Velo</div>",
                 unsafe_allow_html=True,
             )
             lookup_value = (
@@ -7594,7 +7612,7 @@ with exit_velo_overview_tab:
 
     with st.container(border=True):
         st.subheader(
-            f"{ci_band_exit_stat} Final YTD P80 Exit Velo by CI Band",
+            f"{ci_band_exit_stat} P90 Exit Velo by CI Band",
             anchor=False,
         )
         st.plotly_chart(
@@ -7613,19 +7631,19 @@ with exit_velo_overview_tab:
 
 
     with st.container(border=True):
-        st.subheader("Average CI by P80 Exit Velo Bucket", anchor=False)
+        st.subheader("Average CI by P90 Exit Velo Bucket", anchor=False)
         st.plotly_chart(
             build_output_bucket_chart(
                 df=exit_velo_summary,
-                output_col="ytd_p80_exit_velo",
+                output_col="p90_exit_velo",
                 testing_col="avg_ci",
                 bucket_width=EXIT_VELO_OUTPUT_BUCKET_WIDTH,
-                output_bucket_label="P80 exit velo bucket",
+                output_bucket_label="P90 exit velo bucket",
                 testing_metric_label="CI",
-                output_axis_title="Final YTD P80 exit velo bucket",
+                output_axis_title="P90 exit velo bucket",
                 testing_axis_title="Average CI (N·s)",
                 output_unit="mph",
-                empty_text="No matched hitters are available for P80 exit-velo buckets.",
+                empty_text="No matched hitters are available for P90 exit-velo buckets.",
                 color=TEAL,
             ),
             use_container_width=True,
@@ -7636,39 +7654,39 @@ with exit_velo_overview_tab:
 
     exit_output_bands = output_bucket_summary(
         exit_velo_summary,
-        "ytd_p80_exit_velo",
+        "p90_exit_velo",
         "avg_ci",
         EXIT_VELO_OUTPUT_BUCKET_WIDTH,
-        "P80 exit velo bucket",
+        "P90 exit velo bucket",
         "CI",
         "mph",
         "N·s",
     )
     if not exit_output_bands.empty:
-        exit_output_options = exit_output_bands["P80 exit velo bucket"].tolist()
+        exit_output_options = exit_output_bands["P90 exit velo bucket"].tolist()
         exit_output_key = "exit_output_bucket_detail_selector"
         if st.session_state.get(exit_output_key) not in exit_output_options:
             st.session_state[exit_output_key] = exit_output_options[0]
         with st.container(border=True):
-            st.subheader("P80 Exit Velo Bucket Hitters", anchor=False)
+            st.subheader("P90 Exit Velo Bucket Hitters", anchor=False)
             selected_exit_output_bucket = st.selectbox(
-                "P80 exit velo bucket",
+                "P90 exit velo bucket",
                 exit_output_options,
                 key=exit_output_key,
             )
             st.plotly_chart(
                 build_output_bucket_member_chart(
                     df=exit_velo_summary,
-                    output_col="ytd_p80_exit_velo",
+                    output_col="p90_exit_velo",
                     testing_col="avg_ci",
                     bucket_width=EXIT_VELO_OUTPUT_BUCKET_WIDTH,
                     selected_bucket=selected_exit_output_bucket,
-                    output_bucket_label="P80 exit velo bucket",
+                    output_bucket_label="P90 exit velo bucket",
                     output_unit="mph",
                     testing_axis_title="Year-to-date average CI",
                     testing_unit="N·s",
                     entity_label="Hitter",
-                    output_value_label="Final YTD P80 exit velo",
+                    output_value_label="P90 exit velo",
                 ),
                 use_container_width=True,
                 config={"displayModeBar": False},
@@ -7711,7 +7729,7 @@ with exit_velo_overview_tab:
 
     with st.container(border=True):
         st.subheader(
-            "Year-to-Date Average CI vs Final YTD P80 Exit Velo",
+            "Year-to-Date Average CI vs P90 Exit Velo",
             anchor=False,
         )
         st.plotly_chart(
@@ -7737,7 +7755,7 @@ with exit_velo_overview_tab:
                 "athlete",
                 "team",
                 "year",
-                "ytd_p80_exit_velo",
+                "p90_exit_velo",
                 "exit_velo_as_of",
                 "exit_velo_records",
                 "avg_ci",
@@ -7750,8 +7768,8 @@ with exit_velo_overview_tab:
                 "Hitter",
                 "Team",
                 "Year",
-                "Final YTD P80 Exit Velo",
-                "Exit Velo As Of",
+                "P90 Exit Velo",
+                "CI Through",
                 "Exit Velo Records",
                 "Year-to-Date Average CI",
                 "CI Jumps",
@@ -7759,10 +7777,10 @@ with exit_velo_overview_tab:
                 "First CI",
                 "Last CI",
             ]
-            for date_col in ["Exit Velo As Of", "First CI", "Last CI"]:
+            for date_col in ["CI Through", "First CI", "Last CI"]:
                 exit_display[date_col] = exit_display[date_col].map(fmt_date)
-            exit_display["Final YTD P80 Exit Velo"] = (
-                exit_display["Final YTD P80 Exit Velo"].round(2)
+            exit_display["P90 Exit Velo"] = (
+                exit_display["P90 Exit Velo"].round(2)
             )
             exit_display["Year-to-Date Average CI"] = (
                 exit_display["Year-to-Date Average CI"].round(2)
@@ -7773,7 +7791,7 @@ with exit_velo_overview_tab:
                 use_container_width=True,
                 height=min(660, 44 + 36 * (len(exit_display) + 1)),
                 column_config={
-                    "Final YTD P80 Exit Velo":
+                    "P90 Exit Velo":
                         st.column_config.NumberColumn(format="%.2f mph"),
                     "Year-to-Date Average CI":
                         st.column_config.NumberColumn(format="%.2f N·s"),
@@ -7781,9 +7799,9 @@ with exit_velo_overview_tab:
             )
             csv_download_button(
                 exit_display,
-                "Download P80 exit-velo results CSV",
-                "p80_exit_velo_results.csv",
-                "download_p80_exit_velo_results",
+                "Download P90 exit-velo results CSV",
+                "p90_exit_velo_results.csv",
+                "download_p90_exit_velo_results",
             )
 
 
@@ -7921,29 +7939,29 @@ with sc_opportunity_tab:
             use_bat_speed = st.checkbox("Also use bat speed", value=False, key="hsc_use_bat")
             bat_speed_max = st.slider("Maximum monthly bat speed", 55.0, 85.0, 70.0, 0.5, key="hsc_bat_max")
         with cols[3]:
-            use_exit = st.checkbox("Also use P80 exit velo", value=False, key="hsc_use_exit")
-            exit_max = st.slider("Maximum P80 exit velo", 75.0, 110.0, 95.0, 0.5, key="hsc_exit_max")
+            use_exit = st.checkbox("Also use P90 exit velo", value=False, key="hsc_use_exit")
+            exit_max = st.slider("Maximum P90 exit velo", 75.0, 110.0, 95.0, 0.5, key="hsc_exit_max")
         hitter_sc_table = filter_hitter_custom_category(hitter_base, [
             {"enabled": use_month_ci, "column": "monthly_avg_ci", "operator": "lt", "value": month_ci_max, "label": "Monthly CI", "decimals": 0},
             {"enabled": use_ytd_ci, "column": "ytd_avg_ci", "operator": "lt", "value": ytd_ci_max, "label": "YTD CI", "decimals": 0},
             {"enabled": use_bat_speed, "column": "monthly_avg_bat_speed", "operator": "lt", "value": bat_speed_max, "label": "Bat speed", "unit": " mph"},
-            {"enabled": use_exit, "column": "ytd_p80_exit_velo", "operator": "lt", "value": exit_max, "label": "P80 exit velo", "unit": " mph"},
+            {"enabled": use_exit, "column": "p90_exit_velo", "operator": "lt", "value": exit_max, "label": "P90 exit velo", "unit": " mph"},
         ], mode="any" if mode.startswith("Any") else "all")
         st.caption(f"{len(hitter_sc_table)} hitters meet the enabled criteria.")
         if hitter_sc_table.empty:
             st.info("No hitters met the enabled S&C-development criteria.")
         else:
             hitter_sc_display = hitter_sc_table.copy()
-            hitter_sc_display.columns = ["Hitter", "Team", "Bat-Speed Month", "Monthly Average CI", "Monthly Avg Bat Speed", "Projected Bat Speed", "Bat-Speed Residual", "P80 Exit Velo As Of", "YTD Average CI", "Final YTD P80 Exit Velo", "Projected P80 Exit Velo", "P80 Exit-Velo Residual", "Reasons"]
+            hitter_sc_display.columns = ["Hitter", "Team", "Bat-Speed Month", "Monthly Average CI", "Monthly Avg Bat Speed", "Projected Bat Speed", "Bat-Speed Residual", "CI Through", "YTD Average CI", "P90 Exit Velo", "Projected P90 Exit Velo", "P90 Exit-Velo Residual", "Reasons"]
             hitter_sc_display["Bat-Speed Month"] = pd.to_datetime(hitter_sc_display["Bat-Speed Month"], errors="coerce").dt.strftime("%b %Y")
-            hitter_sc_display["P80 Exit Velo As Of"] = hitter_sc_display["P80 Exit Velo As Of"].map(fmt_date)
+            hitter_sc_display["CI Through"] = hitter_sc_display["CI Through"].map(fmt_date)
             st.dataframe(hitter_sc_display, hide_index=True, use_container_width=True, height=min(660, 44 + 36 * (len(hitter_sc_display) + 1)), column_config={
-                "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Projected Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Bat-Speed Residual": st.column_config.NumberColumn(format="%+.2f mph"), "YTD Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Final YTD P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "Projected P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "P80 Exit-Velo Residual": st.column_config.NumberColumn(format="%+.2f mph")})
+                "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Projected Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Bat-Speed Residual": st.column_config.NumberColumn(format="%+.2f mph"), "YTD Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "P90 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "Projected P90 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "P90 Exit-Velo Residual": st.column_config.NumberColumn(format="%+.2f mph")})
             csv_download_button(hitter_sc_display, "Download hitter S&C development CSV", "hitter_sc_development.csv", "download_hitter_sc_development")
 
     with st.container(border=True):
         st.subheader("Hitters Underperforming Their CI", anchor=False)
-        pathway_mode = st.radio("How should the bat-speed and P80 pathways combine?", ["Either pathway", "Both pathways"], horizontal=True, key="hitter_under_path_mode")
+        pathway_mode = st.radio("How should the bat-speed and P90 pathways combine?", ["Either pathway", "Both pathways"], horizontal=True, key="hitter_under_path_mode")
         pathway_cols = st.columns(2)
         with pathway_cols[0]:
             st.markdown("**Bat-speed pathway**")
@@ -7953,12 +7971,12 @@ with sc_opportunity_tab:
             bat_require_residual = st.checkbox("Require negative bat-speed residual", value=True, key="hu_bat_require_resid")
             bat_resid_max = st.slider("Maximum bat-speed residual", -5.0, 1.0, -1.0, 0.1, key="hu_bat_resid_max")
         with pathway_cols[1]:
-            st.markdown("**P80 exit-velo pathway**")
-            use_exit_path = st.checkbox("Enable P80 pathway", value=True, key="hu_use_exit_path")
+            st.markdown("**P90 exit-velo pathway**")
+            use_exit_path = st.checkbox("Enable P90 pathway", value=True, key="hu_use_exit_path")
             exit_require_ci = st.checkbox("Require minimum YTD CI", value=True, key="hu_exit_require_ci")
             exit_ci_min = st.slider("Minimum YTD CI", 220.0, 380.0, 300.0, 5.0, key="hu_exit_ci_min")
-            exit_require_residual = st.checkbox("Require negative P80 residual", value=True, key="hu_exit_require_resid")
-            exit_resid_max = st.slider("Maximum P80 residual", -5.0, 1.0, -1.0, 0.1, key="hu_exit_resid_max")
+            exit_require_residual = st.checkbox("Require negative P90 residual", value=True, key="hu_exit_require_resid")
+            exit_resid_max = st.slider("Maximum P90 residual", -5.0, 1.0, -1.0, 0.1, key="hu_exit_resid_max")
         hitter_underperforming_ci_table = filter_hitter_underperformance_pathways(
             hitter_base, use_bat_path, bat_require_ci, bat_ci_min, bat_require_residual, bat_resid_max,
             use_exit_path, exit_require_ci, exit_ci_min, exit_require_residual, exit_resid_max,
@@ -7969,9 +7987,9 @@ with sc_opportunity_tab:
             st.info("No hitters met the enabled CI-underperformance criteria.")
         else:
             hitter_under_display = hitter_underperforming_ci_table.copy()
-            hitter_under_display.columns = ["Hitter", "Team", "Bat-Speed Month", "Monthly Average CI", "Monthly Avg Bat Speed", "Projected Bat Speed", "Bat-Speed Residual", "P80 Exit Velo As Of", "YTD Average CI", "Final YTD P80 Exit Velo", "Projected P80 Exit Velo", "P80 Exit-Velo Residual", "Reasons"]
+            hitter_under_display.columns = ["Hitter", "Team", "Bat-Speed Month", "Monthly Average CI", "Monthly Avg Bat Speed", "Projected Bat Speed", "Bat-Speed Residual", "CI Through", "YTD Average CI", "P90 Exit Velo", "Projected P90 Exit Velo", "P90 Exit-Velo Residual", "Reasons"]
             hitter_under_display["Bat-Speed Month"] = pd.to_datetime(hitter_under_display["Bat-Speed Month"], errors="coerce").dt.strftime("%b %Y")
-            hitter_under_display["P80 Exit Velo As Of"] = hitter_under_display["P80 Exit Velo As Of"].map(fmt_date)
+            hitter_under_display["CI Through"] = hitter_under_display["CI Through"].map(fmt_date)
             st.dataframe(hitter_under_display, hide_index=True, use_container_width=True, height=min(660, 44 + 36 * (len(hitter_under_display) + 1)), column_config={
-                "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Projected Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Bat-Speed Residual": st.column_config.NumberColumn(format="%+.2f mph"), "YTD Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Final YTD P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "Projected P80 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "P80 Exit-Velo Residual": st.column_config.NumberColumn(format="%+.2f mph")})
+                "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Projected Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Bat-Speed Residual": st.column_config.NumberColumn(format="%+.2f mph"), "YTD Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "P90 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "Projected P90 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "P90 Exit-Velo Residual": st.column_config.NumberColumn(format="%+.2f mph")})
             csv_download_button(hitter_under_display, "Download hitters underperforming CI CSV", "hitters_underperforming_ci.csv", "download_hitters_underperforming_ci")
