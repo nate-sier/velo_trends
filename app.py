@@ -40,6 +40,7 @@ SPRINT_SPEED_OUTPUT_BUCKET_WIDTH = 0.5
 BAT_SPEED_OUTPUT_BUCKET_WIDTH = 2.0
 BAT_SPEED_OUTPUT_BUCKET_FLOOR = 62.0
 EXIT_VELO_OUTPUT_BUCKET_WIDTH = 2.0
+EXIT_VELO_OUTPUT_BUCKET_FLOOR = 96.0
 POTENTIAL_PINCH_INCREASE = 10.0
 POTENTIAL_PEAK_POWER_REL_INCREASE = 5.0
 POTENTIAL_PEAK_POWER_INCREASE = 500.0
@@ -1191,6 +1192,11 @@ def output_bucket_summary(
         work.loc[work[output_col] < BAT_SPEED_OUTPUT_BUCKET_FLOOR, "band_start"] = (
             BAT_SPEED_OUTPUT_BUCKET_FLOOR - width
         )
+    # Hitting P90 exit-velo buckets start with one <96 mph bucket.
+    if output_col == "p90_exit_velo":
+        work.loc[work[output_col] < EXIT_VELO_OUTPUT_BUCKET_FLOOR, "band_start"] = (
+            EXIT_VELO_OUTPUT_BUCKET_FLOOR - width
+        )
     # Pitcher FB-velo output buckets top out at 98+. Keep all other
     # output metrics on their normal uncapped bucket scale.
     if output_col == "avg_fb_velo":
@@ -1213,6 +1219,8 @@ def output_bucket_summary(
     def _fmt_bucket(lower: float) -> str:
         if output_col == "monthly_avg_bat_speed" and lower < BAT_SPEED_OUTPUT_BUCKET_FLOOR:
             return f"<{BAT_SPEED_OUTPUT_BUCKET_FLOOR:.0f} {output_unit}"
+        if output_col == "p90_exit_velo" and lower < EXIT_VELO_OUTPUT_BUCKET_FLOOR:
+            return f"<{EXIT_VELO_OUTPUT_BUCKET_FLOOR:.0f} {output_unit}"
         if output_col == "avg_fb_velo" and lower >= FB_VELO_OUTPUT_BUCKET_TOP:
             return f"{FB_VELO_OUTPUT_BUCKET_TOP:.0f}+ {output_unit}"
         upper = lower + width
@@ -1337,6 +1345,10 @@ def output_bucket_members(
         detail.loc[detail[output_col] < BAT_SPEED_OUTPUT_BUCKET_FLOOR, "band_start"] = (
             BAT_SPEED_OUTPUT_BUCKET_FLOOR - width
         )
+    if output_col == "p90_exit_velo":
+        detail.loc[detail[output_col] < EXIT_VELO_OUTPUT_BUCKET_FLOOR, "band_start"] = (
+            EXIT_VELO_OUTPUT_BUCKET_FLOOR - width
+        )
     if output_col == "avg_fb_velo":
         detail["band_start"] = np.minimum(
             detail["band_start"], FB_VELO_OUTPUT_BUCKET_TOP
@@ -1345,6 +1357,8 @@ def output_bucket_members(
     def _fmt_bucket(lower: float) -> str:
         if output_col == "monthly_avg_bat_speed" and lower < BAT_SPEED_OUTPUT_BUCKET_FLOOR:
             return f"<{BAT_SPEED_OUTPUT_BUCKET_FLOOR:.0f} {output_unit}"
+        if output_col == "p90_exit_velo" and lower < EXIT_VELO_OUTPUT_BUCKET_FLOOR:
+            return f"<{EXIT_VELO_OUTPUT_BUCKET_FLOOR:.0f} {output_unit}"
         if output_col == "avg_fb_velo" and lower >= FB_VELO_OUTPUT_BUCKET_TOP:
             return f"{FB_VELO_OUTPUT_BUCKET_TOP:.0f}+ {output_unit}"
         upper = lower + width
