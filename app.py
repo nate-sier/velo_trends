@@ -34,6 +34,7 @@ MIN_LAST_YTD_FB_VELO = 85.0
 POTENTIAL_CI_INCREASE = 10.0
 FB_VELO_OUTPUT_BUCKET_WIDTH = 2.0
 FB_VELO_OUTPUT_BUCKET_TOP = 98.0
+CI_BUCKET_TOP = 360.0
 SPRINT_SPEED_OUTPUT_BUCKET_WIDTH = 0.5
 BAT_SPEED_OUTPUT_BUCKET_WIDTH = 2.0
 EXIT_VELO_OUTPUT_BUCKET_WIDTH = 2.0
@@ -269,6 +270,19 @@ def fmt_date(value) -> str:
         return "—"
     value = pd.Timestamp(value)
     return f"{value.strftime('%b')} {value.day}, {value.year}"
+
+
+def ci_bucket_start(values: pd.Series, width: float) -> pd.Series:
+    """Return CI bucket starts, with every value >= 360 N·s grouped into 360+."""
+    starts = np.floor(values / width) * width
+    return np.minimum(starts, CI_BUCKET_TOP)
+
+
+def ci_bucket_label(lower: float, width: float) -> str:
+    """Format a CI bucket label with a final 360+ N·s bucket."""
+    if lower >= CI_BUCKET_TOP:
+        return f"{CI_BUCKET_TOP:.0f}+ N·s"
+    return f"{lower:.0f}–{lower + width:.0f} N·s"
 
 
 def add_time_bucket_columns(df: pd.DataFrame, date_col: str, bucket_mode: str) -> pd.DataFrame:
@@ -851,7 +865,7 @@ def ci_band_summary(summary: pd.DataFrame, band_width: int, velo_stat: str = "Me
 
     width = max(1, int(band_width))
     work = summary[["avg_ci", "avg_fb_velo"]].dropna().copy()
-    work["band_start"] = np.floor(work["avg_ci"] / width) * width
+    work["band_start"] = ci_bucket_start(work["avg_ci"], width)
     grouped = (
         work.groupby("band_start", as_index=False)
         .agg(
@@ -863,7 +877,7 @@ def ci_band_summary(summary: pd.DataFrame, band_width: int, velo_stat: str = "Me
         )
         .sort_values("band_start")
     )
-    grouped["CI band"] = grouped["band_start"].map(lambda lower: f"{lower:.0f}–{lower + width:.0f} N·s")
+    grouped["CI band"] = grouped["band_start"].map(lambda lower: ci_bucket_label(lower, width))
     grouped[velo_col] = grouped[velo_col].round(2)
     grouped["Average CI"] = grouped["Average CI"].round(2)
     grouped["Pitchers"] = grouped["Pitchers"].astype(int)
@@ -1009,9 +1023,9 @@ def ci_band_members(
         return pd.DataFrame(columns=cols + ["CI band", "Status", "Difference"]), np.nan, stat
 
     detail = summary[cols].dropna().copy()
-    detail["band_start"] = np.floor(detail["avg_ci"] / width) * width
+    detail["band_start"] = ci_bucket_start(detail["avg_ci"], width)
     detail["CI band"] = detail["band_start"].map(
-        lambda lower: f"{lower:.0f}–{lower + width:.0f} N·s"
+        lambda lower: ci_bucket_label(lower, width)
     )
     detail = detail[detail["CI band"] == ci_band].copy()
     if detail.empty:
@@ -1824,7 +1838,7 @@ def bat_ci_band_summary(
     work = pairs[
         ["name_key", "avg_ci", "monthly_avg_bat_speed"]
     ].dropna().copy()
-    work["band_start"] = np.floor(work["avg_ci"] / width) * width
+    work["band_start"] = ci_bucket_start(work["avg_ci"], width)
     grouped = (
         work.groupby("band_start", as_index=False)
         .agg(
@@ -1840,7 +1854,7 @@ def bat_ci_band_summary(
         .sort_values("band_start")
     )
     grouped["CI band"] = grouped["band_start"].map(
-        lambda lower: f"{lower:.0f}–{lower + width:.0f} N·s"
+        lambda lower: ci_bucket_label(lower, width)
     )
     grouped[speed_col] = grouped[speed_col].round(2)
     grouped["Average CI"] = grouped["Average CI"].round(2)
@@ -2072,9 +2086,9 @@ def bat_ci_band_members(
     detail = pairs[cols].dropna(
         subset=["avg_ci", "monthly_avg_bat_speed"]
     ).copy()
-    detail["band_start"] = np.floor(detail["avg_ci"] / width) * width
+    detail["band_start"] = ci_bucket_start(detail["avg_ci"], width)
     detail["CI band"] = detail["band_start"].map(
-        lambda lower: f"{lower:.0f}–{lower + width:.0f} N·s"
+        lambda lower: ci_bucket_label(lower, width)
     )
     detail = detail[detail["CI band"] == ci_band].copy()
     if detail.empty:
@@ -2605,7 +2619,7 @@ def exit_velo_ci_band_summary(
     work = summary[[
         "name_key", "avg_ci", "p90_exit_velo",
     ]].dropna().copy()
-    work["band_start"] = np.floor(work["avg_ci"] / width) * width
+    work["band_start"] = ci_bucket_start(work["avg_ci"], width)
     grouped = (
         work.groupby("band_start", as_index=False)
         .agg(**{
@@ -2619,7 +2633,7 @@ def exit_velo_ci_band_summary(
         .sort_values("band_start")
     )
     grouped["CI band"] = grouped["band_start"].map(
-        lambda lower: f"{lower:.0f}–{lower + width:.0f} N·s"
+        lambda lower: ci_bucket_label(lower, width)
     )
     grouped[velo_col] = grouped[velo_col].round(2)
     grouped["Average CI"] = grouped["Average CI"].round(2)
@@ -2812,9 +2826,9 @@ def exit_velo_ci_band_members(
     detail = summary[cols].dropna(
         subset=["avg_ci", "p90_exit_velo"]
     ).copy()
-    detail["band_start"] = np.floor(detail["avg_ci"] / width) * width
+    detail["band_start"] = ci_bucket_start(detail["avg_ci"], width)
     detail["CI band"] = detail["band_start"].map(
-        lambda lower: f"{lower:.0f}–{lower + width:.0f} N·s"
+        lambda lower: ci_bucket_label(lower, width)
     )
     detail = detail[detail["CI band"] == ci_band].copy()
     if detail.empty:
