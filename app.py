@@ -33,6 +33,7 @@ LOCAL_SERVICE_ACCOUNT_FILE = Path.home() / "Desktop" / "service_account.json"
 MIN_LAST_YTD_FB_VELO = 85.0
 POTENTIAL_CI_INCREASE = 10.0
 FB_VELO_OUTPUT_BUCKET_WIDTH = 2.0
+FB_VELO_OUTPUT_BUCKET_TOP = 98.0
 SPRINT_SPEED_OUTPUT_BUCKET_WIDTH = 0.5
 BAT_SPEED_OUTPUT_BUCKET_WIDTH = 2.0
 EXIT_VELO_OUTPUT_BUCKET_WIDTH = 2.0
@@ -1153,6 +1154,12 @@ def output_bucket_summary(
         ])
 
     work["band_start"] = np.floor(work[output_col] / width) * width
+    # Pitcher FB-velo output buckets top out at 98+. Keep all other
+    # output metrics on their normal uncapped bucket scale.
+    if output_col == "avg_fb_velo":
+        work["band_start"] = np.minimum(
+            work["band_start"], FB_VELO_OUTPUT_BUCKET_TOP
+        )
     grouped = (
         work.groupby("band_start", as_index=False)
         .agg(
@@ -1167,6 +1174,8 @@ def output_bucket_summary(
     )
 
     def _fmt_bucket(lower: float) -> str:
+        if output_col == "avg_fb_velo" and lower >= FB_VELO_OUTPUT_BUCKET_TOP:
+            return f"{FB_VELO_OUTPUT_BUCKET_TOP:.0f}+ {output_unit}"
         upper = lower + width
         if float(width).is_integer():
             return f"{lower:.0f}–{upper:.0f} {output_unit}"
@@ -1285,8 +1294,14 @@ def output_bucket_members(
         return pd.DataFrame(columns=columns), np.nan
 
     detail["band_start"] = np.floor(detail[output_col] / width) * width
+    if output_col == "avg_fb_velo":
+        detail["band_start"] = np.minimum(
+            detail["band_start"], FB_VELO_OUTPUT_BUCKET_TOP
+        )
 
     def _fmt_bucket(lower: float) -> str:
+        if output_col == "avg_fb_velo" and lower >= FB_VELO_OUTPUT_BUCKET_TOP:
+            return f"{FB_VELO_OUTPUT_BUCKET_TOP:.0f}+ {output_unit}"
         upper = lower + width
         if float(width).is_integer():
             return f"{lower:.0f}–{upper:.0f} {output_unit}"
