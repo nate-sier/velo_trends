@@ -35,8 +35,10 @@ POTENTIAL_CI_INCREASE = 10.0
 FB_VELO_OUTPUT_BUCKET_WIDTH = 2.0
 FB_VELO_OUTPUT_BUCKET_TOP = 98.0
 CI_BUCKET_TOP = 360.0
+HITTING_CI_BUCKET_FLOOR = 240.0
 SPRINT_SPEED_OUTPUT_BUCKET_WIDTH = 0.5
 BAT_SPEED_OUTPUT_BUCKET_WIDTH = 2.0
+BAT_SPEED_OUTPUT_BUCKET_FLOOR = 62.0
 EXIT_VELO_OUTPUT_BUCKET_WIDTH = 2.0
 POTENTIAL_PINCH_INCREASE = 10.0
 POTENTIAL_PEAK_POWER_REL_INCREASE = 5.0
@@ -280,6 +282,22 @@ def ci_bucket_start(values: pd.Series, width: float) -> pd.Series:
 
 def ci_bucket_label(lower: float, width: float) -> str:
     """Format a CI bucket label with a final 360+ N·s bucket."""
+    if lower >= CI_BUCKET_TOP:
+        return f"{CI_BUCKET_TOP:.0f}+ N·s"
+    return f"{lower:.0f}–{lower + width:.0f} N·s"
+
+
+def hitting_ci_bucket_start(values: pd.Series, width: float) -> pd.Series:
+    """Hitting CI buckets use <240 N·s as the floor and 360+ N·s as the ceiling."""
+    starts = np.floor(values / width) * width
+    starts = np.where(values < HITTING_CI_BUCKET_FLOOR, HITTING_CI_BUCKET_FLOOR - width, starts)
+    return pd.Series(np.minimum(starts, CI_BUCKET_TOP), index=values.index)
+
+
+def hitting_ci_bucket_label(lower: float, width: float) -> str:
+    """Format hitting CI buckets with <240 and 360+ endpoint buckets."""
+    if lower < HITTING_CI_BUCKET_FLOOR:
+        return f"<{HITTING_CI_BUCKET_FLOOR:.0f} N·s"
     if lower >= CI_BUCKET_TOP:
         return f"{CI_BUCKET_TOP:.0f}+ N·s"
     return f"{lower:.0f}–{lower + width:.0f} N·s"
@@ -1168,6 +1186,11 @@ def output_bucket_summary(
         ])
 
     work["band_start"] = np.floor(work[output_col] / width) * width
+    # Hitting bat-speed buckets start with one <62 mph bucket.
+    if output_col == "monthly_avg_bat_speed":
+        work.loc[work[output_col] < BAT_SPEED_OUTPUT_BUCKET_FLOOR, "band_start"] = (
+            BAT_SPEED_OUTPUT_BUCKET_FLOOR - width
+        )
     # Pitcher FB-velo output buckets top out at 98+. Keep all other
     # output metrics on their normal uncapped bucket scale.
     if output_col == "avg_fb_velo":
@@ -1188,6 +1211,8 @@ def output_bucket_summary(
     )
 
     def _fmt_bucket(lower: float) -> str:
+        if output_col == "monthly_avg_bat_speed" and lower < BAT_SPEED_OUTPUT_BUCKET_FLOOR:
+            return f"<{BAT_SPEED_OUTPUT_BUCKET_FLOOR:.0f} {output_unit}"
         if output_col == "avg_fb_velo" and lower >= FB_VELO_OUTPUT_BUCKET_TOP:
             return f"{FB_VELO_OUTPUT_BUCKET_TOP:.0f}+ {output_unit}"
         upper = lower + width
@@ -1308,12 +1333,18 @@ def output_bucket_members(
         return pd.DataFrame(columns=columns), np.nan
 
     detail["band_start"] = np.floor(detail[output_col] / width) * width
+    if output_col == "monthly_avg_bat_speed":
+        detail.loc[detail[output_col] < BAT_SPEED_OUTPUT_BUCKET_FLOOR, "band_start"] = (
+            BAT_SPEED_OUTPUT_BUCKET_FLOOR - width
+        )
     if output_col == "avg_fb_velo":
         detail["band_start"] = np.minimum(
             detail["band_start"], FB_VELO_OUTPUT_BUCKET_TOP
         )
 
     def _fmt_bucket(lower: float) -> str:
+        if output_col == "monthly_avg_bat_speed" and lower < BAT_SPEED_OUTPUT_BUCKET_FLOOR:
+            return f"<{BAT_SPEED_OUTPUT_BUCKET_FLOOR:.0f} {output_unit}"
         if output_col == "avg_fb_velo" and lower >= FB_VELO_OUTPUT_BUCKET_TOP:
             return f"{FB_VELO_OUTPUT_BUCKET_TOP:.0f}+ {output_unit}"
         upper = lower + width
@@ -1838,7 +1869,7 @@ def bat_ci_band_summary(
     work = pairs[
         ["name_key", "avg_ci", "monthly_avg_bat_speed"]
     ].dropna().copy()
-    work["band_start"] = ci_bucket_start(work["avg_ci"], width)
+    work["band_start"] = hitting_ci_bucket_start(work["avg_ci"], width)
     grouped = (
         work.groupby("band_start", as_index=False)
         .agg(
@@ -1854,7 +1885,7 @@ def bat_ci_band_summary(
         .sort_values("band_start")
     )
     grouped["CI band"] = grouped["band_start"].map(
-        lambda lower: ci_bucket_label(lower, width)
+        lambda lower: hitting_ci_bucket_label(lower, width)
     )
     grouped[speed_col] = grouped[speed_col].round(2)
     grouped["Average CI"] = grouped["Average CI"].round(2)
@@ -2086,9 +2117,9 @@ def bat_ci_band_members(
     detail = pairs[cols].dropna(
         subset=["avg_ci", "monthly_avg_bat_speed"]
     ).copy()
-    detail["band_start"] = ci_bucket_start(detail["avg_ci"], width)
+    detail["band_start"] = hitting_ci_bucket_start(detail["avg_ci"], width)
     detail["CI band"] = detail["band_start"].map(
-        lambda lower: ci_bucket_label(lower, width)
+        lambda lower: hitting_ci_bucket_label(lower, width)
     )
     detail = detail[detail["CI band"] == ci_band].copy()
     if detail.empty:
@@ -2619,7 +2650,7 @@ def exit_velo_ci_band_summary(
     work = summary[[
         "name_key", "avg_ci", "p90_exit_velo",
     ]].dropna().copy()
-    work["band_start"] = ci_bucket_start(work["avg_ci"], width)
+    work["band_start"] = hitting_ci_bucket_start(work["avg_ci"], width)
     grouped = (
         work.groupby("band_start", as_index=False)
         .agg(**{
@@ -2633,7 +2664,7 @@ def exit_velo_ci_band_summary(
         .sort_values("band_start")
     )
     grouped["CI band"] = grouped["band_start"].map(
-        lambda lower: ci_bucket_label(lower, width)
+        lambda lower: hitting_ci_bucket_label(lower, width)
     )
     grouped[velo_col] = grouped[velo_col].round(2)
     grouped["Average CI"] = grouped["Average CI"].round(2)
@@ -2826,9 +2857,9 @@ def exit_velo_ci_band_members(
     detail = summary[cols].dropna(
         subset=["avg_ci", "p90_exit_velo"]
     ).copy()
-    detail["band_start"] = ci_bucket_start(detail["avg_ci"], width)
+    detail["band_start"] = hitting_ci_bucket_start(detail["avg_ci"], width)
     detail["CI band"] = detail["band_start"].map(
-        lambda lower: ci_bucket_label(lower, width)
+        lambda lower: hitting_ci_bucket_label(lower, width)
     )
     detail = detail[detail["CI band"] == ci_band].copy()
     if detail.empty:
