@@ -5,7 +5,11 @@ Performance × CI — Streamlit deployment-ready dashboard.
 """
 from __future__ import annotations
 
-# Defensive relationship integration build: 2026-08-13 v5
+# Selected defensive relationships build v7.
+# Relative Peak Power × Sprint Speed now uses the baserunning-sheet Sprint Speed source.
+# Selected baserunning/defensive tabs use current baserunning-sheet Sprint Speed where applicable.
+
+# Defensive relationship integration build: 2026-08-13 v7
 
 import html
 import hmac
@@ -3056,38 +3060,53 @@ def build_exit_velo_ci_band_member_chart(
 
 
 # -----------------------------------------------------------------------------
-# FINAL ELIGIBLE-MONTH SPRINT SPEED × RELATIVE PEAK POWER
+# BASERUNNING SPRINT SPEED × RELATIVE PEAK POWER
 # -----------------------------------------------------------------------------
 def build_sprint_overview_summary(
     jump_power: pd.DataFrame,
-    sprint: pd.DataFrame,
+    baserunning: pd.DataFrame,
     start_date,
     end_date,
     team_filter: str,
     min_power_jumps: int,
 ) -> pd.DataFrame:
-    """Create one player-level observation from each player's final eligible month.
+    """Match current baserunning-sheet Sprint Speed to mean in-window Relative Peak Power.
 
-    An eligible month must contain a valid final monthly_max_sprint_speed value,
-    at least 14 distinct PP_Sprint data dates inside the selected dashboard date
-    range, and at least min_power_jumps Peak Power / BM rows from Jump Data in
-    that same month and selected date range. The regression therefore receives
-    exactly one row per player.
+    Sprint Speed is the current season-to-date snapshot from the same baserunning
+    Google Sheet used by the nBSR and Adv Runs tabs. Relative Peak Power is the
+    player's mean Peak Power / BM from Jump Data inside the selected dashboard
+    date window. There is no PP_Sprint monthly-eligibility requirement here.
     """
+    columns = [
+        "name_key", "athlete", "team", "avg_peak_power_rel",
+        "power_jumps", "power_test_dates", "first_power_date",
+        "last_power_date", "monthly_max_sprint_speed", "month_label",
+        "observation",
+    ]
+    required = {"name_key", "athlete", "baserunning_sprint_speed"}
+    if jump_power.empty or baserunning.empty or not required.issubset(baserunning.columns):
+        return pd.DataFrame(columns=columns)
+
     start = pd.Timestamp(start_date).normalize()
     end = pd.Timestamp(end_date).normalize()
 
-    # Apply the ACTUAL selected dates before assigning rows to calendar months.
-    # This prevents days before the selected start date or after the selected end
-    # date from helping a partial month qualify.
-    power_window = jump_power[
-        (jump_power["date"] >= start) & (jump_power["date"] <= end)
-    ].copy()
-    power_window["month"] = (
-        power_window["date"].dt.to_period("M").dt.to_timestamp()
+    team_lookup = (
+        jump_power.sort_values("date")
+        .groupby("name_key", as_index=False)
+        .tail(1)[["name_key", "team"]]
+        .drop_duplicates("name_key")
     )
-    power_monthly = (
-        power_window.groupby(["name_key", "month"], as_index=False)
+
+    power_window = jump_power[
+        (jump_power["date"] >= start)
+        & (jump_power["date"] <= end)
+        & jump_power["peak_power_rel"].notna()
+    ].copy()
+    if power_window.empty:
+        return pd.DataFrame(columns=columns)
+
+    power_summary = (
+        power_window.groupby("name_key", as_index=False)
         .agg(
             athlete=("athlete", "first"),
             avg_peak_power_rel=("peak_power_rel", "mean"),
@@ -3096,99 +3115,26 @@ def build_sprint_overview_summary(
             first_power_date=("date", "min"),
             last_power_date=("date", "max"),
         )
+        .merge(team_lookup, on="name_key", how="left")
     )
 
-    team_lookup = (
-        jump_power.sort_values("date")
-        .groupby("name_key", as_index=False)
-        .tail(1)[["name_key", "team"]]
+    sprint_snapshot = (
+        baserunning[["name_key", "baserunning_sprint_speed"]]
+        .dropna(subset=["baserunning_sprint_speed"])
         .drop_duplicates("name_key")
-        .rename(columns={"team": "current_team"})
+        .rename(columns={"baserunning_sprint_speed": "monthly_max_sprint_speed"})
     )
 
-    sprint_window = sprint[
-        (sprint["date"] >= start) & (sprint["date"] <= end)
+    summary = power_summary.merge(sprint_snapshot, on="name_key", how="inner")
+    summary = summary[
+        summary["power_jumps"] >= max(1, int(min_power_jumps))
     ].copy()
-    sprint_window["month"] = (
-        sprint_window["date"].dt.to_period("M").dt.to_timestamp()
-    )
-    sprint_window = sprint_window.sort_values(
-        ["name_key", "month", "date"], kind="stable"
-    )
-
-    sprint_monthly_coverage = (
-        sprint_window.groupby(["name_key", "month"], as_index=False)
-        .agg(
-            first_sprint_date=("date", "min"),
-            last_sprint_date=("date", "max"),
-            sprint_data_dates=("date", "nunique"),
-            sprint_source_rows=("date", "size"),
-        )
-    )
-    sprint_monthly_coverage["sprint_coverage_days"] = (
-        sprint_monthly_coverage["last_sprint_date"]
-        - sprint_monthly_coverage["first_sprint_date"]
-    ).dt.days + 1
-
-    sprint_monthly_final = (
-        sprint_window.groupby(["name_key", "month"], as_index=False)
-        .tail(1)[[
-            "name_key", "athlete", "month", "date",
-            "monthly_max_sprint_speed", "team",
-        ]]
-        .rename(columns={"date": "sprint_speed_as_of"})
-        .merge(
-            sprint_monthly_coverage,
-            on=["name_key", "month"],
-            how="left",
-        )
-    )
-
-    eligible = power_monthly.merge(
-        sprint_monthly_final,
-        on=["name_key", "month"],
-        how="inner",
-        suffixes=("", "_sprint"),
-    )
-    eligible = eligible.merge(team_lookup, on="name_key", how="left")
-    eligible["team"] = eligible["current_team"].combine_first(
-        eligible["team"]
-    )
-    eligible = eligible.drop(columns=["current_team"])
-    eligible["team"] = eligible["team"].fillna("Unassigned")
-    eligible = eligible[
-        (eligible["power_jumps"] >= max(1, int(min_power_jumps)))
-        & (
-            eligible["sprint_data_dates"]
-            >= MIN_SPRINT_MONTH_DATA_DATES
-        )
-    ].copy()
-
     if team_filter != "All Teams":
-        eligible = eligible[eligible["team"] == team_filter].copy()
+        summary = summary[summary["team"] == team_filter].copy()
 
-    if eligible.empty:
-        eligible["month_label"] = pd.Series(dtype=str)
-        eligible["observation"] = pd.Series(dtype=str)
-        return eligible.reset_index(drop=True)
-
-    # Select the final qualifying month only after all matching and minimum-data
-    # rules are applied, preserving one independent observation per player.
-    summary = (
-        eligible.sort_values(
-            ["name_key", "month", "sprint_speed_as_of"],
-            kind="stable",
-        )
-        .groupby("name_key", as_index=False)
-        .tail(1)
-        .copy()
-    )
-    summary["month_label"] = summary["month"].dt.strftime("%b %Y")
+    summary["month_label"] = "Current baserunning snapshot"
     summary["observation"] = summary["athlete"]
-    return summary.sort_values(
-        ["athlete"], kind="stable"
-    ).reset_index(drop=True)
-
+    return summary.sort_values("athlete", kind="stable").reset_index(drop=True)
 
 
 def sprint_correlation_stats(
@@ -3280,7 +3226,7 @@ def build_sprint_residual_chart(pairs: pd.DataFrame) -> go.Figure:
         hovertemplate=(
             "<b>%{y}</b><br>"
             "Team: %{customdata[0]}<br>"
-            "Month: %{customdata[1]}<br>"
+            "Source: %{customdata[1]}<br>"
             "Relative peak power: %{customdata[2]:.2f} W/kg<br>"
             "Actual sprint speed: %{customdata[3]:.2f} ft/s<br>"
             "Predicted sprint speed: %{customdata[4]:.2f} ft/s<br>"
@@ -3321,7 +3267,7 @@ def sprint_power_band_summary(
     sprint_stat: str = "Mean",
 ) -> pd.DataFrame:
     stat = "Median" if str(sprint_stat).strip().lower() == "median" else "Mean"
-    speed_col = f"{stat} Monthly Max Sprint Speed"
+    speed_col = f"{stat} Sprint Speed"
     if pairs.empty:
         return pd.DataFrame(columns=[
             "Power band", speed_col, "Players", "Average Peak Power / BM",
@@ -3368,8 +3314,7 @@ def build_sprint_scatter(
     if pairs.empty:
         fig.add_annotation(
             text="No matched players meet the selected rules.",
-            showarrow=False,
-            font={"size": 15, "color": SUBTEXT},
+            showarrow=False, font={"size": 15, "color": SUBTEXT},
             x=0.5, y=0.5, xref="paper", yref="paper",
         )
         fig.update_xaxes(visible=False)
@@ -3379,12 +3324,10 @@ def build_sprint_scatter(
     customdata = np.column_stack([
         pairs["athlete"],
         pairs["team"],
-        pairs["month_label"],
         pairs["power_jumps"],
         pairs["power_test_dates"],
         pairs["first_power_date"].map(fmt_date),
         pairs["last_power_date"].map(fmt_date),
-        pairs["sprint_speed_as_of"].map(fmt_date),
     ])
     fig.add_trace(go.Scatter(
         x=pairs["avg_peak_power_rel"],
@@ -3401,13 +3344,12 @@ def build_sprint_scatter(
         },
         customdata=customdata,
         hovertemplate=(
-            "<b>%{customdata[0]}</b> · %{customdata[2]}<br>"
+            "<b>%{customdata[0]}</b><br>"
             "Team: %{customdata[1]}<br>"
-            "Monthly max sprint speed: %{y:.2f} ft/s<br>"
-            "Final-month average Peak Power / BM: %{x:.2f} W/kg<br><br>"
-            "Jump rows: %{customdata[3]} across %{customdata[4]} dates · "
-            "%{customdata[5]}–%{customdata[6]}<br>"
-            "Sprint-speed value as of %{customdata[7]}<extra></extra>"
+            "Baserunning Sprint Speed: %{y:.2f} ft/s<br>"
+            "Mean Peak Power / BM: %{x:.2f} W/kg<br><br>"
+            "Jump rows: %{customdata[2]} across %{customdata[3]} dates · "
+            "%{customdata[4]}–%{customdata[5]}<extra></extra>"
         ),
     ))
 
@@ -3451,20 +3393,20 @@ def build_sprint_scatter(
                 },
                 hovertemplate=(
                     "<b>Power lookup</b><br>"
-                    "Final-month average Peak Power / BM: %{x:.1f} W/kg<br>"
-                    "Estimated monthly max sprint speed: %{y:.2f} ft/s"
+                    "Mean Peak Power / BM: %{x:.1f} W/kg<br>"
+                    "Estimated Sprint Speed: %{y:.2f} ft/s"
                     "<extra></extra>"
                 ),
             ))
 
     fig.update_xaxes(
-        title="Average Peak Power / BM in final eligible month (W/kg)",
+        title="Mean Peak Power / BM in selected window (W/kg)",
         showgrid=True, gridcolor=GRID, zeroline=False,
         linecolor=BORDER, tickfont={"color": SUBTEXT},
         title_font={"color": SUBTEXT},
     )
     fig.update_yaxes(
-        title="Monthly max sprint speed (ft/s)",
+        title="Baserunning Sprint Speed (ft/s)",
         showgrid=True, gridcolor=GRID, zeroline=False,
         linecolor=BORDER, tickfont={"color": SUBTEXT},
         title_font={"color": SUBTEXT},
@@ -3478,7 +3420,7 @@ def build_sprint_band_chart(
     sprint_stat: str = "Mean",
 ) -> go.Figure:
     stat = "Median" if str(sprint_stat).strip().lower() == "median" else "Mean"
-    speed_col = f"{stat} Monthly Max Sprint Speed"
+    speed_col = f"{stat} Sprint Speed"
     bands = sprint_power_band_summary(pairs, band_width, stat)
     fig = go.Figure()
     if bands.empty:
@@ -3504,7 +3446,7 @@ def build_sprint_band_chart(
             bands["Average Peak Power / BM"],
         ]),
         hovertemplate=(
-            f"<b>%{{x}}</b><br>{stat} monthly max sprint speed: "
+            f"<b>%{{x}}</b><br>{stat} sprint speed: "
             "%{y:.2f} ft/s<br>"
             "Players: %{customdata[0]}<br>"
             "Mean Peak Power / BM within band: %{customdata[1]:.2f} W/kg"
@@ -3514,12 +3456,12 @@ def build_sprint_band_chart(
     y_min = max(0, float(bands[speed_col].min()) - 1.5)
     y_max = float(bands[speed_col].max()) + 1.0
     fig.update_xaxes(
-        title="Final-month average Peak Power / BM band",
+        title="Mean Peak Power / BM band",
         showgrid=False, linecolor=BORDER,
         tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
     )
     fig.update_yaxes(
-        title=f"{stat} monthly max sprint speed (ft/s)",
+        title=f"{stat} baserunning Sprint Speed (ft/s)",
         range=[y_min, y_max], showgrid=True, gridcolor=GRID,
         zeroline=False, linecolor=BORDER,
         tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
@@ -6853,7 +6795,7 @@ bat_monthly_pairs = build_bat_monthly_pairs(
 )
 sprint_overview_summary = build_sprint_overview_summary(
     jump_power=jump_power,
-    sprint=sprint,
+    baserunning=baserunning_defense,
     start_date=start_date,
     end_date=end_date,
     team_filter=team_filter,
@@ -6876,36 +6818,10 @@ if_reaction_power_summary = build_peak_power_rel_outcome_summary(
     team_filter=team_filter,
     min_power_jumps=int(min_power_jumps),
 )
-nbsr_power_summary = build_peak_power_rel_outcome_summary(
-    jump_power=jump_power,
-    outcome_df=baserunning_defense,
-    outcome_col="nbsr",
-    start_date=start_date,
-    end_date=end_date,
-    team_filter=team_filter,
-    min_power_jumps=int(min_power_jumps),
-)
 sprint_nbsr_summary = build_sprint_nbsr_summary(
     jump=jump,
     outcome_df=baserunning_defense,
     team_filter=team_filter,
-)
-sprint_power_nbsr_model_summary = build_sprint_power_nbsr_model_summary(
-    jump_power=jump_power,
-    outcome_df=baserunning_defense,
-    start_date=start_date,
-    end_date=end_date,
-    team_filter=team_filter,
-    min_power_jumps=int(min_power_jumps),
-)
-adv_runs_power_summary = build_peak_power_rel_outcome_summary(
-    jump_power=jump_power,
-    outcome_df=baserunning_defense,
-    outcome_col="adv_runs",
-    start_date=start_date,
-    end_date=end_date,
-    team_filter=team_filter,
-    min_power_jumps=int(min_power_jumps),
 )
 sprint_adv_runs_summary = build_baserunning_sprint_outcome_summary(
     jump=jump,
@@ -6929,10 +6845,7 @@ st.markdown(
     bat_overview_tab,
     exit_velo_overview_tab,
     if_reaction_power_tab,
-    nbsr_power_tab,
     sprint_nbsr_tab,
-    sprint_power_nbsr_model_tab,
-    adv_runs_power_tab,
     sprint_adv_runs_tab,
     sc_opportunity_tab,
 ) = st.tabs([
@@ -6944,10 +6857,7 @@ st.markdown(
     "Bat Speed Overview",
     "P90 Exit Velo Overview",
     "Rel PP × IF Reaction 3ft",
-    "Rel PP × nBSR",
     "Sprint Speed × nBSR",
-    "Sprint + Rel PP → nBSR",
-    "Rel PP × Adv Runs",
     "Sprint Speed × Adv Runs",
     "S&C Opportunity",
 ])
@@ -8004,9 +7914,8 @@ with sprint_overview_tab:
         sprint_overview_summary["avg_peak_power_rel"].mean()
         if n_sprint_players else np.nan
     )
-    sprint_r_text = (
-        f"{sprint_stats[0]:+.2f}" if sprint_stats is not None else "—"
-    )
+    sprint_r_text = f"{sprint_stats[0]:+.2f}" if sprint_stats is not None else "—"
+    sprint_r2_text = f"{sprint_stats[1]:.2f}" if sprint_stats is not None else "—"
     potential_sprint_increase = (
         sprint_stats[2] * POTENTIAL_PEAK_POWER_REL_INCREASE
         if sprint_stats is not None else np.nan
@@ -8016,40 +7925,28 @@ with sprint_overview_tab:
         if pd.notna(potential_sprint_increase) else "—"
     )
 
-    sprint_r2_text = (
-        f"{sprint_stats[1]:.2f}" if sprint_stats is not None else "—"
-    )
     top_cols = st.columns(3)
-    top_metrics = [
+    for column, values in zip(top_cols, [
         ("Players / Observations", str(n_sprint_players), BLUE),
         ("Correlation", sprint_r_text, ACCENT_RED),
         ("R²", sprint_r2_text, NAVY_MID),
-    ]
-    for column, values in zip(top_cols, top_metrics):
+    ]):
         with column:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
     bottom_cols = st.columns(3)
-    bottom_metrics = [
-        (
-            "Monthly Max Sprint Speed",
-            f"{fmt(mean_sprint_speed)} ft/s",
-            TEAL,
-        ),
-        (
-            "Final-Month Avg Peak Power / BM",
-            f"{fmt(mean_power_rel)} W/kg",
-            GREEN,
-        ),
-        (
-            f"Sprint-Speed Association · +{POTENTIAL_PEAK_POWER_REL_INCREASE:.0f} W/kg",
-            potential_sprint_text,
-            NAVY_MID,
-        ),
-    ]
-    for column, values in zip(bottom_cols, bottom_metrics):
+    for column, values in zip(bottom_cols, [
+        ("Baserunning Sprint Speed", f"{fmt(mean_sprint_speed)} ft/s", TEAL),
+        ("Mean Peak Power / BM", f"{fmt(mean_power_rel)} W/kg", GREEN),
+        (f"Sprint-Speed Association · +{POTENTIAL_PEAK_POWER_REL_INCREASE:.0f} W/kg", potential_sprint_text, NAVY_MID),
+    ]):
         with column:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    st.caption(
+        "Sprint Speed is the current value from nats_players_baserunning_2026—the same source used by the nBSR and Adv Runs tabs. "
+        "Peak Power / BM is the player's mean Jump Data value inside the selected dashboard date window. PP_Sprint is not used for this relationship."
+    )
 
     estimated_sprint_speed = (
         sprint_stats[2] * float(sprint_power_lookup) + sprint_stats[3]
@@ -8059,27 +7956,16 @@ with sprint_overview_tab:
         st.subheader("Relative Peak Power Lookup", anchor=False)
         lookup_left, lookup_right = st.columns(2)
         with lookup_left:
+            st.markdown("<div class='metric-label'>Mean Peak Power / BM</div>", unsafe_allow_html=True)
             st.markdown(
-                "<div class='metric-label'>Final-Month Average Peak Power / BM</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"<div class='lookup-value' style='color:#0A1F44;'>"
-                f"{fmt(sprint_power_lookup, 1)} W/kg</div>",
+                f"<div class='lookup-value' style='color:#0A1F44;'>{fmt(sprint_power_lookup, 1)} W/kg</div>",
                 unsafe_allow_html=True,
             )
         with lookup_right:
+            st.markdown("<div class='metric-label'>Estimated Sprint Speed</div>", unsafe_allow_html=True)
+            lookup_value = f"{fmt(estimated_sprint_speed)} ft/s" if pd.notna(estimated_sprint_speed) else "—"
             st.markdown(
-                "<div class='metric-label'>Estimated Monthly Max Sprint Speed</div>",
-                unsafe_allow_html=True,
-            )
-            lookup_value = (
-                f"{fmt(estimated_sprint_speed)} ft/s"
-                if pd.notna(estimated_sprint_speed) else "—"
-            )
-            st.markdown(
-                f"<div class='lookup-value' style='color:#0D7E8A;'>"
-                f"{lookup_value}</div>",
+                f"<div class='lookup-value' style='color:#0D7E8A;'>{lookup_value}</div>",
                 unsafe_allow_html=True,
             )
         st.number_input(
@@ -8089,7 +7975,7 @@ with sprint_overview_tab:
 
     with st.container(border=True):
         st.subheader(
-            f"{sprint_power_band_stat} Monthly Max Sprint Speed by Peak Power / BM Band",
+            f"{sprint_power_band_stat} Sprint Speed by Peak Power / BM Band",
             anchor=False,
         )
         st.plotly_chart(
@@ -8117,7 +8003,6 @@ with sprint_overview_tab:
                 key="sprint_power_band_stat",
             )
 
-
     with st.container(border=True):
         st.subheader("Average Peak Power / BM by Sprint Speed Bucket", anchor=False)
         st.plotly_chart(
@@ -8128,8 +8013,8 @@ with sprint_overview_tab:
                 bucket_width=SPRINT_SPEED_OUTPUT_BUCKET_WIDTH,
                 output_bucket_label="Sprint speed bucket",
                 testing_metric_label="peak power / BM",
-                output_axis_title="Monthly max sprint speed bucket",
-                testing_axis_title="Average peak power / BM (W/kg)",
+                output_axis_title="Baserunning Sprint Speed bucket",
+                testing_axis_title="Average Peak Power / BM (W/kg)",
                 output_unit="ft/s",
                 empty_text="No matched players are available for sprint-speed buckets.",
                 color=TEAL,
@@ -8138,7 +8023,6 @@ with sprint_overview_tab:
             config={"displayModeBar": False},
             key=f"sprint_output_bucket_{team_filter}_{start_date}_{end_date}",
         )
-
 
     sprint_output_bands = output_bucket_summary(
         sprint_overview_summary,
@@ -8174,7 +8058,7 @@ with sprint_overview_tab:
                     testing_axis_title="Average peak power / BM",
                     testing_unit="W/kg",
                     entity_label="Player",
-                    output_value_label="Monthly max sprint speed",
+                    output_value_label="Baserunning Sprint Speed",
                 ),
                 use_container_width=True,
                 config={"displayModeBar": False},
@@ -8182,10 +8066,7 @@ with sprint_overview_tab:
             )
 
     with st.container(border=True):
-        st.subheader(
-            "Final-Month Peak Power / BM vs Monthly Max Sprint Speed",
-            anchor=False,
-        )
+        st.subheader("Peak Power / BM vs Baserunning Sprint Speed", anchor=False)
         st.plotly_chart(
             build_sprint_scatter(
                 sprint_overview_summary,
@@ -8201,37 +8082,24 @@ with sprint_overview_tab:
         )
         st.checkbox("Show names", key="sprint_show_labels")
 
-    sprint_residuals = build_sprint_residual_summary(
-        sprint_overview_summary
-    )
+    sprint_residuals = build_sprint_residual_summary(sprint_overview_summary)
     with st.container(border=True):
         st.subheader("Relative Peak Power → Sprint Speed Residuals", anchor=False)
         if sprint_residuals.empty:
             st.info("Residuals could not be calculated for the current filters.")
         else:
-            sprint_residual_mae = float(
-                sprint_residuals["abs_sprint_speed_residual"].mean()
-            )
-            sprint_residual_rmse = float(np.sqrt(np.mean(
-                sprint_residuals["sprint_speed_residual"] ** 2
-            )))
-            sprint_positive = int(
-                (sprint_residuals["sprint_speed_residual"] > 0).sum()
-            )
-            sprint_negative = int(
-                (sprint_residuals["sprint_speed_residual"] < 0).sum()
-            )
+            sprint_residual_mae = float(sprint_residuals["abs_sprint_speed_residual"].mean())
+            sprint_residual_rmse = float(np.sqrt(np.mean(sprint_residuals["sprint_speed_residual"] ** 2)))
+            sprint_positive = int((sprint_residuals["sprint_speed_residual"] > 0).sum())
+            sprint_negative = int((sprint_residuals["sprint_speed_residual"] < 0).sum())
 
             residual_metric_cols = st.columns(4)
-            residual_metric_values = [
+            for column, values in zip(residual_metric_cols, [
                 ("Mean Absolute Residual", f"{sprint_residual_mae:.2f} ft/s", TEAL),
                 ("Residual RMSE", f"{sprint_residual_rmse:.2f} ft/s", NAVY_MID),
                 ("Faster Than Predicted", str(sprint_positive), GREEN),
                 ("Slower Than Predicted", str(sprint_negative), ACCENT_RED),
-            ]
-            for column, values in zip(
-                residual_metric_cols, residual_metric_values
-            ):
+            ]):
                 with column:
                     st.markdown(metric_card(*values), unsafe_allow_html=True)
 
@@ -8239,61 +8107,36 @@ with sprint_overview_tab:
                 build_sprint_residual_chart(sprint_overview_summary),
                 use_container_width=True,
                 config={"displayModeBar": False},
-                key=(
-                    f"sprint_residual_chart_{team_filter}_{start_date}_{end_date}_"
-                    f"{min_power_jumps}"
-                ),
+                key=f"sprint_residual_chart_{team_filter}_{start_date}_{end_date}_{min_power_jumps}",
             )
 
             sprint_residual_display = sprint_residuals[[
-                "athlete",
-                "team",
-                "month",
-                "avg_peak_power_rel",
-                "monthly_max_sprint_speed",
-                "predicted_sprint_speed",
-                "sprint_speed_residual",
-                "abs_sprint_speed_residual",
+                "athlete", "team", "avg_peak_power_rel",
+                "monthly_max_sprint_speed", "predicted_sprint_speed",
+                "sprint_speed_residual", "abs_sprint_speed_residual",
             ]].copy()
             sprint_residual_display.columns = [
-                "Player",
-                "Team",
-                "Month",
-                "Final-Month Avg Peak Power / BM",
-                "Actual Monthly Max Sprint Speed",
-                "Predicted Sprint Speed",
-                "Residual",
-                "Absolute Residual",
+                "Player", "Team", "Mean Peak Power / BM",
+                "Actual Sprint Speed", "Predicted Sprint Speed",
+                "Residual", "Absolute Residual",
             ]
-            sprint_residual_display["Month"] = (
-                pd.to_datetime(sprint_residual_display["Month"])
-                .dt.strftime("%b %Y")
-            )
             st.dataframe(
                 sprint_residual_display,
                 hide_index=True,
                 use_container_width=True,
-                height=min(
-                    660,
-                    44 + 36 * (len(sprint_residual_display) + 1),
-                ),
+                height=min(660, 44 + 36 * (len(sprint_residual_display) + 1)),
                 column_config={
-                    "Final-Month Avg Peak Power / BM":
-                        st.column_config.NumberColumn(format="%.2f W/kg"),
-                    "Actual Monthly Max Sprint Speed":
-                        st.column_config.NumberColumn(format="%.2f ft/s"),
-                    "Predicted Sprint Speed":
-                        st.column_config.NumberColumn(format="%.2f ft/s"),
-                    "Residual":
-                        st.column_config.NumberColumn(format="%+.2f ft/s"),
-                    "Absolute Residual":
-                        st.column_config.NumberColumn(format="%.2f ft/s"),
+                    "Mean Peak Power / BM": st.column_config.NumberColumn(format="%.2f W/kg"),
+                    "Actual Sprint Speed": st.column_config.NumberColumn(format="%.2f ft/s"),
+                    "Predicted Sprint Speed": st.column_config.NumberColumn(format="%.2f ft/s"),
+                    "Residual": st.column_config.NumberColumn(format="%+.2f ft/s"),
+                    "Absolute Residual": st.column_config.NumberColumn(format="%.2f ft/s"),
                 },
             )
             csv_download_button(
                 sprint_residual_display,
                 "Download sprint residuals CSV",
-                "relative_peak_power_sprint_speed_residuals.csv",
+                "relative_peak_power_baserunning_sprint_speed_residuals.csv",
                 "download_sprint_residuals",
             )
 
@@ -8303,69 +8146,31 @@ with sprint_overview_tab:
             st.info("No matching players.")
         else:
             sprint_display = sprint_overview_summary[[
-                "athlete",
-                "team",
-                "month",
-                "monthly_max_sprint_speed",
-                "sprint_speed_as_of",
-                "first_sprint_date",
-                "last_sprint_date",
-                "sprint_coverage_days",
-                "sprint_data_dates",
-                "avg_peak_power_rel",
-                "power_jumps",
-                "power_test_dates",
-                "first_power_date",
-                "last_power_date",
+                "athlete", "team", "monthly_max_sprint_speed",
+                "avg_peak_power_rel", "power_jumps", "power_test_dates",
+                "first_power_date", "last_power_date",
             ]].copy()
             sprint_display.columns = [
-                "Player",
-                "Team",
-                "Month",
-                "Monthly Max Sprint Speed",
-                "Sprint Speed As Of",
-                "First Sprint Record",
-                "Last Sprint Record",
-                "Sprint Coverage Days",
-                "Sprint Data Dates",
-                "Final-Month Avg Peak Power / BM",
-                "Jump Rows",
-                "Jump Test Dates",
-                "First Jump",
-                "Last Jump",
+                "Player", "Team", "Baserunning Sprint Speed",
+                "Mean Peak Power / BM", "Jump Rows", "Jump Test Dates",
+                "First Jump", "Last Jump",
             ]
-            sprint_display["Month"] = (
-                pd.to_datetime(sprint_display["Month"]).dt.strftime("%b %Y")
-            )
-            for date_col in [
-                "Sprint Speed As Of", "First Sprint Record",
-                "Last Sprint Record", "First Jump", "Last Jump"
-            ]:
+            for date_col in ["First Jump", "Last Jump"]:
                 sprint_display[date_col] = sprint_display[date_col].map(fmt_date)
-            sprint_display["Monthly Max Sprint Speed"] = (
-                sprint_display["Monthly Max Sprint Speed"].round(2)
-            )
-            sprint_display["Final-Month Avg Peak Power / BM"] = (
-                sprint_display["Final-Month Avg Peak Power / BM"].round(2)
-            )
             st.dataframe(
                 sprint_display,
                 hide_index=True,
                 use_container_width=True,
                 height=min(660, 44 + 36 * (len(sprint_display) + 1)),
                 column_config={
-                    "Monthly Max Sprint Speed": st.column_config.NumberColumn(
-                        format="%.2f ft/s"
-                    ),
-                    "Final-Month Avg Peak Power / BM": st.column_config.NumberColumn(
-                        format="%.2f W/kg"
-                    ),
+                    "Baserunning Sprint Speed": st.column_config.NumberColumn(format="%.2f ft/s"),
+                    "Mean Peak Power / BM": st.column_config.NumberColumn(format="%.2f W/kg"),
                 },
             )
             csv_download_button(
                 sprint_display,
                 "Download sprint results CSV",
-                "sprint_speed_results.csv",
+                "relative_peak_power_baserunning_sprint_speed_results.csv",
                 "download_sprint_speed_results",
             )
 
@@ -8996,34 +8801,8 @@ with if_reaction_power_tab:
         default_bucket_width=0.05,
     )
 
-with nbsr_power_tab:
-    render_selected_peak_power_rel_tab(
-        nbsr_power_summary,
-        outcome_col="nbsr",
-        outcome_label="nBSR",
-        outcome_unit="runs",
-        tab_key="nbsr_peak_power_rel",
-        default_lookup=60.0,
-        default_bucket_width=1.0,
-    )
-
-
 with sprint_nbsr_tab:
     render_sprint_nbsr_tab(sprint_nbsr_summary)
-
-with sprint_power_nbsr_model_tab:
-    render_sprint_power_nbsr_model_tab(sprint_power_nbsr_model_summary)
-
-with adv_runs_power_tab:
-    render_selected_peak_power_rel_tab(
-        adv_runs_power_summary,
-        outcome_col="adv_runs",
-        outcome_label="Adv Runs",
-        outcome_unit="runs",
-        tab_key="adv_runs_peak_power_rel",
-        default_lookup=60.0,
-        default_bucket_width=0.5,
-    )
 
 with sprint_adv_runs_tab:
     render_sprint_outcome_tab(
