@@ -85,7 +85,7 @@ st.set_page_config(
     page_title="Performance × CI",
     page_icon="⚾",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 st.markdown(
@@ -97,6 +97,7 @@ st.markdown(
       --fb-sub: {SUBTEXT}; --fb-border: {BORDER};
     }}
     .stApp {{ background: var(--fb-bg); color: var(--fb-text); }}
+    [data-testid="stSidebar"], [data-testid="collapsedControl"] {{ display: none !important; }}
     .block-container {{ max-width: 1540px; padding-top: 2.15rem; padding-bottom: 3rem; }}
     h1, h2, h3 {{ letter-spacing: -0.025em; }}
 
@@ -1165,51 +1166,42 @@ def output_bucket_summary(
     testing_metric_label: str,
     output_unit: str,
     testing_unit: str,
+    testing_stat: str = "Mean",
 ) -> pd.DataFrame:
-    """Summarize the average testing metric within buckets of the output metric."""
+    """Summarize the mean or median testing metric within output-metric buckets."""
+    stat = "Median" if str(testing_stat).strip().lower() == "median" else "Mean"
+    value_col = f"{stat} {testing_metric_label}"
+    output_avg_col = f"Average {output_bucket_label}"
     cols = [output_col, testing_col]
+    empty_columns = [output_bucket_label, value_col, "Observations", output_avg_col]
     if df.empty or any(col not in df.columns for col in cols):
-        return pd.DataFrame(columns=[
-            output_bucket_label,
-            f"Average {testing_metric_label}",
-            "Observations",
-            f"Average {output_bucket_label}",
-        ])
+        return pd.DataFrame(columns=empty_columns)
 
     width = max(float(bucket_width), 1e-9)
     work = df[cols].dropna().copy()
     if work.empty:
-        return pd.DataFrame(columns=[
-            output_bucket_label,
-            f"Average {testing_metric_label}",
-            "Observations",
-            f"Average {output_bucket_label}",
-        ])
+        return pd.DataFrame(columns=empty_columns)
 
     work["band_start"] = np.floor(work[output_col] / width) * width
-    # Hitting bat-speed buckets start with one <62 mph bucket.
     if output_col == "monthly_avg_bat_speed":
         work.loc[work[output_col] < BAT_SPEED_OUTPUT_BUCKET_FLOOR, "band_start"] = (
             BAT_SPEED_OUTPUT_BUCKET_FLOOR - width
         )
-    # Hitting P90 exit-velo buckets start with one <96 mph bucket.
     if output_col == "p90_exit_velo":
         work.loc[work[output_col] < EXIT_VELO_OUTPUT_BUCKET_FLOOR, "band_start"] = (
             EXIT_VELO_OUTPUT_BUCKET_FLOOR - width
         )
-    # Pitcher FB-velo output buckets top out at 98+. Keep all other
-    # output metrics on their normal uncapped bucket scale.
     if output_col == "avg_fb_velo":
-        work["band_start"] = np.minimum(
-            work["band_start"], FB_VELO_OUTPUT_BUCKET_TOP
-        )
+        work["band_start"] = np.minimum(work["band_start"], FB_VELO_OUTPUT_BUCKET_TOP)
+
+    agg_func = "median" if stat == "Median" else "mean"
     grouped = (
         work.groupby("band_start", as_index=False)
         .agg(
             **{
-                f"Average {testing_metric_label}": (testing_col, "mean"),
+                value_col: (testing_col, agg_func),
                 "Observations": (testing_col, "count"),
-                f"Average {output_bucket_label}": (output_col, "mean"),
+                output_avg_col: (output_col, "mean"),
             }
         )
         .sort_values("band_start")
@@ -1229,15 +1221,10 @@ def output_bucket_summary(
         return f"{lower:.1f}–{upper:.1f} {output_unit}"
 
     grouped[output_bucket_label] = grouped["band_start"].map(_fmt_bucket)
-    grouped[f"Average {testing_metric_label}"] = grouped[f"Average {testing_metric_label}"].round(2)
-    grouped[f"Average {output_bucket_label}"] = grouped[f"Average {output_bucket_label}"].round(2)
+    grouped[value_col] = grouped[value_col].round(2)
+    grouped[output_avg_col] = grouped[output_avg_col].round(2)
     grouped["Observations"] = grouped["Observations"].astype(int)
-    return grouped[[
-        output_bucket_label,
-        f"Average {testing_metric_label}",
-        "Observations",
-        f"Average {output_bucket_label}",
-    ]]
+    return grouped[[output_bucket_label, value_col, "Observations", output_avg_col]]
 
 
 def build_output_bucket_chart(
@@ -1252,7 +1239,9 @@ def build_output_bucket_chart(
     output_unit: str,
     empty_text: str,
     color: str = BLUE,
+    testing_stat: str = "Mean",
 ) -> go.Figure:
+    stat = "Median" if str(testing_stat).strip().lower() == "median" else "Mean"
     bands = output_bucket_summary(
         df=df,
         output_col=output_col,
@@ -1262,8 +1251,9 @@ def build_output_bucket_chart(
         testing_metric_label=testing_metric_label,
         output_unit=output_unit,
         testing_unit="",
+        testing_stat=stat,
     )
-    value_col = f"Average {testing_metric_label}"
+    value_col = f"{stat} {testing_metric_label}"
     output_avg_col = f"Average {output_bucket_label}"
 
     fig = go.Figure()
@@ -1272,10 +1262,7 @@ def build_output_bucket_chart(
             text=empty_text,
             showarrow=False,
             font={"size": 14, "color": SUBTEXT},
-            x=0.5,
-            y=0.5,
-            xref="paper",
-            yref="paper",
+            x=0.5, y=0.5, xref="paper", yref="paper",
         )
         fig.update_xaxes(visible=False)
         fig.update_yaxes(visible=False)
@@ -1290,7 +1277,7 @@ def build_output_bucket_chart(
         cliponaxis=False,
         customdata=np.column_stack([bands["Observations"], bands[output_avg_col]]),
         hovertemplate=(
-            f"<b>%{{x}}</b><br>Average {testing_metric_label}: %{{y:.2f}}<br>"
+            f"<b>%{{x}}</b><br>{stat} {testing_metric_label}: %{{y:.2f}}<br>"
             "Observations: %{customdata[0]}<br>"
             f"Mean {output_axis_title.lower()}: %{{customdata[1]:.2f}} {output_unit}<extra></extra>"
         ),
@@ -1298,20 +1285,12 @@ def build_output_bucket_chart(
     y_min = max(0, float(bands[value_col].min()) - 1.5)
     y_max = float(bands[value_col].max()) + 1.25
     fig.update_xaxes(
-        title=output_axis_title,
-        showgrid=False,
-        linecolor=BORDER,
-        tickfont={"color": SUBTEXT},
-        title_font={"color": SUBTEXT},
+        title=output_axis_title, showgrid=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
     )
     fig.update_yaxes(
-        title=testing_axis_title,
-        range=[y_min, y_max],
-        showgrid=True,
-        gridcolor=GRID,
-        zeroline=False,
-        linecolor=BORDER,
-        tickfont={"color": SUBTEXT},
+        title=testing_axis_title, range=[y_min, y_max], showgrid=True, gridcolor=GRID,
+        zeroline=False, linecolor=BORDER, tickfont={"color": SUBTEXT},
         title_font={"color": SUBTEXT},
     )
     return base_figure_layout(fig, 380)
@@ -1327,18 +1306,20 @@ def output_bucket_members(
     output_unit: str,
     entity_col: str = "athlete",
     team_col: str = "team",
-) -> tuple[pd.DataFrame, float]:
-    """Return athletes in one output bucket and flag testing values versus the bucket mean."""
+    testing_stat: str = "Mean",
+) -> tuple[pd.DataFrame, float, str]:
+    """Return athletes in one output bucket and compare testing values with mean/median."""
+    stat = "Median" if str(testing_stat).strip().lower() == "median" else "Mean"
     required = [entity_col, output_col, testing_col]
     columns = required + [team_col, output_bucket_label, "Difference", "Status", "Display"]
     if df.empty or any(col not in df.columns for col in required):
-        return pd.DataFrame(columns=columns), np.nan
+        return pd.DataFrame(columns=columns), np.nan, stat
 
     width = max(float(bucket_width), 1e-9)
     work_cols = list(dict.fromkeys(required + ([team_col] if team_col in df.columns else [])))
     detail = df[work_cols].dropna(subset=required).copy()
     if detail.empty:
-        return pd.DataFrame(columns=columns), np.nan
+        return pd.DataFrame(columns=columns), np.nan, stat
 
     detail["band_start"] = np.floor(detail[output_col] / width) * width
     if output_col == "monthly_avg_bat_speed":
@@ -1350,9 +1331,7 @@ def output_bucket_members(
             EXIT_VELO_OUTPUT_BUCKET_FLOOR - width
         )
     if output_col == "avg_fb_velo":
-        detail["band_start"] = np.minimum(
-            detail["band_start"], FB_VELO_OUTPUT_BUCKET_TOP
-        )
+        detail["band_start"] = np.minimum(detail["band_start"], FB_VELO_OUTPUT_BUCKET_TOP)
 
     def _fmt_bucket(lower: float) -> str:
         if output_col == "monthly_avg_bat_speed" and lower < BAT_SPEED_OUTPUT_BUCKET_FLOOR:
@@ -1369,27 +1348,31 @@ def output_bucket_members(
     detail[output_bucket_label] = detail["band_start"].map(_fmt_bucket)
     detail = detail[detail[output_bucket_label] == selected_bucket].copy()
     if detail.empty:
-        return detail, np.nan
+        return detail, np.nan, stat
 
     if team_col not in detail.columns:
         detail[team_col] = "Unassigned"
     detail[team_col] = detail[team_col].fillna("Unassigned")
 
-    reference = float(detail[testing_col].mean())
+    reference = (
+        float(detail[testing_col].median())
+        if stat == "Median"
+        else float(detail[testing_col].mean())
+    )
     detail["Difference"] = detail[testing_col] - reference
     detail["Status"] = np.where(
         np.isclose(detail["Difference"], 0, atol=1e-10),
-        "At mean",
-        np.where(detail["Difference"] > 0, "Above mean", "Below mean"),
+        f"At {stat.lower()}",
+        np.where(
+            detail["Difference"] > 0,
+            f"Above {stat.lower()}",
+            f"Below {stat.lower()}",
+        ),
     )
     detail["Display"] = detail.apply(
-        lambda row: f"{row[entity_col]} · {row[output_col]:.1f} {output_unit}",
-        axis=1,
+        lambda row: f"{row[entity_col]} · {row[output_col]:.1f} {output_unit}", axis=1,
     )
-    return (
-        detail.sort_values(testing_col, ascending=False).reset_index(drop=True),
-        reference,
-    )
+    return detail.sort_values(testing_col, ascending=False).reset_index(drop=True), reference, stat
 
 
 def build_output_bucket_member_chart(
@@ -1406,39 +1389,29 @@ def build_output_bucket_member_chart(
     output_value_label: str,
     entity_col: str = "athlete",
     team_col: str = "team",
+    testing_stat: str = "Mean",
 ) -> go.Figure:
-    """Horizontal athlete chart for one output bucket, using the testing metric as bars."""
-    detail, reference = output_bucket_members(
-        df=df,
-        output_col=output_col,
-        testing_col=testing_col,
-        bucket_width=bucket_width,
-        selected_bucket=selected_bucket,
-        output_bucket_label=output_bucket_label,
-        output_unit=output_unit,
-        entity_col=entity_col,
-        team_col=team_col,
+    """Horizontal athlete chart for one output bucket, using mean/median reference."""
+    detail, reference, stat = output_bucket_members(
+        df=df, output_col=output_col, testing_col=testing_col, bucket_width=bucket_width,
+        selected_bucket=selected_bucket, output_bucket_label=output_bucket_label,
+        output_unit=output_unit, entity_col=entity_col, team_col=team_col, testing_stat=testing_stat,
     )
     fig = go.Figure()
 
     if detail.empty:
         fig.add_annotation(
-            text="No athletes are available in this output bucket.",
-            showarrow=False,
-            font={"size": 14, "color": SUBTEXT},
-            x=0.5,
-            y=0.5,
-            xref="paper",
-            yref="paper",
+            text="No athletes are available in this output bucket.", showarrow=False,
+            font={"size": 14, "color": SUBTEXT}, x=0.5, y=0.5, xref="paper", yref="paper",
         )
         fig.update_xaxes(visible=False)
         fig.update_yaxes(visible=False)
         return base_figure_layout(fig, 340)
 
     status_style = [
-        ("Above mean", GREEN),
-        ("At mean", TEAL),
-        ("Below mean", ACCENT_RED),
+        (f"Above {stat.lower()}", GREEN),
+        (f"At {stat.lower()}", TEAL),
+        (f"Below {stat.lower()}", ACCENT_RED),
     ]
     category_order = detail["Display"].tolist()
 
@@ -1447,28 +1420,19 @@ def build_output_bucket_member_chart(
         if sub.empty:
             continue
         customdata = np.column_stack([
-            sub[entity_col],
-            sub[team_col],
-            sub[output_col],
-            sub["Difference"],
-            sub["Status"],
+            sub[entity_col], sub[team_col], sub[output_col], sub["Difference"], sub["Status"],
         ])
         fig.add_trace(go.Bar(
-            x=sub[testing_col],
-            y=sub["Display"],
-            orientation="h",
-            name=status.title(),
+            x=sub[testing_col], y=sub["Display"], orientation="h", name=status.title(),
             marker={"color": color, "line": {"color": "#FFFFFF", "width": 1}},
-            text=[f"{value:.2f}" for value in sub[testing_col]],
-            textposition="outside",
-            cliponaxis=False,
-            customdata=customdata,
+            text=[f"{value:.2f}" for value in sub[testing_col]], textposition="outside",
+            cliponaxis=False, customdata=customdata,
             hovertemplate=(
                 "<b>%{customdata[0]}</b><br>"
                 "Team: %{customdata[1]}<br>"
                 f"{output_value_label}: %{{customdata[2]:.2f}} {output_unit}<br>"
                 f"{testing_axis_title}: %{{x:.2f}} {testing_unit}<br>"
-                "Difference from bucket mean: %{customdata[3]:+.2f}<br>"
+                f"Difference from bucket {stat.lower()}: %{{customdata[3]:+.2f}}<br>"
                 "Flag: %{customdata[4]}<extra></extra>"
             ),
         ))
@@ -1482,43 +1446,27 @@ def build_output_bucket_member_chart(
     x_max = data_max + pad
 
     fig.add_vline(
-        x=reference,
-        line_color=NAVY_MID,
-        line_width=2,
-        line_dash="dash",
-        annotation_text=f"Mean {reference:.2f}",
-        annotation_font_color=NAVY_MID,
+        x=reference, line_color=NAVY_MID, line_width=2, line_dash="dash",
+        annotation_text=f"{stat} {reference:.2f}", annotation_font_color=NAVY_MID,
         annotation_position="top right",
     )
     fig.update_xaxes(
-        title=testing_axis_title,
-        range=[x_min, x_max],
-        showgrid=True,
-        gridcolor=GRID,
-        zeroline=False,
-        linecolor=BORDER,
-        tickfont={"color": SUBTEXT},
+        title=testing_axis_title, range=[x_min, x_max], showgrid=True, gridcolor=GRID,
+        zeroline=False, linecolor=BORDER, tickfont={"color": SUBTEXT},
         title_font={"color": SUBTEXT},
     )
     fig.update_yaxes(
-        title=f"{entity_label} · {output_value_label}",
-        categoryorder="array",
-        categoryarray=category_order,
-        autorange="reversed",
-        showgrid=False,
-        linecolor=BORDER,
-        tickfont={"color": TEXT, "size": 12},
-        title_font={"color": SUBTEXT},
-        automargin=True,
+        title=f"{entity_label} · {output_value_label}", categoryorder="array",
+        categoryarray=category_order, autorange="reversed", showgrid=False, linecolor=BORDER,
+        tickfont={"color": TEXT, "size": 12}, title_font={"color": SUBTEXT}, automargin=True,
     )
     fig = base_figure_layout(fig, max(340, len(detail) * 42 + 125))
     fig.update_layout(
         showlegend=True,
         legend={"orientation": "h", "x": 0, "y": 1.14, "font": {"color": SUBTEXT}},
-        margin={"l": 220, "r": 80, "t": 50, "b": 58},
+        margin={"l": 210, "r": 80, "t": 50, "b": 58},
     )
     return fig
-
 
 def fisher_mean_correlation(values: pd.Series) -> float:
     """Average correlations on Fisher's z scale rather than raw r."""
@@ -5729,10 +5677,17 @@ def require_password() -> None:
 # -----------------------------------------------------------------------------
 require_password()
 
-with st.sidebar:
-    st.markdown("<div style='height:4px;width:42px;border-radius:999px;background:#C8102E;margin:2px 0 16px;'></div>", unsafe_allow_html=True)
-    st.markdown("<h2 style='color:#FFFFFF;margin:0 0 18px;font-size:27px;letter-spacing:-.03em;'>Performance × CI</h2>", unsafe_allow_html=True)
-    refresh = st.button("↻ Refresh", use_container_width=True, type="primary")
+# The dashboard intentionally has no sidebar. Global data filters stay compact at
+# the top of the page; chart-specific controls are rendered directly below the
+# chart or lookup card they affect.
+title_col, refresh_col = st.columns([5, 1])
+with title_col:
+    st.markdown(
+        "<h1 style='margin:0;color:#0A1F44;font-size:37px;font-weight:800;'>Performance × CI</h1>",
+        unsafe_allow_html=True,
+    )
+with refresh_col:
+    refresh = st.button("↻ Refresh data", use_container_width=True, type="primary")
 
 if refresh:
     load_source_data.clear()
@@ -5751,106 +5706,89 @@ min_date = all_dates.min().date()
 max_date = all_dates.max().date()
 default_start = max(pd.Timestamp(year=max_date.year, month=1, day=1).date(), min_date)
 
-with st.sidebar:
-    selected_dates = st.date_input(
-        "Date range",
-        value=(default_start, max_date),
-        min_value=min_date,
-        max_value=max_date,
-    )
-    if isinstance(selected_dates, tuple) and len(selected_dates) == 2:
-        start_date, end_date = selected_dates
-    else:
-        start_date = end_date = selected_dates
+available_teams = (
+    set(jump["team"].dropna().unique().tolist())
+    | set(jump_power["team"].dropna().unique().tolist())
+    | set(bat["team"].dropna().unique().tolist())
+    | set(pinch["team"].dropna().unique().tolist())
+    | set(sprint["team"].dropna().unique().tolist())
+    | set(exit_velo["team"].dropna().unique().tolist())
+)
+teams = ["All Teams"] + [team for team in INCLUDED_TEAMS if team in available_teams]
 
-    available_teams = (
-        set(jump["team"].dropna().unique().tolist())
-        | set(jump_power["team"].dropna().unique().tolist())
-        | set(bat["team"].dropna().unique().tolist())
-        | set(pinch["team"].dropna().unique().tolist())
-        | set(sprint["team"].dropna().unique().tolist())
-        | set(exit_velo["team"].dropna().unique().tolist())
-    )
-    teams = ["All Teams"] + [team for team in INCLUDED_TEAMS if team in available_teams]
-    team_filter = st.selectbox("Team", teams)
+with st.container(border=True):
+    filter_date_col, filter_team_col = st.columns([2, 1])
+    with filter_date_col:
+        selected_dates = st.date_input(
+            "Date range",
+            value=(default_start, max_date),
+            min_value=min_date,
+            max_value=max_date,
+            key="global_date_range",
+        )
+        if isinstance(selected_dates, tuple) and len(selected_dates) == 2:
+            start_date, end_date = selected_dates
+        else:
+            start_date = end_date = selected_dates
+    with filter_team_col:
+        team_filter = st.selectbox("Team", teams, key="global_team_filter")
 
-    st.markdown("---")
-    ci_lookup = st.number_input("CI lookup", min_value=0.0, step=1.0, value=280.0, format="%.1f")
-    ci_band_width = st.selectbox("CI band", [5, 10, 15, 20], index=1, format_func=lambda x: f"{x} N·s")
-    ci_band_velo_stat = st.selectbox(
-        "CI band FB velo",
-        ["Mean", "Median"],
-        index=0,
-        key="ci_band_fb_velo_stat",
-    )
-    pinch_lookup = st.number_input(
-        "Pinch lookup", min_value=0.0, step=1.0, value=40.0, format="%.1f"
-    )
-    pinch_band_width = st.selectbox(
-        "Pinch band", [2.5, 5.0, 10.0], index=1,
-        format_func=lambda x: f"{x:g} units",
-    )
-    pinch_band_velo_stat = st.selectbox(
-        "Pinch band FB velo",
-        ["Mean", "Median"],
-        index=0,
-        key="pinch_band_fb_velo_stat",
-    )
-    ci_band_bat_stat = st.selectbox(
-        "CI band bat speed",
-        ["Mean", "Median"],
-        index=0,
-        key="ci_band_bat_speed_stat",
-    )
-    ci_band_exit_stat = st.selectbox(
-        "CI band P90 exit velo",
-        ["Mean", "Median"],
-        index=0,
-        key="ci_band_p90_exit_velo_stat",
-    )
-    power_lookup = st.number_input(
-        "Peak Power / BM lookup",
-        min_value=0.0, step=1.0, value=60.0, format="%.1f",
-    )
-    power_band_width = st.selectbox(
-        "Peak Power / BM band",
-        [1.0, 2.0, 2.5, 5.0],
-        index=2,
-        format_func=lambda x: f"{x:g} W/kg",
-    )
-    power_band_sprint_stat = st.selectbox(
-        "Power band sprint speed",
-        ["Mean", "Median"],
-        index=0,
-        key="power_band_sprint_speed_stat",
-    )
-    pitch_power_lookup = st.number_input(
-        "Peak Power [W] lookup",
-        min_value=0.0, step=100.0, value=5000.0, format="%.0f",
-    )
-    pitch_power_band_width = st.selectbox(
-        "Peak Power [W] band",
-        [100.0, 250.0, 500.0, 1000.0],
-        index=1,
-        format_func=lambda x: f"{x:g} W",
-    )
-    power_band_velo_stat = st.selectbox(
-        "Peak Power band FB velo",
-        ["Mean", "Median"],
-        index=0,
-        key="power_band_fb_velo_stat",
-    )
+    with st.expander("Data requirements", expanded=False):
+        req1, req2, req3, req4 = st.columns(4)
+        with req1:
+            min_velo_records = st.number_input(
+                "Min FB records", min_value=1, step=1, value=1, key="global_min_velo_records"
+            )
+        with req2:
+            min_ci_jumps = st.number_input(
+                "Min CI jumps", min_value=1, step=1, value=1, key="global_min_ci_jumps"
+            )
+        with req3:
+            min_pinch_tests = st.number_input(
+                "Min pinch tests", min_value=1, step=1, value=1, key="global_min_pinch_tests"
+            )
+        with req4:
+            min_power_jumps = st.number_input(
+                "Min power jumps", min_value=1, step=1, value=1, key="global_min_power_jumps"
+            )
 
-    st.markdown("---")
-    min_velo_records = st.number_input("Min FB records", min_value=1, step=1, value=1)
-    min_ci_jumps = st.number_input("Min CI jumps", min_value=1, step=1, value=1)
-    min_pinch_tests = st.number_input("Min pinch tests", min_value=1, step=1, value=1)
-    min_power_jumps = st.number_input(
-        "Min power jumps", min_value=1, step=1, value=1
-    )
-    show_labels = st.checkbox("Show names")
+# Read chart-control state before building figures. The widgets themselves are
+# intentionally placed below their associated charts; Streamlit updates session
+# state before the rerun, so the new value is already available here.
+fb_ci_lookup = float(st.session_state.get("fb_ci_lookup", 280.0))
+fb_ci_band_width = int(st.session_state.get("fb_ci_band_width", 10))
+fb_ci_band_velo_stat = st.session_state.get("fb_ci_band_velo_stat", "Mean")
+fb_velo_bucket_ci_stat = st.session_state.get("fb_velo_bucket_ci_stat", "Mean")
+fb_show_labels = bool(st.session_state.get("fb_show_labels", False))
 
+pinch_tab_lookup = float(st.session_state.get("pinch_tab_lookup", 40.0))
+pinch_tab_band_width = float(st.session_state.get("pinch_tab_band_width", 5.0))
+pinch_tab_band_velo_stat = st.session_state.get("pinch_tab_band_velo_stat", "Mean")
+pinch_show_labels = bool(st.session_state.get("pinch_show_labels", False))
 
+pitch_power_tab_lookup = float(st.session_state.get("pitch_power_tab_lookup", 5000.0))
+pitch_power_tab_band_width = float(st.session_state.get("pitch_power_tab_band_width", 250.0))
+pitch_power_tab_band_velo_stat = st.session_state.get("pitch_power_tab_band_velo_stat", "Mean")
+pitch_power_show_labels = bool(st.session_state.get("pitch_power_show_labels", False))
+
+combined_ci_lookup = float(st.session_state.get("combined_ci_lookup", 280.0))
+combined_pinch_lookup = float(st.session_state.get("combined_pinch_lookup", 40.0))
+combined_show_labels = bool(st.session_state.get("combined_show_labels", False))
+
+sprint_power_lookup = float(st.session_state.get("sprint_power_lookup", 60.0))
+sprint_power_band_width = float(st.session_state.get("sprint_power_band_width", 2.5))
+sprint_power_band_stat = st.session_state.get("sprint_power_band_stat", "Mean")
+sprint_show_labels = bool(st.session_state.get("sprint_show_labels", False))
+
+bat_ci_lookup = float(st.session_state.get("bat_ci_lookup", 280.0))
+bat_ci_band_width = int(st.session_state.get("bat_ci_band_width", 10))
+bat_ci_band_stat = st.session_state.get("bat_ci_band_stat", "Mean")
+bat_show_labels = bool(st.session_state.get("bat_show_labels", False))
+
+exit_ci_lookup = float(st.session_state.get("exit_ci_lookup", 280.0))
+exit_ci_band_width = int(st.session_state.get("exit_ci_band_width", 10))
+exit_ci_band_stat = st.session_state.get("exit_ci_band_stat", "Mean")
+exit_show_labels = bool(st.session_state.get("exit_show_labels", False))
 
 summary = build_summary(
     jump=jump,
@@ -5911,15 +5849,11 @@ exit_velo_summary = build_exit_velo_summary(
     min_ci_jumps=int(min_ci_jumps),
 )
 period_text = f"{fmt_date(start_date)} – {fmt_date(end_date)}"
-title_col, filter_col = st.columns([4, 1])
-with title_col:
-    st.markdown("<h1 style='margin:0;color:#0A1F44;font-size:37px;font-weight:800;'>Performance × CI</h1>", unsafe_allow_html=True)
-with filter_col:
-    st.markdown(
-        f"<div style='text-align:right;color:#667085;font-weight:700;font-size:13px;padding-top:13px;'>{html.escape(team_filter)}</div>",
-        unsafe_allow_html=True,
-    )
-st.markdown(f"<div style='color:#667085;font-size:13px;margin:3px 0 20px;'>{html.escape(period_text)}</div>", unsafe_allow_html=True)
+st.markdown(
+    f"<div style='color:#667085;font-size:13px;margin:8px 0 18px;'>"
+    f"{html.escape(team_filter)} · {html.escape(period_text)} · {html.escape(status)}</div>",
+    unsafe_allow_html=True,
+)
 
 (
     overview_tab,
@@ -5981,33 +5915,48 @@ with overview_tab:
 
     estimated_velo = np.nan
     if stats is not None:
-        estimated_velo = stats[2] * float(ci_lookup) + stats[3]
+        estimated_velo = stats[2] * float(fb_ci_lookup) + stats[3]
 
     with st.container(border=True):
         st.subheader("CI Lookup", anchor=False)
         lookup_left, lookup_right = st.columns(2)
         with lookup_left:
             st.markdown("<div class='metric-label'>Average CI</div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='lookup-value' style='color:#0A1F44;'>{fmt(ci_lookup, 1)} N·s</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='lookup-value' style='color:#0A1F44;'>{fmt(fb_ci_lookup, 1)} N·s</div>", unsafe_allow_html=True)
         with lookup_right:
             st.markdown("<div class='metric-label'>Estimated FB Velo</div>", unsafe_allow_html=True)
             lookup_value = f"{fmt(estimated_velo)} mph" if pd.notna(estimated_velo) else "—"
             st.markdown(f"<div class='lookup-value' style='color:#0D7E8A;'>{lookup_value}</div>", unsafe_allow_html=True)
-
-    ci_band_overview = ci_band_summary(summary, int(ci_band_width), ci_band_velo_stat)
-
-    with st.container(border=True):
-        st.subheader(f"{ci_band_velo_stat} FB Velo by CI Band", anchor=False)
-        st.plotly_chart(
-            build_band_chart(summary, int(ci_band_width), ci_band_velo_stat),
-            use_container_width=True,
-            config={"displayModeBar": False},
-            key=f"ci_band_chart_{ci_band_width}_{ci_band_velo_stat}_{team_filter}_{start_date}_{end_date}",
+        st.number_input(
+            "CI lookup", min_value=0.0, step=1.0, value=280.0,
+            format="%.1f", key="fb_ci_lookup",
         )
 
+    ci_band_overview = ci_band_summary(summary, int(fb_ci_band_width), fb_ci_band_velo_stat)
 
     with st.container(border=True):
-        st.subheader("Average CI by FB Velo Bucket", anchor=False)
+        st.subheader(f"{fb_ci_band_velo_stat} FB Velo by CI Band", anchor=False)
+        st.plotly_chart(
+            build_band_chart(summary, int(fb_ci_band_width), fb_ci_band_velo_stat),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"ci_band_chart_{fb_ci_band_width}_{fb_ci_band_velo_stat}_{team_filter}_{start_date}_{end_date}",
+        )
+        band_control_1, band_control_2 = st.columns(2)
+        with band_control_1:
+            st.selectbox(
+                "CI band width", [5, 10, 15, 20], index=1,
+                format_func=lambda x: f"{x} N·s", key="fb_ci_band_width",
+            )
+        with band_control_2:
+            st.radio(
+                "FB velo statistic", ["Mean", "Median"], horizontal=True,
+                key="fb_ci_band_velo_stat",
+            )
+
+
+    with st.container(border=True):
+        st.subheader(f"{fb_velo_bucket_ci_stat} CI by FB Velo Bucket", anchor=False)
         st.plotly_chart(
             build_output_bucket_chart(
                 df=summary,
@@ -6017,14 +5966,23 @@ with overview_tab:
                 output_bucket_label="FB velo bucket",
                 testing_metric_label="CI",
                 output_axis_title="Last YTD FB velo bucket",
-                testing_axis_title="Average CI (N·s)",
+                testing_axis_title=f"{fb_velo_bucket_ci_stat} CI (N·s)",
                 output_unit="mph",
                 empty_text="No matched pitchers are available for FB velo buckets.",
                 color=TEAL,
+                testing_stat=fb_velo_bucket_ci_stat,
             ),
             use_container_width=True,
             config={"displayModeBar": False},
-            key=f"fb_velo_output_bucket_{team_filter}_{start_date}_{end_date}",
+            key=(
+                f"fb_velo_output_bucket_{fb_velo_bucket_ci_stat}_"
+                f"{team_filter}_{start_date}_{end_date}"
+            ),
+        )
+        st.radio(
+            "CI statistic", ["Mean", "Median"], horizontal=True,
+            key="fb_velo_bucket_ci_stat",
+            help="Choose whether each FB-velocity bucket displays mean or median pitcher CI.",
         )
 
 
@@ -6037,6 +5995,7 @@ with overview_tab:
         "CI",
         "mph",
         "N·s",
+        testing_stat=fb_velo_bucket_ci_stat,
     )
     if not fb_output_bands.empty:
         fb_output_options = fb_output_bands["FB velo bucket"].tolist()
@@ -6059,14 +6018,18 @@ with overview_tab:
                     selected_bucket=selected_fb_output_bucket,
                     output_bucket_label="FB velo bucket",
                     output_unit="mph",
-                    testing_axis_title="Average CI",
+                    testing_axis_title=f"{fb_velo_bucket_ci_stat} CI",
                     testing_unit="N·s",
                     entity_label="Pitcher",
                     output_value_label="Last YTD FB velo",
+                    testing_stat=fb_velo_bucket_ci_stat,
                 ),
                 use_container_width=True,
                 config={"displayModeBar": False},
-                key=f"fb_output_detail_{selected_fb_output_bucket}_{team_filter}_{start_date}_{end_date}",
+                key=(
+                    f"fb_output_detail_{selected_fb_output_bucket}_{fb_velo_bucket_ci_stat}_"
+                    f"{team_filter}_{start_date}_{end_date}"
+                ),
             )
 
     if not ci_band_overview.empty:
@@ -6085,21 +6048,22 @@ with overview_tab:
             st.plotly_chart(
                 build_ci_band_member_chart(
                     summary,
-                    int(ci_band_width),
+                    int(fb_ci_band_width),
                     selected_ci_band,
-                    ci_band_velo_stat,
+                    fb_ci_band_velo_stat,
                 ),
                 use_container_width=True,
                 config={"displayModeBar": False},
                 key=(
-                    f"ci_band_detail_{selected_ci_band}_{ci_band_width}_"
-                    f"{ci_band_velo_stat}_{team_filter}_{start_date}_{end_date}"
+                    f"ci_band_detail_{selected_ci_band}_{fb_ci_band_width}_"
+                    f"{fb_ci_band_velo_stat}_{team_filter}_{start_date}_{end_date}"
                 ),
             )
 
     with st.container(border=True):
         st.subheader("CI vs YTD FB Velo", anchor=False)
-        st.plotly_chart(build_scatter(summary, show_labels, float(ci_lookup)), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(build_scatter(summary, fb_show_labels, float(fb_ci_lookup)), use_container_width=True, config={"displayModeBar": False})
+        st.checkbox("Show names", key="fb_show_labels")
 
     with st.container(border=True):
         st.subheader("Pitcher Results", anchor=False)
@@ -6189,7 +6153,7 @@ with pinch_overview_tab:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
     estimated_pinch_velo = (
-        pinch_stats[2] * float(pinch_lookup) + pinch_stats[3]
+        pinch_stats[2] * float(pinch_tab_lookup) + pinch_stats[3]
         if pinch_stats is not None else np.nan
     )
     with st.container(border=True):
@@ -6202,7 +6166,7 @@ with pinch_overview_tab:
             )
             st.markdown(
                 f"<div class='lookup-value' style='color:#0A1F44;'>"
-                f"{fmt(pinch_lookup, 1)}</div>",
+                f"{fmt(pinch_tab_lookup, 1)}</div>",
                 unsafe_allow_html=True,
             )
         with lookup_right:
@@ -6219,30 +6183,45 @@ with pinch_overview_tab:
                 f"{lookup_value}</div>",
                 unsafe_allow_html=True,
             )
+        st.number_input(
+            "Pinch lookup", min_value=0.0, step=1.0, value=40.0,
+            format="%.1f", key="pinch_tab_lookup",
+        )
 
     pinch_band_overview = pinch_band_summary(
         pinch_view,
-        float(pinch_band_width),
-        pinch_band_velo_stat,
+        float(pinch_tab_band_width),
+        pinch_tab_band_velo_stat,
     )
     with st.container(border=True):
         st.subheader(
-            f"{pinch_band_velo_stat} FB Velo by Pinch Band",
+            f"{pinch_tab_band_velo_stat} FB Velo by Pinch Band",
             anchor=False,
         )
         st.plotly_chart(
             build_pinch_band_chart(
                 pinch_view,
-                float(pinch_band_width),
-                pinch_band_velo_stat,
+                float(pinch_tab_band_width),
+                pinch_tab_band_velo_stat,
             ),
             use_container_width=True,
             config={"displayModeBar": False},
             key=(
-                f"pinch_band_chart_{pinch_band_width}_"
-                f"{pinch_band_velo_stat}_{team_filter}_{start_date}_{end_date}"
+                f"pinch_band_chart_{pinch_tab_band_width}_"
+                f"{pinch_tab_band_velo_stat}_{team_filter}_{start_date}_{end_date}"
             ),
         )
+        pinch_control_1, pinch_control_2 = st.columns(2)
+        with pinch_control_1:
+            st.selectbox(
+                "Pinch band width", [2.5, 5.0, 10.0], index=1,
+                format_func=lambda x: f"{x:g} units", key="pinch_tab_band_width",
+            )
+        with pinch_control_2:
+            st.radio(
+                "FB velo statistic", ["Mean", "Median"], horizontal=True,
+                key="pinch_tab_band_velo_stat",
+            )
 
 
     with st.container(border=True):
@@ -6324,15 +6303,15 @@ with pinch_overview_tab:
             st.plotly_chart(
                 build_pinch_band_member_chart(
                     pinch_view,
-                    float(pinch_band_width),
+                    float(pinch_tab_band_width),
                     selected_pinch_band,
-                    pinch_band_velo_stat,
+                    pinch_tab_band_velo_stat,
                 ),
                 use_container_width=True,
                 config={"displayModeBar": False},
                 key=(
                     f"pinch_band_detail_{selected_pinch_band}_"
-                    f"{pinch_band_width}_{pinch_band_velo_stat}_"
+                    f"{pinch_tab_band_width}_{pinch_tab_band_velo_stat}_"
                     f"{team_filter}_{start_date}_{end_date}"
                 ),
             )
@@ -6342,16 +6321,17 @@ with pinch_overview_tab:
         st.plotly_chart(
             build_pinch_scatter(
                 pinch_view,
-                show_labels,
-                float(pinch_lookup),
+                pinch_show_labels,
+                float(pinch_tab_lookup),
             ),
             use_container_width=True,
             config={"displayModeBar": False},
             key=(
                 f"pinch_scatter_{team_filter}_{start_date}_{end_date}_"
-                f"{min_pinch_tests}_{pinch_lookup}_{show_labels}"
+                f"{min_pinch_tests}_{pinch_tab_lookup}_{pinch_show_labels}"
             ),
         )
+        st.checkbox("Show names", key="pinch_show_labels")
 
     with st.container(border=True):
         st.subheader("Pinch Grip Pitcher Results", anchor=False)
@@ -6446,7 +6426,7 @@ with power_pitch_tab:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
     estimated_power_pitch_velo = (
-        power_pitch_stats[2] * float(pitch_power_lookup) + power_pitch_stats[3]
+        power_pitch_stats[2] * float(pitch_power_tab_lookup) + power_pitch_stats[3]
         if power_pitch_stats is not None else np.nan
     )
     with st.container(border=True):
@@ -6459,7 +6439,7 @@ with power_pitch_tab:
             )
             st.markdown(
                 f"<div class='lookup-value' style='color:#0A1F44;'>"
-                f"{fmt(pitch_power_lookup, 1)} W</div>",
+                f"{fmt(pitch_power_tab_lookup, 1)} W</div>",
                 unsafe_allow_html=True,
             )
         with lookup_right:
@@ -6476,30 +6456,45 @@ with power_pitch_tab:
                 f"{lookup_value}</div>",
                 unsafe_allow_html=True,
             )
+        st.number_input(
+            "Peak Power [W] lookup", min_value=0.0, step=100.0, value=5000.0,
+            format="%.0f", key="pitch_power_tab_lookup",
+        )
 
     power_pitch_bands = power_pitch_band_summary(
         power_pitch_summary,
-        float(pitch_power_band_width),
-        power_band_velo_stat,
+        float(pitch_power_tab_band_width),
+        pitch_power_tab_band_velo_stat,
     )
     with st.container(border=True):
         st.subheader(
-            f"{power_band_velo_stat} FB Velo by Peak Power [W] Band",
+            f"{pitch_power_tab_band_velo_stat} FB Velo by Peak Power [W] Band",
             anchor=False,
         )
         st.plotly_chart(
             build_power_pitch_band_chart(
                 power_pitch_summary,
-                float(pitch_power_band_width),
-                power_band_velo_stat,
+                float(pitch_power_tab_band_width),
+                pitch_power_tab_band_velo_stat,
             ),
             use_container_width=True,
             config={"displayModeBar": False},
             key=(
-                f"power_pitch_band_{pitch_power_band_width}_{power_band_velo_stat}_"
+                f"power_pitch_band_{pitch_power_tab_band_width}_{pitch_power_tab_band_velo_stat}_"
                 f"{team_filter}_{start_date}_{end_date}"
             ),
         )
+        pitch_power_control_1, pitch_power_control_2 = st.columns(2)
+        with pitch_power_control_1:
+            st.selectbox(
+                "Peak Power [W] band width", [100.0, 250.0, 500.0, 1000.0], index=1,
+                format_func=lambda x: f"{x:g} W", key="pitch_power_tab_band_width",
+            )
+        with pitch_power_control_2:
+            st.radio(
+                "FB velo statistic", ["Mean", "Median"], horizontal=True,
+                key="pitch_power_tab_band_velo_stat",
+            )
 
     if not power_pitch_bands.empty:
         power_pitch_band_options = power_pitch_bands["Peak Power band"].tolist()
@@ -6516,15 +6511,15 @@ with power_pitch_tab:
             st.plotly_chart(
                 build_power_pitch_band_member_chart(
                     power_pitch_summary,
-                    float(pitch_power_band_width),
+                    float(pitch_power_tab_band_width),
                     selected_power_pitch_band,
-                    power_band_velo_stat,
+                    pitch_power_tab_band_velo_stat,
                 ),
                 use_container_width=True,
                 config={"displayModeBar": False},
                 key=(
                     f"power_pitch_band_detail_{selected_power_pitch_band}_"
-                    f"{pitch_power_band_width}_{power_band_velo_stat}_{team_filter}_"
+                    f"{pitch_power_tab_band_width}_{pitch_power_tab_band_velo_stat}_{team_filter}_"
                     f"{start_date}_{end_date}"
                 ),
             )
@@ -6599,16 +6594,17 @@ with power_pitch_tab:
         st.plotly_chart(
             build_power_pitch_scatter(
                 power_pitch_summary,
-                show_labels,
-                float(pitch_power_lookup),
+                pitch_power_show_labels,
+                float(pitch_power_tab_lookup),
             ),
             use_container_width=True,
             config={"displayModeBar": False},
             key=(
                 f"power_pitch_scatter_{team_filter}_{start_date}_{end_date}_"
-                f"{show_labels}_{pitch_power_lookup}"
+                f"{pitch_power_show_labels}_{pitch_power_tab_lookup}"
             ),
         )
+        st.checkbox("Show names", key="pitch_power_show_labels")
 
     with st.container(border=True):
         st.subheader("Peak Power [W] Pitcher Results", anchor=False)
@@ -6731,13 +6727,13 @@ with combined_model_tab:
             st.subheader("Combined CI + Pinch Lookup", anchor=False)
             lookup_estimate = (
                 combined_model["intercept"]
-                + combined_model["beta_ci"] * float(ci_lookup)
-                + combined_model["beta_pinch"] * float(pinch_lookup)
+                + combined_model["beta_ci"] * float(combined_ci_lookup)
+                + combined_model["beta_pinch"] * float(combined_pinch_lookup)
             )
             lookup_cols = st.columns(3)
             lookup_items = [
-                ("Average CI", f"{float(ci_lookup):.1f} N·s", BLUE),
-                ("Average Pinch", f"{float(pinch_lookup):.1f}", TEAL),
+                ("Average CI", f"{float(combined_ci_lookup):.1f} N·s", BLUE),
+                ("Average Pinch", f"{float(combined_pinch_lookup):.1f}", TEAL),
                 ("Estimated Final YTD FB Velo", f"{lookup_estimate:.2f} mph", ACCENT_RED),
             ]
             for column, (label, value, color) in zip(lookup_cols, lookup_items):
@@ -6751,16 +6747,27 @@ with combined_model_tab:
                         f"{html.escape(value)}</div>",
                         unsafe_allow_html=True,
                     )
+            combined_lookup_1, combined_lookup_2 = st.columns(2)
+            with combined_lookup_1:
+                st.number_input(
+                    "CI lookup", min_value=0.0, step=1.0, value=280.0,
+                    format="%.1f", key="combined_ci_lookup",
+                )
+            with combined_lookup_2:
+                st.number_input(
+                    "Pinch lookup", min_value=0.0, step=1.0, value=40.0,
+                    format="%.1f", key="combined_pinch_lookup",
+                )
 
             model_data = combined_model["data"]
             outside_ci = not (
                 model_data["avg_ci"].min()
-                <= float(ci_lookup)
+                <= float(combined_ci_lookup)
                 <= model_data["avg_ci"].max()
             )
             outside_pinch = not (
                 model_data["avg_pinch_strength"].min()
-                <= float(pinch_lookup)
+                <= float(combined_pinch_lookup)
                 <= model_data["avg_pinch_strength"].max()
             )
             if outside_ci or outside_pinch:
@@ -6788,16 +6795,17 @@ with combined_model_tab:
                 st.subheader("Actual vs Predicted FB Velo", anchor=False)
                 st.plotly_chart(
                     build_combined_actual_predicted_chart(
-                        combined_model, show_labels
+                        combined_model, combined_show_labels
                     ),
                     use_container_width=True,
                     config={"displayModeBar": False},
                     key=(
                         f"combined_overview_actual_predicted_{team_filter}_"
-                        f"{start_date}_{end_date}_{show_labels}_"
+                        f"{start_date}_{end_date}_{combined_show_labels}_"
                         f"{min_ci_jumps}_{min_pinch_tests}_{min_velo_records}"
                     ),
                 )
+                st.checkbox("Show names", key="combined_show_labels")
 
         with st.container(border=True):
             st.subheader("Combined Model Coefficients", anchor=False)
@@ -6967,7 +6975,7 @@ with sprint_overview_tab:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
     estimated_sprint_speed = (
-        sprint_stats[2] * float(power_lookup) + sprint_stats[3]
+        sprint_stats[2] * float(sprint_power_lookup) + sprint_stats[3]
         if sprint_stats is not None else np.nan
     )
     with st.container(border=True):
@@ -6980,7 +6988,7 @@ with sprint_overview_tab:
             )
             st.markdown(
                 f"<div class='lookup-value' style='color:#0A1F44;'>"
-                f"{fmt(power_lookup, 1)} W/kg</div>",
+                f"{fmt(sprint_power_lookup, 1)} W/kg</div>",
                 unsafe_allow_html=True,
             )
         with lookup_right:
@@ -6997,25 +7005,40 @@ with sprint_overview_tab:
                 f"{lookup_value}</div>",
                 unsafe_allow_html=True,
             )
+        st.number_input(
+            "Peak Power / BM lookup", min_value=0.0, step=1.0, value=60.0,
+            format="%.1f", key="sprint_power_lookup",
+        )
 
     with st.container(border=True):
         st.subheader(
-            f"{power_band_sprint_stat} Monthly Max Sprint Speed by Peak Power / BM Band",
+            f"{sprint_power_band_stat} Monthly Max Sprint Speed by Peak Power / BM Band",
             anchor=False,
         )
         st.plotly_chart(
             build_sprint_band_chart(
                 sprint_overview_summary,
-                float(power_band_width),
-                power_band_sprint_stat,
+                float(sprint_power_band_width),
+                sprint_power_band_stat,
             ),
             use_container_width=True,
             config={"displayModeBar": False},
             key=(
-                f"sprint_power_band_{power_band_width}_{power_band_sprint_stat}_"
+                f"sprint_power_band_{sprint_power_band_width}_{sprint_power_band_stat}_"
                 f"{team_filter}_{start_date}_{end_date}"
             ),
         )
+        sprint_band_control_1, sprint_band_control_2 = st.columns(2)
+        with sprint_band_control_1:
+            st.selectbox(
+                "Peak Power / BM band width", [1.0, 2.0, 2.5, 5.0], index=2,
+                format_func=lambda x: f"{x:g} W/kg", key="sprint_power_band_width",
+            )
+        with sprint_band_control_2:
+            st.radio(
+                "Sprint speed statistic", ["Mean", "Median"], horizontal=True,
+                key="sprint_power_band_stat",
+            )
 
 
     with st.container(border=True):
@@ -7089,16 +7112,17 @@ with sprint_overview_tab:
         st.plotly_chart(
             build_sprint_scatter(
                 sprint_overview_summary,
-                show_labels,
-                float(power_lookup),
+                sprint_show_labels,
+                float(sprint_power_lookup),
             ),
             use_container_width=True,
             config={"displayModeBar": False},
             key=(
                 f"sprint_scatter_{team_filter}_{start_date}_{end_date}_"
-                f"{show_labels}_{power_lookup}"
+                f"{sprint_show_labels}_{sprint_power_lookup}"
             ),
         )
+        st.checkbox("Show names", key="sprint_show_labels")
 
     sprint_residuals = build_sprint_residual_summary(
         sprint_overview_summary
@@ -7328,7 +7352,7 @@ with bat_overview_tab:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
     estimated_bat_speed = (
-        bat_stats[2] * float(ci_lookup) + bat_stats[3]
+        bat_stats[2] * float(bat_ci_lookup) + bat_stats[3]
         if bat_stats is not None else np.nan
     )
     with st.container(border=True):
@@ -7341,7 +7365,7 @@ with bat_overview_tab:
             )
             st.markdown(
                 f"<div class='lookup-value' style='color:#0A1F44;'>"
-                f"{fmt(ci_lookup, 1)} N·s</div>",
+                f"{fmt(bat_ci_lookup, 1)} N·s</div>",
                 unsafe_allow_html=True,
             )
         with lookup_right:
@@ -7358,25 +7382,40 @@ with bat_overview_tab:
                 f"{lookup_value}</div>",
                 unsafe_allow_html=True,
             )
+        st.number_input(
+            "CI lookup", min_value=0.0, step=1.0, value=280.0,
+            format="%.1f", key="bat_ci_lookup",
+        )
 
     with st.container(border=True):
         st.subheader(
-            f"{ci_band_bat_stat} Monthly Bat Speed by CI Band",
+            f"{bat_ci_band_stat} Monthly Bat Speed by CI Band",
             anchor=False,
         )
         st.plotly_chart(
             build_bat_band_chart(
                 bat_monthly_pairs,
-                int(ci_band_width),
-                ci_band_bat_stat,
+                int(bat_ci_band_width),
+                bat_ci_band_stat,
             ),
             use_container_width=True,
             config={"displayModeBar": False},
             key=(
-                f"bat_ci_band_{ci_band_width}_{ci_band_bat_stat}_"
+                f"bat_ci_band_{bat_ci_band_width}_{bat_ci_band_stat}_"
                 f"{team_filter}_{start_date}_{end_date}"
             ),
         )
+        bat_band_control_1, bat_band_control_2 = st.columns(2)
+        with bat_band_control_1:
+            st.selectbox(
+                "CI band width", [5, 10, 15, 20], index=1,
+                format_func=lambda x: f"{x} N·s", key="bat_ci_band_width",
+            )
+        with bat_band_control_2:
+            st.radio(
+                "Bat speed statistic", ["Mean", "Median"], horizontal=True,
+                key="bat_ci_band_stat",
+            )
 
 
     with st.container(border=True):
@@ -7444,8 +7483,8 @@ with bat_overview_tab:
 
     bat_ci_band_overview = bat_ci_band_summary(
         bat_monthly_pairs,
-        int(ci_band_width),
-        ci_band_bat_stat,
+        int(bat_ci_band_width),
+        bat_ci_band_stat,
     )
 
     if not bat_ci_band_overview.empty:
@@ -7464,15 +7503,15 @@ with bat_overview_tab:
             st.plotly_chart(
                 build_bat_ci_band_member_chart(
                     bat_monthly_pairs,
-                    int(ci_band_width),
+                    int(bat_ci_band_width),
                     selected_bat_ci_band,
-                    ci_band_bat_stat,
+                    bat_ci_band_stat,
                 ),
                 use_container_width=True,
                 config={"displayModeBar": False},
                 key=(
                     f"bat_ci_band_detail_{selected_bat_ci_band}_"
-                    f"{ci_band_width}_{ci_band_bat_stat}_{team_filter}_"
+                    f"{bat_ci_band_width}_{bat_ci_band_stat}_{team_filter}_"
                     f"{start_date}_{end_date}"
                 ),
             )
@@ -7485,16 +7524,17 @@ with bat_overview_tab:
         st.plotly_chart(
             build_bat_scatter(
                 bat_monthly_pairs,
-                show_labels,
-                float(ci_lookup),
+                bat_show_labels,
+                float(bat_ci_lookup),
             ),
             use_container_width=True,
             config={"displayModeBar": False},
             key=(
                 f"bat_scatter_{team_filter}_{start_date}_{end_date}_"
-                f"{show_labels}_{ci_lookup}"
+                f"{bat_show_labels}_{bat_ci_lookup}"
             ),
         )
+        st.checkbox("Show names", key="bat_show_labels")
 
     with st.container(border=True):
         st.subheader("Hitter Results", anchor=False)
@@ -7624,7 +7664,7 @@ with exit_velo_overview_tab:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
     estimated_exit_velo = (
-        exit_stats[2] * float(ci_lookup) + exit_stats[3]
+        exit_stats[2] * float(exit_ci_lookup) + exit_stats[3]
         if exit_stats is not None else np.nan
     )
     with st.container(border=True):
@@ -7637,7 +7677,7 @@ with exit_velo_overview_tab:
             )
             st.markdown(
                 f"<div class='lookup-value' style='color:#0A1F44;'>"
-                f"{fmt(ci_lookup, 1)} N·s</div>",
+                f"{fmt(exit_ci_lookup, 1)} N·s</div>",
                 unsafe_allow_html=True,
             )
         with lookup_right:
@@ -7654,25 +7694,40 @@ with exit_velo_overview_tab:
                 f"{lookup_value}</div>",
                 unsafe_allow_html=True,
             )
+        st.number_input(
+            "CI lookup", min_value=0.0, step=1.0, value=280.0,
+            format="%.1f", key="exit_ci_lookup",
+        )
 
     with st.container(border=True):
         st.subheader(
-            f"{ci_band_exit_stat} P90 Exit Velo by CI Band",
+            f"{exit_ci_band_stat} P90 Exit Velo by CI Band",
             anchor=False,
         )
         st.plotly_chart(
             build_exit_velo_band_chart(
                 exit_velo_summary,
-                int(ci_band_width),
-                ci_band_exit_stat,
+                int(exit_ci_band_width),
+                exit_ci_band_stat,
             ),
             use_container_width=True,
             config={"displayModeBar": False},
             key=(
-                f"exit_ci_band_{ci_band_width}_{ci_band_exit_stat}_"
+                f"exit_ci_band_{exit_ci_band_width}_{exit_ci_band_stat}_"
                 f"{team_filter}_{start_date}_{end_date}"
             ),
         )
+        exit_band_control_1, exit_band_control_2 = st.columns(2)
+        with exit_band_control_1:
+            st.selectbox(
+                "CI band width", [5, 10, 15, 20], index=1,
+                format_func=lambda x: f"{x} N·s", key="exit_ci_band_width",
+            )
+        with exit_band_control_2:
+            st.radio(
+                "P90 exit velo statistic", ["Mean", "Median"], horizontal=True,
+                key="exit_ci_band_stat",
+            )
 
 
     with st.container(border=True):
@@ -7740,8 +7795,8 @@ with exit_velo_overview_tab:
 
     exit_band_overview = exit_velo_ci_band_summary(
         exit_velo_summary,
-        int(ci_band_width),
-        ci_band_exit_stat,
+        int(exit_ci_band_width),
+        exit_ci_band_stat,
     )
     if not exit_band_overview.empty:
         exit_band_options = exit_band_overview["CI band"].tolist()
@@ -7759,15 +7814,15 @@ with exit_velo_overview_tab:
             st.plotly_chart(
                 build_exit_velo_ci_band_member_chart(
                     exit_velo_summary,
-                    int(ci_band_width),
+                    int(exit_ci_band_width),
                     selected_exit_ci_band,
-                    ci_band_exit_stat,
+                    exit_ci_band_stat,
                 ),
                 use_container_width=True,
                 config={"displayModeBar": False},
                 key=(
                     f"exit_ci_band_detail_{selected_exit_ci_band}_"
-                    f"{ci_band_width}_{ci_band_exit_stat}_{team_filter}_"
+                    f"{exit_ci_band_width}_{exit_ci_band_stat}_{team_filter}_"
                     f"{start_date}_{end_date}"
                 ),
             )
@@ -7780,16 +7835,17 @@ with exit_velo_overview_tab:
         st.plotly_chart(
             build_exit_velo_scatter(
                 exit_velo_summary,
-                show_labels,
-                float(ci_lookup),
+                exit_show_labels,
+                float(exit_ci_lookup),
             ),
             use_container_width=True,
             config={"displayModeBar": False},
             key=(
                 f"exit_scatter_{team_filter}_{start_date}_{end_date}_"
-                f"{show_labels}_{ci_lookup}"
+                f"{exit_show_labels}_{exit_ci_lookup}"
             ),
         )
+        st.checkbox("Show names", key="exit_show_labels")
 
     with st.container(border=True):
         st.subheader("Hitter Results", anchor=False)
