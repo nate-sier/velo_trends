@@ -29,6 +29,8 @@ DEFAULT_VELO_TAB = "FB Velo"
 DEFAULT_BAT_TAB = "PP_Sprint"
 DEFAULT_EXIT_TAB = "Nats Hitting"
 DEFAULT_PINCH_TAB = "Pinch Grip"
+DEFAULT_INFIELD_SHEET_NAME = "nats_players_infield_2026"
+DEFAULT_BASERUNNING_SHEET_NAME = "nats_players_baserunning_2026"
 LOCAL_SERVICE_ACCOUNT_FILE = Path.home() / "Desktop" / "service_account.json"
 MIN_LAST_YTD_FB_VELO = 85.0
 POTENTIAL_CI_INCREASE = 10.0
@@ -378,9 +380,27 @@ def read_tab(client: gspread.Client, sheet_id: str, tab_name: str) -> pd.DataFra
     return pd.DataFrame(worksheet.get_all_records())
 
 
+def read_external_sheet(
+    client: gspread.Client,
+    *,
+    id_secret: str,
+    name_secret: str,
+    default_name: str,
+    tab_secret: str,
+) -> pd.DataFrame:
+    """Read an external Google spreadsheet by optional ID or, by default, title."""
+    sheet_id = secret_or_default(id_secret, "").strip()
+    sheet_name = secret_or_default(name_secret, default_name).strip()
+    tab_name = secret_or_default(tab_secret, "").strip()
+
+    book = client.open_by_key(sheet_id) if sheet_id else client.open(sheet_name)
+    worksheet = book.worksheet(tab_name) if tab_name else book.sheet1
+    return pd.DataFrame(worksheet.get_all_records())
+
+
 @st.cache_data(ttl=300, show_spinner="Loading Google Sheet data…")
-def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
-    """Load Jump Data, FB Velo, Pinch Grip, bat, sprint, and exit-velocity data."""
+def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    """Load core performance data plus selected infield and baserunning outcomes."""
     sheet_id = secret_or_default("SHEET_ID", DEFAULT_SHEET_ID)
     jump_tab = secret_or_default("JUMP_TAB", DEFAULT_JUMP_TAB)
     velo_tab = secret_or_default("VELO_TAB", DEFAULT_VELO_TAB)
@@ -395,6 +415,20 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
     bat_raw = read_tab(client, sheet_id, bat_tab)
     exit_raw = read_tab(client, sheet_id, exit_tab)
     pinch_raw = read_tab(client, sheet_id, pinch_tab)
+    infield_raw = read_external_sheet(
+        client,
+        id_secret="INFIELD_SHEET_ID",
+        name_secret="INFIELD_SHEET_NAME",
+        default_name=DEFAULT_INFIELD_SHEET_NAME,
+        tab_secret="INFIELD_TAB",
+    )
+    baserunning_raw = read_external_sheet(
+        client,
+        id_secret="BASERUNNING_SHEET_ID",
+        name_secret="BASERUNNING_SHEET_NAME",
+        default_name=DEFAULT_BASERUNNING_SHEET_NAME,
+        tab_secret="BASERUNNING_TAB",
+    )
 
     if jump_raw.empty:
         raise ValueError(f"The '{jump_tab}' tab did not return any rows.")
@@ -406,6 +440,10 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         raise ValueError(f"The '{exit_tab}' tab did not return any rows.")
     if pinch_raw.empty:
         raise ValueError(f"The '{pinch_tab}' tab did not return any rows.")
+    if infield_raw.empty:
+        raise ValueError("The infield defensive spreadsheet did not return any rows.")
+    if baserunning_raw.empty:
+        raise ValueError("The baserunning spreadsheet did not return any rows.")
 
     # Jump Data. CI and relative peak power are cleaned independently so
     # missing values in one metric do not remove valid observations for the other.
@@ -783,14 +821,61 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         ["name_key", "month", "date"], kind="stable"
     ).reset_index(drop=True)
 
+    # Selected defensive/baserunning outcomes. These source sheets are current
+    # season-to-date snapshots, so they are matched cross-sectionally to the
+    # player's mean Peak Power / BM inside the dashboard's selected date window.
+    infield_raw.columns = infield_raw.columns.astype(str).str.strip()
+    infield_name_col = first_existing(
+        infield_raw.columns.tolist(), ["name", "Name", "player", "Player", "Athlete", "athlete"]
+    )
+    infield_reaction_col = first_existing(
+        infield_raw.columns.tolist(), ["IF_reaction_3ft", "IF Reaction 3ft", "IF reaction 3ft"]
+    )
+    if infield_name_col is None or infield_reaction_col is None:
+        raise ValueError("Infield source must contain 'name' and 'IF_reaction_3ft'.")
+    infield_defense = pd.DataFrame({
+        "athlete": infield_raw[infield_name_col].astype(str).str.strip(),
+        "if_reaction_3ft": pd.to_numeric(infield_raw[infield_reaction_col], errors="coerce"),
+    })
+    infield_defense["name_key"] = infield_defense["athlete"].map(canonical_name)
+    infield_defense = (
+        infield_defense[(infield_defense["athlete"] != "") & (infield_defense["name_key"] != "")]
+        .dropna(subset=["if_reaction_3ft"])
+        .groupby("name_key", as_index=False)
+        .agg(athlete=("athlete", "first"), if_reaction_3ft=("if_reaction_3ft", "mean"))
+    )
+
+    baserunning_raw.columns = baserunning_raw.columns.astype(str).str.strip()
+    baserunning_name_col = first_existing(
+        baserunning_raw.columns.tolist(), ["name", "Name", "player", "Player", "Athlete", "athlete"]
+    )
+    nbsr_col = first_existing(baserunning_raw.columns.tolist(), ["nBSR", "NBSR", "nbsr"])
+    if baserunning_name_col is None or nbsr_col is None:
+        raise ValueError("Baserunning source must contain 'name' and 'nBSR'.")
+    baserunning_defense = pd.DataFrame({
+        "athlete": baserunning_raw[baserunning_name_col].astype(str).str.strip(),
+        "nbsr": pd.to_numeric(baserunning_raw[nbsr_col], errors="coerce"),
+    })
+    baserunning_defense["name_key"] = baserunning_defense["athlete"].map(canonical_name)
+    baserunning_defense = (
+        baserunning_defense[(baserunning_defense["athlete"] != "") & (baserunning_defense["name_key"] != "")]
+        .dropna(subset=["nbsr"])
+        .groupby("name_key", as_index=False)
+        .agg(athlete=("athlete", "first"), nbsr=("nbsr", "mean"))
+    )
+
     status = (
         f"Loaded {len(jump):,} CI rows, {len(jump_power):,} relative-power rows, "
         f"{len(velo):,} FB Velo rows, {len(pinch):,} Pinch Grip rows, "
         f"{len(sprint):,} valid sprint-speed rows, {len(bat):,} hitter-month "
-        f"bat-speed rows, and {len(exit_velo):,} valid P90 exit-velocity rows from Nats Hitting · "
+        f"bat-speed rows, {len(exit_velo):,} valid P90 exit-velocity rows, "
+        f"{len(infield_defense):,} IF Reaction 3ft rows, and {len(baserunning_defense):,} nBSR rows · "
         f"{datetime.now().strftime('%I:%M %p').lstrip('0')}"
     )
-    return jump, jump_power, velo, bat, pinch, sprint, exit_velo, status
+    return (
+        jump, jump_power, velo, bat, pinch, sprint, exit_velo,
+        infield_defense, baserunning_defense, status,
+    )
 
 
 def build_summary(
@@ -5614,6 +5699,288 @@ def build_power_pitch_scatter(
     return base_figure_layout(fig, 560)
 
 # -----------------------------------------------------------------------------
+# SELECTED DEFENSIVE / BASERUNNING RELATIONSHIPS
+# -----------------------------------------------------------------------------
+def build_peak_power_rel_outcome_summary(
+    jump_power: pd.DataFrame,
+    outcome_df: pd.DataFrame,
+    outcome_col: str,
+    start_date,
+    end_date,
+    team_filter: str,
+    min_power_jumps: int,
+) -> pd.DataFrame:
+    """Match one current S-T-D outcome to mean in-window Peak Power / BM."""
+    columns = [
+        "athlete", "team", "avg_peak_power_rel", "power_jumps", "power_test_dates",
+        "first_power_date", "last_power_date", outcome_col,
+    ]
+    if jump_power.empty or outcome_df.empty or outcome_col not in outcome_df.columns:
+        return pd.DataFrame(columns=columns)
+
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    team_lookup = (
+        jump_power.sort_values("date")
+        .groupby("name_key", as_index=False)
+        .tail(1)[["name_key", "team"]]
+        .drop_duplicates("name_key")
+    )
+    power_window = jump_power[
+        (jump_power["date"] >= start)
+        & (jump_power["date"] <= end)
+        & jump_power["peak_power_rel"].notna()
+    ].copy()
+    if power_window.empty:
+        return pd.DataFrame(columns=columns)
+
+    power_summary = (
+        power_window.groupby("name_key", as_index=False)
+        .agg(
+            athlete=("athlete", "first"),
+            avg_peak_power_rel=("peak_power_rel", "mean"),
+            power_jumps=("peak_power_rel", "count"),
+            power_test_dates=("date", "nunique"),
+            first_power_date=("date", "min"),
+            last_power_date=("date", "max"),
+        )
+        .merge(team_lookup, on="name_key", how="left")
+    )
+    outcome = outcome_df[["name_key", outcome_col]].dropna().drop_duplicates("name_key")
+    summary = power_summary.merge(outcome, on="name_key", how="inner")
+    summary = summary[
+        summary["power_jumps"] >= max(1, int(min_power_jumps))
+    ].copy()
+    if team_filter != "All Teams":
+        summary = summary[summary["team"] == team_filter].copy()
+    return summary.sort_values(outcome_col, ascending=False).reset_index(drop=True)
+
+
+def peak_power_rel_outcome_stats(summary: pd.DataFrame, outcome_col: str):
+    if len(summary) < 2:
+        return None
+    x = pd.to_numeric(summary["avg_peak_power_rel"], errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(summary[outcome_col], errors="coerce").to_numpy(dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    if len(x) < 2 or np.isclose(np.std(x), 0) or np.isclose(np.std(y), 0):
+        return None
+    slope, intercept = np.polyfit(x, y, 1)
+    r = float(np.corrcoef(x, y)[0, 1])
+    return r, r * r, float(slope), float(intercept)
+
+
+def build_peak_power_rel_outcome_scatter(
+    summary: pd.DataFrame,
+    outcome_col: str,
+    outcome_label: str,
+    outcome_unit: str,
+    show_labels: bool,
+    lookup_value: float | None,
+) -> go.Figure:
+    fig = go.Figure()
+    if summary.empty:
+        fig.add_annotation(
+            text="No matched players meet the selected window and minimum-data rules.",
+            showarrow=False, font={"size": 15, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 560)
+
+    customdata = np.column_stack([
+        summary["athlete"], summary["team"], summary["power_jumps"],
+        summary["power_test_dates"], summary["first_power_date"].map(fmt_date),
+        summary["last_power_date"].map(fmt_date),
+    ])
+    fig.add_trace(go.Scatter(
+        x=summary["avg_peak_power_rel"], y=summary[outcome_col],
+        mode="markers+text" if show_labels else "markers",
+        text=summary["athlete"] if show_labels else None,
+        textposition="top center", textfont={"size": 10, "color": NAVY},
+        marker={"size": 13, "color": TEAL, "opacity": 0.88, "line": {"color": "#FFFFFF", "width": 2}},
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Team: %{customdata[1]}<br>"
+            f"{outcome_label}: %{{y:.2f}} {outcome_unit}<br>"
+            "Mean Peak Power / BM: %{x:.2f} W/kg<br><br>"
+            "Power jumps: %{customdata[2]} across %{customdata[3]} test dates · "
+            "%{customdata[4]}–%{customdata[5]}<extra></extra>"
+        ),
+    ))
+    stats = peak_power_rel_outcome_stats(summary, outcome_col)
+    if stats is not None:
+        r, r2, slope, intercept = stats
+        x_range = np.linspace(summary["avg_peak_power_rel"].min(), summary["avg_peak_power_rel"].max(), 100)
+        fig.add_trace(go.Scatter(
+            x=x_range, y=slope * x_range + intercept, mode="lines",
+            line={"color": NAVY_MID, "width": 2.5, "dash": "dash"}, hoverinfo="skip",
+        ))
+        fig.add_annotation(
+            text=f"r = {r:+.2f} · R² = {r2:.2f}",
+            x=0.02, y=0.98, xref="paper", yref="paper", xanchor="left", yanchor="top",
+            showarrow=False, font={"color": NAVY, "size": 13}, bgcolor="#FFFFFF",
+            bordercolor=BORDER, borderwidth=1, borderpad=7,
+        )
+        if lookup_value is not None and np.isfinite(lookup_value):
+            predicted = slope * float(lookup_value) + intercept
+            fig.add_vline(x=float(lookup_value), line_color=ACCENT_RED, line_width=1.5, line_dash="dot")
+            fig.add_hline(y=predicted, line_color=ACCENT_RED, line_width=1.5, line_dash="dot")
+            fig.add_trace(go.Scatter(
+                x=[float(lookup_value)], y=[predicted], mode="markers",
+                marker={"size": 15, "color": ACCENT_RED, "symbol": "diamond", "line": {"color": "#FFFFFF", "width": 2}},
+                hovertemplate=(
+                    "<b>Peak Power / BM lookup</b><br>Peak Power / BM: %{x:.1f} W/kg<br>"
+                    f"Estimated {outcome_label}: %{{y:.2f}} {outcome_unit}<extra></extra>"
+                ),
+            ))
+    fig.update_xaxes(
+        title="Mean Peak Power / BM (W/kg)", showgrid=True, gridcolor=GRID,
+        zeroline=False, linecolor=BORDER, tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title=f"{outcome_label}{f' ({outcome_unit})' if outcome_unit else ''}",
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 560)
+
+
+def render_selected_peak_power_rel_tab(
+    summary: pd.DataFrame,
+    *,
+    outcome_col: str,
+    outcome_label: str,
+    outcome_unit: str,
+    tab_key: str,
+    default_lookup: float,
+    default_bucket_width: float,
+) -> None:
+    stats = peak_power_rel_outcome_stats(summary, outcome_col)
+    n_players = len(summary)
+    r_text = f"{stats[0]:+.2f}" if stats is not None else "—"
+    r2_text = f"{stats[1]:.2f}" if stats is not None else "—"
+    mean_outcome = summary[outcome_col].mean() if n_players else np.nan
+    mean_power = summary["avg_peak_power_rel"].mean() if n_players else np.nan
+
+    top_cols = st.columns(4)
+    for column, values in zip(top_cols, [
+        ("Players", str(n_players), BLUE),
+        ("Correlation", r_text, ACCENT_RED),
+        ("R²", r2_text, NAVY_MID),
+        ("Mean Peak Power / BM", f"{fmt(mean_power)} W/kg", GREEN),
+    ]):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    st.caption(
+        "The defensive/baserunning outcome is a current season-to-date snapshot. "
+        "Peak Power / BM is the player's mean value inside the selected dashboard date window."
+    )
+
+    lookup_key = f"{tab_key}_lookup"
+    labels_key = f"{tab_key}_show_labels"
+    bucket_stat_key = f"{tab_key}_bucket_power_stat"
+    bucket_width_key = f"{tab_key}_bucket_width"
+    lookup_value = float(st.session_state.get(lookup_key, default_lookup))
+    show_labels = bool(st.session_state.get(labels_key, False))
+    bucket_stat = st.session_state.get(bucket_stat_key, "Mean")
+    bucket_width = float(st.session_state.get(bucket_width_key, default_bucket_width))
+
+    with st.container(border=True):
+        st.subheader(f"Peak Power / BM × {outcome_label}", anchor=False)
+        st.plotly_chart(
+            build_peak_power_rel_outcome_scatter(
+                summary, outcome_col, outcome_label, outcome_unit, show_labels, lookup_value,
+            ),
+            use_container_width=True, config={"displayModeBar": False},
+            key=f"{tab_key}_scatter_{team_filter}_{start_date}_{end_date}",
+        )
+        st.toggle("Show player labels", value=False, key=labels_key)
+
+    estimated = stats[2] * lookup_value + stats[3] if stats is not None else np.nan
+    with st.container(border=True):
+        st.subheader("Peak Power / BM Lookup", anchor=False)
+        left, right = st.columns(2)
+        with left:
+            st.markdown("<div class='metric-label'>Peak Power / BM</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='lookup-value' style='color:#0A1F44;'>{fmt(lookup_value, 1)} W/kg</div>", unsafe_allow_html=True)
+        with right:
+            st.markdown(f"<div class='metric-label'>Estimated {html.escape(outcome_label)}</div>", unsafe_allow_html=True)
+            unit_suffix = f" {outcome_unit}" if outcome_unit else ""
+            value = f"{fmt(estimated)}{unit_suffix}" if pd.notna(estimated) else "—"
+            st.markdown(f"<div class='lookup-value' style='color:#0D7E8A;'>{value}</div>", unsafe_allow_html=True)
+        st.number_input(
+            "Peak Power / BM lookup", min_value=0.0, step=0.5, value=float(default_lookup),
+            format="%.1f", key=lookup_key,
+        )
+
+    with st.container(border=True):
+        st.subheader(f"{bucket_stat} Peak Power / BM by {outcome_label} Bucket", anchor=False)
+        st.plotly_chart(
+            build_output_bucket_chart(
+                df=summary,
+                output_col=outcome_col,
+                testing_col="avg_peak_power_rel",
+                bucket_width=bucket_width,
+                output_bucket_label=f"{outcome_label} bucket",
+                testing_metric_label="Peak Power / BM",
+                output_axis_title=f"{outcome_label} bucket",
+                testing_axis_title=f"{bucket_stat} Peak Power / BM (W/kg)",
+                output_unit=outcome_unit,
+                empty_text=f"No matched players are available for {outcome_label} buckets.",
+                color=TEAL,
+                testing_stat=bucket_stat,
+            ),
+            use_container_width=True, config={"displayModeBar": False},
+            key=f"{tab_key}_bucket_chart_{team_filter}_{start_date}_{end_date}_{bucket_stat}_{bucket_width}",
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            width_options = [0.02, 0.05, 0.10] if default_bucket_width < 0.2 else [0.5, 1.0, 2.0]
+            st.selectbox(
+                f"{outcome_label} bucket width", width_options,
+                index=width_options.index(default_bucket_width) if default_bucket_width in width_options else 0,
+                key=bucket_width_key,
+            )
+        with c2:
+            st.radio("Peak Power / BM statistic", ["Mean", "Median"], horizontal=True, key=bucket_stat_key)
+
+    with st.container(border=True):
+        st.subheader("Matched Players", anchor=False)
+        if summary.empty:
+            st.info("No matched players are available for the selected filters.")
+        else:
+            display = summary[[
+                "athlete", "team", "avg_peak_power_rel", outcome_col,
+                "power_jumps", "power_test_dates", "first_power_date", "last_power_date",
+            ]].copy()
+            display.columns = [
+                "Player", "Team", "Mean Peak Power / BM", outcome_label,
+                "Power Jumps", "Power Test Dates", "First Power Date", "Last Power Date",
+            ]
+            display["First Power Date"] = display["First Power Date"].map(fmt_date)
+            display["Last Power Date"] = display["Last Power Date"].map(fmt_date)
+            display = display.sort_values(outcome_label, ascending=False)
+            st.dataframe(
+                display, hide_index=True, use_container_width=True,
+                height=min(680, 44 + 36 * (len(display) + 1)),
+                column_config={
+                    "Mean Peak Power / BM": st.column_config.NumberColumn(format="%.2f W/kg"),
+                    outcome_label: st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
+            csv_download_button(
+                display,
+                f"Download {outcome_label} relationship CSV",
+                f"{tab_key}_relationship.csv",
+                f"download_{tab_key}_relationship",
+            )
+
+
+# -----------------------------------------------------------------------------
 # PASSWORD AUTHENTICATION
 # -----------------------------------------------------------------------------
 def require_password() -> None:
@@ -5683,7 +6050,8 @@ require_password()
 title_col, refresh_col = st.columns([5, 1])
 with title_col:
     st.markdown(
-        "<h1 style='margin:0;color:#0A1F44;font-size:37px;font-weight:800;'>Performance × CI</h1>",
+        "<h1 style='margin:0;color:#0A1F44;font-size:37px;font-weight:800;'>Performance × CI</h1>"
+        "<div style='color:#667085;font-size:12px;margin-top:4px;'>Defense integration build · 2026-08-13 v2</div>",
         unsafe_allow_html=True,
     )
 with refresh_col:
@@ -5693,7 +6061,10 @@ if refresh:
     load_source_data.clear()
 
 try:
-    jump, jump_power, velo, bat, pinch, sprint, exit_velo, status = load_source_data()
+    (
+        jump, jump_power, velo, bat, pinch, sprint, exit_velo,
+        infield_defense, baserunning_defense, status,
+    ) = load_source_data()
 except Exception as exc:
     st.error(f"Could not load data. {exc}")
     st.stop()
@@ -5848,6 +6219,24 @@ exit_velo_summary = build_exit_velo_summary(
     team_filter=team_filter,
     min_ci_jumps=int(min_ci_jumps),
 )
+if_reaction_power_summary = build_peak_power_rel_outcome_summary(
+    jump_power=jump_power,
+    outcome_df=infield_defense,
+    outcome_col="if_reaction_3ft",
+    start_date=start_date,
+    end_date=end_date,
+    team_filter=team_filter,
+    min_power_jumps=int(min_power_jumps),
+)
+nbsr_power_summary = build_peak_power_rel_outcome_summary(
+    jump_power=jump_power,
+    outcome_df=baserunning_defense,
+    outcome_col="nbsr",
+    start_date=start_date,
+    end_date=end_date,
+    team_filter=team_filter,
+    min_power_jumps=int(min_power_jumps),
+)
 period_text = f"{fmt_date(start_date)} – {fmt_date(end_date)}"
 st.markdown(
     f"<div style='color:#667085;font-size:13px;margin:8px 0 18px;'>"
@@ -5863,6 +6252,8 @@ st.markdown(
     sprint_overview_tab,
     bat_overview_tab,
     exit_velo_overview_tab,
+    if_reaction_power_tab,
+    nbsr_power_tab,
     sc_opportunity_tab,
 ) = st.tabs([
     "FB Velo Overview",
@@ -5872,6 +6263,8 @@ st.markdown(
     "Sprint Speed Overview",
     "Bat Speed Overview",
     "P90 Exit Velo Overview",
+    "Rel PP × IF Reaction 3ft",
+    "Rel PP × nBSR",
     "S&C Opportunity",
 ])
 
@@ -7906,6 +8299,29 @@ with exit_velo_overview_tab:
             )
 
 
+
+
+with if_reaction_power_tab:
+    render_selected_peak_power_rel_tab(
+        if_reaction_power_summary,
+        outcome_col="if_reaction_3ft",
+        outcome_label="IF Reaction 3ft",
+        outcome_unit="s",
+        tab_key="if_reaction_3ft_peak_power_rel",
+        default_lookup=60.0,
+        default_bucket_width=0.05,
+    )
+
+with nbsr_power_tab:
+    render_selected_peak_power_rel_tab(
+        nbsr_power_summary,
+        outcome_col="nbsr",
+        outcome_label="nBSR",
+        outcome_unit="runs",
+        tab_key="nbsr_peak_power_rel",
+        default_lookup=60.0,
+        default_bucket_width=1.0,
+    )
 
 
 with sc_opportunity_tab:
