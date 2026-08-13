@@ -5,6 +5,8 @@ Performance × CI — Streamlit deployment-ready dashboard.
 """
 from __future__ import annotations
 
+# Defensive relationship integration build: 2026-08-13 v4
+
 import html
 import hmac
 import os
@@ -850,18 +852,31 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         baserunning_raw.columns.tolist(), ["name", "Name", "player", "Player", "Athlete", "athlete"]
     )
     nbsr_col = first_existing(baserunning_raw.columns.tolist(), ["nBSR", "NBSR", "nbsr"])
-    if baserunning_name_col is None or nbsr_col is None:
-        raise ValueError("Baserunning source must contain 'name' and 'nBSR'.")
+    baserunning_sprint_col = first_existing(
+        baserunning_raw.columns.tolist(),
+        ["Sprint Speed", "Sprint speed", "sprint speed", "Sprint_Speed", "sprint_speed"],
+    )
+    if baserunning_name_col is None or nbsr_col is None or baserunning_sprint_col is None:
+        raise ValueError(
+            "Baserunning source must contain 'name', 'nBSR', and 'Sprint Speed'."
+        )
     baserunning_defense = pd.DataFrame({
         "athlete": baserunning_raw[baserunning_name_col].astype(str).str.strip(),
         "nbsr": pd.to_numeric(baserunning_raw[nbsr_col], errors="coerce"),
+        "baserunning_sprint_speed": pd.to_numeric(
+            baserunning_raw[baserunning_sprint_col], errors="coerce"
+        ),
     })
     baserunning_defense["name_key"] = baserunning_defense["athlete"].map(canonical_name)
     baserunning_defense = (
         baserunning_defense[(baserunning_defense["athlete"] != "") & (baserunning_defense["name_key"] != "")]
         .dropna(subset=["nbsr"])
         .groupby("name_key", as_index=False)
-        .agg(athlete=("athlete", "first"), nbsr=("nbsr", "mean"))
+        .agg(
+            athlete=("athlete", "first"),
+            nbsr=("nbsr", "mean"),
+            baserunning_sprint_speed=("baserunning_sprint_speed", "mean"),
+        )
     )
 
     status = (
@@ -5980,6 +5995,221 @@ def render_selected_peak_power_rel_tab(
             )
 
 
+
+# -----------------------------------------------------------------------------
+# SPRINT SPEED × nBSR — BOTH FROM BASERUNNING SOURCE
+# -----------------------------------------------------------------------------
+def build_sprint_nbsr_summary(
+    jump: pd.DataFrame,
+    outcome_df: pd.DataFrame,
+    team_filter: str,
+) -> pd.DataFrame:
+    """Match baserunning-sheet Sprint Speed directly to baserunning-sheet nBSR.
+
+    Both performance variables are current season-to-date snapshot values from
+    the same baserunning Google Sheet. Jump Data is used only to attach each
+    player's current team for the dashboard team filter; it is not used to
+    calculate sprint speed for this relationship.
+    """
+    columns = ["athlete", "team", "baserunning_sprint_speed", "nbsr"]
+    required = {"name_key", "athlete", "baserunning_sprint_speed", "nbsr"}
+    if jump.empty or outcome_df.empty or not required.issubset(outcome_df.columns):
+        return pd.DataFrame(columns=columns)
+
+    team_lookup = (
+        jump.sort_values("date")
+        .groupby("name_key", as_index=False)
+        .tail(1)[["name_key", "team"]]
+        .drop_duplicates("name_key")
+    )
+
+    summary = (
+        outcome_df[["name_key", "athlete", "baserunning_sprint_speed", "nbsr"]]
+        .dropna(subset=["baserunning_sprint_speed", "nbsr"])
+        .drop_duplicates("name_key")
+        .merge(team_lookup, on="name_key", how="left")
+    )
+    summary["team"] = summary["team"].fillna("Unassigned")
+    if team_filter != "All Teams":
+        summary = summary[summary["team"] == team_filter].copy()
+
+    return summary[columns].sort_values("nbsr", ascending=False).reset_index(drop=True)
+
+
+def sprint_nbsr_stats(summary: pd.DataFrame):
+    if len(summary) < 2:
+        return None
+    x = pd.to_numeric(
+        summary["baserunning_sprint_speed"], errors="coerce"
+    ).to_numpy(dtype=float)
+    y = pd.to_numeric(summary["nbsr"], errors="coerce").to_numpy(dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    if len(x) < 2 or np.isclose(np.std(x), 0) or np.isclose(np.std(y), 0):
+        return None
+    slope, intercept = np.polyfit(x, y, 1)
+    r = float(np.corrcoef(x, y)[0, 1])
+    return r, r * r, float(slope), float(intercept)
+
+
+def build_sprint_nbsr_scatter(summary: pd.DataFrame, show_labels: bool) -> go.Figure:
+    fig = go.Figure()
+    if summary.empty:
+        fig.add_annotation(
+            text="No matched players have both Sprint Speed and nBSR in the baserunning source.",
+            showarrow=False, font={"size": 15, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 560)
+
+    customdata = np.column_stack([summary["athlete"], summary["team"]])
+    fig.add_trace(go.Scatter(
+        x=summary["baserunning_sprint_speed"], y=summary["nbsr"],
+        mode="markers+text" if show_labels else "markers",
+        text=summary["athlete"] if show_labels else None,
+        textposition="top center", textfont={"size": 10, "color": NAVY},
+        marker={"size": 13, "color": TEAL, "opacity": 0.88,
+                "line": {"color": "#FFFFFF", "width": 2}},
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Team: %{customdata[1]}<br>"
+            "Baserunning Sprint Speed: %{x:.2f} ft/s<br>"
+            "nBSR: %{y:.2f}<extra></extra>"
+        ),
+    ))
+    stats = sprint_nbsr_stats(summary)
+    if stats is not None:
+        r, r2, slope, intercept = stats
+        x_range = np.linspace(
+            summary["baserunning_sprint_speed"].min(),
+            summary["baserunning_sprint_speed"].max(), 100,
+        )
+        fig.add_trace(go.Scatter(
+            x=x_range, y=slope * x_range + intercept, mode="lines",
+            line={"color": NAVY_MID, "width": 2.5, "dash": "dash"},
+            hoverinfo="skip",
+        ))
+        fig.add_annotation(
+            text=f"r = {r:+.2f} · R² = {r2:.2f}",
+            x=0.02, y=0.98, xref="paper", yref="paper",
+            xanchor="left", yanchor="top", showarrow=False,
+            font={"color": NAVY, "size": 13}, bgcolor="#FFFFFF",
+            bordercolor=BORDER, borderwidth=1, borderpad=7,
+        )
+    fig.update_xaxes(
+        title="Sprint Speed from baserunning sheet (ft/s)",
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="nBSR", showgrid=True, gridcolor=GRID, zeroline=False,
+        linecolor=BORDER, tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 560)
+
+
+def render_sprint_nbsr_tab(summary: pd.DataFrame) -> None:
+    stats = sprint_nbsr_stats(summary)
+    n_players = len(summary)
+    r_text = f"{stats[0]:+.2f}" if stats is not None else "—"
+    r2_text = f"{stats[1]:.2f}" if stats is not None else "—"
+    mean_sprint = (
+        summary["baserunning_sprint_speed"].mean() if n_players else np.nan
+    )
+
+    top_cols = st.columns(4)
+    for column, values in zip(top_cols, [
+        ("Players", str(n_players), BLUE),
+        ("Correlation", r_text, ACCENT_RED),
+        ("R²", r2_text, NAVY_MID),
+        ("Mean Sprint Speed", f"{fmt(mean_sprint)} ft/s", GREEN),
+    ]):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+    st.caption(
+        "Both Sprint Speed and nBSR come directly from the current baserunning "
+        "Google Sheet snapshot. The Velo Trends date window does not alter these "
+        "two values; Jump Data is used only for the current-team filter."
+    )
+
+    labels_key = "sprint_nbsr_show_labels"
+    bucket_stat_key = "sprint_nbsr_bucket_stat"
+    bucket_width_key = "sprint_nbsr_bucket_width"
+    show_labels = bool(st.session_state.get(labels_key, False))
+    bucket_stat = st.session_state.get(bucket_stat_key, "Mean")
+    bucket_width = float(st.session_state.get(bucket_width_key, 1.0))
+
+    with st.container(border=True):
+        st.subheader("Sprint Speed × nBSR", anchor=False)
+        st.plotly_chart(
+            build_sprint_nbsr_scatter(summary, show_labels),
+            use_container_width=True, config={"displayModeBar": False},
+            key=f"sprint_nbsr_scatter_{team_filter}_{show_labels}",
+        )
+        st.toggle("Show player labels", value=False, key=labels_key)
+
+    with st.container(border=True):
+        st.subheader(f"{bucket_stat} Sprint Speed by nBSR Bucket", anchor=False)
+        st.plotly_chart(
+            build_output_bucket_chart(
+                df=summary,
+                output_col="nbsr",
+                testing_col="baserunning_sprint_speed",
+                bucket_width=bucket_width,
+                output_bucket_label="nBSR bucket",
+                testing_metric_label="Sprint Speed",
+                output_axis_title="nBSR bucket",
+                testing_axis_title=f"{bucket_stat} sprint speed (ft/s)",
+                output_unit="",
+                empty_text="No matched players are available for nBSR buckets.",
+                color=TEAL,
+                testing_stat=bucket_stat,
+            ),
+            use_container_width=True, config={"displayModeBar": False},
+            key=f"sprint_nbsr_bucket_{team_filter}_{bucket_stat}_{bucket_width}",
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            st.selectbox(
+                "nBSR bucket width", [0.5, 1.0, 2.0], index=1,
+                key=bucket_width_key,
+            )
+        with c2:
+            st.radio(
+                "Sprint-speed statistic", ["Mean", "Median"],
+                horizontal=True, key=bucket_stat_key,
+            )
+
+    with st.container(border=True):
+        st.subheader("Matched Players", anchor=False)
+        if summary.empty:
+            st.info("No matched players are available for the selected team filter.")
+        else:
+            display = summary[[
+                "athlete", "team", "baserunning_sprint_speed", "nbsr",
+            ]].copy()
+            display.columns = ["Player", "Team", "Sprint Speed", "nBSR"]
+            display = display.sort_values("nBSR", ascending=False)
+            st.dataframe(
+                display, hide_index=True, use_container_width=True,
+                height=min(680, 44 + 36 * (len(display) + 1)),
+                column_config={
+                    "Sprint Speed": st.column_config.NumberColumn(format="%.2f ft/s"),
+                    "nBSR": st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
+            csv_download_button(
+                display,
+                "Download Sprint Speed × nBSR CSV",
+                "sprint_speed_nbsr_relationship.csv",
+                "download_sprint_nbsr_relationship",
+            )
+
 # -----------------------------------------------------------------------------
 # PASSWORD AUTHENTICATION
 # -----------------------------------------------------------------------------
@@ -6051,7 +6281,7 @@ title_col, refresh_col = st.columns([5, 1])
 with title_col:
     st.markdown(
         "<h1 style='margin:0;color:#0A1F44;font-size:37px;font-weight:800;'>Performance × CI</h1>"
-        "<div style='color:#667085;font-size:12px;margin-top:4px;'>Defense integration build · 2026-08-13 v2</div>",
+        "<div style='color:#667085;font-size:12px;margin-top:4px;'>Defense integration build · 2026-08-13 v3</div>",
         unsafe_allow_html=True,
     )
 with refresh_col:
@@ -6237,6 +6467,11 @@ nbsr_power_summary = build_peak_power_rel_outcome_summary(
     team_filter=team_filter,
     min_power_jumps=int(min_power_jumps),
 )
+sprint_nbsr_summary = build_sprint_nbsr_summary(
+    jump=jump,
+    outcome_df=baserunning_defense,
+    team_filter=team_filter,
+)
 period_text = f"{fmt_date(start_date)} – {fmt_date(end_date)}"
 st.markdown(
     f"<div style='color:#667085;font-size:13px;margin:8px 0 18px;'>"
@@ -6254,6 +6489,7 @@ st.markdown(
     exit_velo_overview_tab,
     if_reaction_power_tab,
     nbsr_power_tab,
+    sprint_nbsr_tab,
     sc_opportunity_tab,
 ) = st.tabs([
     "FB Velo Overview",
@@ -6265,6 +6501,7 @@ st.markdown(
     "P90 Exit Velo Overview",
     "Rel PP × IF Reaction 3ft",
     "Rel PP × nBSR",
+    "Sprint Speed × nBSR",
     "S&C Opportunity",
 ])
 
@@ -8322,6 +8559,10 @@ with nbsr_power_tab:
         default_lookup=60.0,
         default_bucket_width=1.0,
     )
+
+
+with sprint_nbsr_tab:
+    render_sprint_nbsr_tab(sprint_nbsr_summary)
 
 
 with sc_opportunity_tab:
