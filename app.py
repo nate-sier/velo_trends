@@ -6829,13 +6829,6 @@ sprint_adv_runs_summary = build_baserunning_sprint_outcome_summary(
     outcome_col="adv_runs",
     team_filter=team_filter,
 )
-period_text = f"{fmt_date(start_date)} – {fmt_date(end_date)}"
-st.markdown(
-    f"<div style='color:#667085;font-size:13px;margin:8px 0 18px;'>"
-    f"{html.escape(team_filter)} · {html.escape(period_text)} · {html.escape(status)}</div>",
-    unsafe_allow_html=True,
-)
-
 (
     overview_tab,
     pinch_overview_tab,
@@ -7942,11 +7935,6 @@ with sprint_overview_tab:
     ]):
         with column:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
-
-    st.caption(
-        "Sprint Speed is the current value from nats_players_baserunning_2026—the same source used by the nBSR and Adv Runs tabs. "
-        "Peak Power / BM is the player's mean Jump Data value inside the selected dashboard date window. PP_Sprint is not used for this relationship."
-    )
 
     estimated_sprint_speed = (
         sprint_stats[2] * float(sprint_power_lookup) + sprint_stats[3]
