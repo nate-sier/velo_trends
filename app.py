@@ -7285,7 +7285,7 @@ with overview_tab:
             "team, date-window, and minimum-data filters. CI CV is each pitcher's "
             "within-window SD ÷ mean × 100."
         )
-        percentile_levels = [5, 10, 25, 50, 75, 90, 95]
+        percentile_levels = [1, 5, 10, 25, 50, 75, 90, 95]
         percentile_sources = {
             "Average CI (N·s)": pd.to_numeric(summary.get("avg_ci"), errors="coerce"),
             "CI SD (N·s)": pd.to_numeric(summary.get("ci_sd"), errors="coerce"),
