@@ -4660,6 +4660,143 @@ def build_combined_actual_predicted_chart(
     return base_figure_layout(fig, 500)
 
 
+
+def build_predicted_actual_roster_chart(
+    model: dict | None,
+) -> go.Figure:
+    """Compare actual and model-predicted FB velo for every eligible pitcher."""
+    fig = go.Figure()
+    if model is None or model["data"].empty:
+        fig.add_annotation(
+            text="No eligible pitchers are available for predicted vs actual velo.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 460)
+
+    data = model["data"].copy().sort_values(
+        "avg_fb_velo", ascending=True
+    ).reset_index(drop=True)
+    customdata = np.column_stack([
+        data["team"], data["avg_ci"], data["avg_pinch_strength"],
+        data["pinch_hand"], data["residual_fb_velo"],
+        data["ytd_as_of_date"].map(fmt_date),
+    ])
+
+    fig.add_trace(go.Bar(
+        x=data["avg_fb_velo"],
+        y=data["athlete"],
+        orientation="h",
+        name="Actual",
+        marker={"color": NAVY_MID},
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Team: %{customdata[0]}<br>"
+            "Actual final YTD FB velo: %{x:.2f} mph<br>"
+            "YTD as of %{customdata[5]}<br>"
+            "Average CI: %{customdata[1]:.2f} N·s<br>"
+            "Average pinch: %{customdata[2]:.2f} · %{customdata[3]}"
+            "<extra></extra>"
+        ),
+    ))
+    fig.add_trace(go.Bar(
+        x=data["predicted_fb_velo"],
+        y=data["athlete"],
+        orientation="h",
+        name="Predicted",
+        marker={"color": TEAL},
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Predicted FB velo: %{x:.2f} mph<br>"
+            "Actual − predicted residual: %{customdata[4]:+.2f} mph"
+            "<extra></extra>"
+        ),
+    ))
+
+    all_values = np.concatenate([
+        data["avg_fb_velo"].to_numpy(dtype=float),
+        data["predicted_fb_velo"].to_numpy(dtype=float),
+    ])
+    x_min = max(0.0, float(np.nanmin(all_values)) - 1.0)
+    x_max = float(np.nanmax(all_values)) + 1.0
+    fig.update_xaxes(
+        title="Final YTD FB velo (mph)", range=[x_min, x_max],
+        showgrid=True, gridcolor=GRID, zeroline=False,
+        linecolor=BORDER, tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Pitcher", showgrid=False, linecolor=BORDER,
+        tickfont={"color": TEXT, "size": 11},
+        title_font={"color": SUBTEXT}, automargin=True,
+    )
+    fig = base_figure_layout(
+        fig, max(500, min(1500, 170 + 34 * len(data)))
+    )
+    fig.update_layout(
+        barmode="group",
+        showlegend=True,
+        legend={
+            "orientation": "h", "x": 0, "y": 1.04,
+            "font": {"color": SUBTEXT},
+        },
+        margin={"l": 135, "r": 30, "t": 46, "b": 58},
+    )
+    return fig
+
+
+def build_pitcher_whatif_chart(
+    pitcher: str,
+    actual_velo: float,
+    current_predicted: float,
+    whatif_predicted: float,
+) -> go.Figure:
+    """Show one pitcher's actual, current predicted, and what-if predicted velo."""
+    fig = go.Figure()
+    labels = ["Actual", "Current predicted", "What-if predicted"]
+    values = [actual_velo, current_predicted, whatif_predicted]
+    colors = [NAVY_MID, TEAL, ACCENT_RED]
+    fig.add_trace(go.Bar(
+        x=labels,
+        y=values,
+        marker={"color": colors},
+        text=[f"{value:.2f}" for value in values],
+        textposition="outside",
+        cliponaxis=False,
+        hovertemplate="<b>%{x}</b><br>%{y:.2f} mph<extra></extra>",
+    ))
+    low = max(0.0, min(values) - 2.0)
+    high = max(values) + 1.5
+    if np.isclose(low, high):
+        high = low + 3.0
+    fig.update_xaxes(
+        title="", showgrid=False, linecolor=BORDER,
+        tickfont={"color": TEXT},
+    )
+    fig.update_yaxes(
+        title="FB velo (mph)", range=[low, high],
+        showgrid=True, gridcolor=GRID, zeroline=False,
+        linecolor=BORDER, tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    fig = base_figure_layout(fig, 390)
+    fig.update_layout(
+        title={
+            "text": f"{pitcher} · actual vs model scenarios",
+            "x": 0.01,
+            "xanchor": "left",
+            "font": {"size": 16, "color": NAVY},
+        },
+        margin={"l": 66, "r": 30, "t": 55, "b": 58},
+    )
+    return fig
+
+
 def build_combined_model_comparison_chart(
     model: dict | None,
 ) -> go.Figure:
@@ -6834,6 +6971,7 @@ sprint_adv_runs_summary = build_baserunning_sprint_outcome_summary(
     pinch_overview_tab,
     power_pitch_tab,
     combined_model_tab,
+    predicted_actual_tab,
     sprint_overview_tab,
     bat_overview_tab,
     exit_velo_overview_tab,
@@ -6846,6 +6984,7 @@ sprint_adv_runs_summary = build_baserunning_sprint_outcome_summary(
     "Pinch Grip Overview",
     "Peak Power [W] × Pitching Velo",
     "Combined CI + Pinch Overview",
+    "Predicted vs Actual Velo",
     "Sprint Speed Overview",
     "Bat Speed Overview",
     "P90 Exit Velo Overview",
@@ -7893,6 +8032,203 @@ with combined_model_tab:
                 "Download combined pitcher results CSV",
                 "combined_pitcher_results.csv",
                 "download_combined_pitcher_results",
+            )
+
+
+with predicted_actual_tab:
+    if combined_model is None or combined_model["data"].empty:
+        st.info(
+            "Predicted vs Actual Velo uses the same CI + pinch model as the "
+            "Combined CI + Pinch Overview. There are not enough eligible "
+            "pitchers to fit that model under the current filters."
+        )
+    else:
+        model_data = combined_model["data"].copy()
+        model_data["abs_residual"] = model_data["residual_fb_velo"].abs()
+        mean_abs_error = float(model_data["abs_residual"].mean())
+        mean_residual = float(model_data["residual_fb_velo"].mean())
+
+        top_cols = st.columns(4)
+        top_values = [
+            ("Eligible Pitchers", str(len(model_data)), BLUE),
+            ("Model R²", f"{combined_model['r2']:.2f}", ACCENT_RED),
+            ("Mean Absolute Gap", f"{mean_abs_error:.2f} mph", TEAL),
+            ("Mean Residual", f"{mean_residual:+.2f} mph", NAVY_MID),
+        ]
+        for column, values in zip(top_cols, top_values):
+            with column:
+                st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+        st.caption(
+            "Predicted velo comes from the same pitcher-level model used in the "
+            "Combined CI + Pinch Overview: final YTD FB velo predicted from "
+            "Average CI and Average Pinch Strength. The global team, date, and "
+            "minimum-data filters still apply."
+        )
+
+        with st.container(border=True):
+            st.subheader("Actual vs Predicted · All Eligible Pitchers", anchor=False)
+            st.plotly_chart(
+                build_predicted_actual_roster_chart(combined_model),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=(
+                    f"predicted_actual_roster_{team_filter}_{start_date}_{end_date}_"
+                    f"{min_ci_jumps}_{min_pinch_tests}_{min_velo_records}"
+                ),
+            )
+
+        with st.container(border=True):
+            st.subheader("Pitcher What-If Simulator", anchor=False)
+            pitcher_options = model_data.sort_values(
+                ["team", "athlete"], kind="stable"
+            )["athlete"].tolist()
+            pitcher_selector_key = "predicted_actual_whatif_pitcher"
+            if st.session_state.get(pitcher_selector_key) not in pitcher_options:
+                st.session_state[pitcher_selector_key] = pitcher_options[0]
+            selected_pitcher = st.selectbox(
+                "Pitcher",
+                pitcher_options,
+                key=pitcher_selector_key,
+            )
+            selected = model_data.loc[
+                model_data["athlete"] == selected_pitcher
+            ].iloc[0]
+
+            current_ci = float(selected["avg_ci"])
+            current_pinch = float(selected["avg_pinch_strength"])
+            actual_velo = float(selected["avg_fb_velo"])
+            current_predicted = float(selected["predicted_fb_velo"])
+            player_key = re.sub(r"[^a-zA-Z0-9]+", "_", str(selected["name_key"])).strip("_")
+            filter_key = re.sub(
+                r"[^a-zA-Z0-9]+", "_",
+                f"{team_filter}_{start_date}_{end_date}",
+            ).strip("_")
+            ci_widget_key = f"predicted_actual_whatif_ci_{player_key}_{filter_key}"
+            pinch_widget_key = f"predicted_actual_whatif_pinch_{player_key}_{filter_key}"
+
+            input_left, input_right = st.columns(2)
+            with input_left:
+                whatif_ci = st.number_input(
+                    "What-if Average CI (N·s)",
+                    min_value=0.0,
+                    value=current_ci,
+                    step=1.0,
+                    format="%.1f",
+                    key=ci_widget_key,
+                )
+            with input_right:
+                whatif_pinch = st.number_input(
+                    "What-if Average Pinch Strength",
+                    min_value=0.0,
+                    value=current_pinch,
+                    step=1.0,
+                    format="%.1f",
+                    key=pinch_widget_key,
+                )
+
+            whatif_predicted = (
+                combined_model["intercept"]
+                + combined_model["beta_ci"] * float(whatif_ci)
+                + combined_model["beta_pinch"] * float(whatif_pinch)
+            )
+            ci_impact = combined_model["beta_ci"] * (float(whatif_ci) - current_ci)
+            pinch_impact = combined_model["beta_pinch"] * (
+                float(whatif_pinch) - current_pinch
+            )
+            total_impact = whatif_predicted - current_predicted
+            whatif_gap_to_actual = actual_velo - whatif_predicted
+
+            result_cols = st.columns(5)
+            result_values = [
+                ("Actual Velo", f"{actual_velo:.2f} mph", NAVY_MID),
+                ("Current Predicted", f"{current_predicted:.2f} mph", TEAL),
+                ("What-If Predicted", f"{whatif_predicted:.2f} mph", ACCENT_RED),
+                ("Projected Change", f"{total_impact:+.2f} mph", GREEN),
+                ("Actual − What-If", f"{whatif_gap_to_actual:+.2f} mph", BLUE),
+            ]
+            for column, values in zip(result_cols, result_values):
+                with column:
+                    st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+            impact_cols = st.columns(4)
+            impact_values = [
+                ("Current Average CI", f"{current_ci:.1f} N·s", BLUE),
+                ("Current Average Pinch", f"{current_pinch:.1f}", TEAL),
+                ("CI Contribution", f"{ci_impact:+.2f} mph", BLUE),
+                ("Pinch Contribution", f"{pinch_impact:+.2f} mph", TEAL),
+            ]
+            for column, values in zip(impact_cols, impact_values):
+                with column:
+                    st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+            st.plotly_chart(
+                build_pitcher_whatif_chart(
+                    selected_pitcher,
+                    actual_velo,
+                    current_predicted,
+                    whatif_predicted,
+                ),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=(
+                    f"predicted_actual_whatif_chart_{player_key}_"
+                    f"{float(whatif_ci):.2f}_{float(whatif_pinch):.2f}"
+                ),
+            )
+            st.caption(
+                "This is a model-based what-if, not a causal guarantee. It holds "
+                "the fitted coefficients constant and changes only CI and pinch."
+            )
+
+        with st.container(border=True):
+            st.subheader("Predicted vs Actual Table", anchor=False)
+            predicted_actual_display = model_data[[
+                "athlete", "team", "avg_fb_velo", "predicted_fb_velo",
+                "residual_fb_velo", "avg_ci", "avg_pinch_strength",
+                "pinch_hand", "ytd_as_of_date",
+            ]].copy()
+            predicted_actual_display["Model Gap"] = (
+                predicted_actual_display["avg_fb_velo"]
+                - predicted_actual_display["predicted_fb_velo"]
+            )
+            predicted_actual_display = predicted_actual_display.drop(
+                columns=["residual_fb_velo"]
+            )
+            predicted_actual_display.columns = [
+                "Pitcher", "Team", "Actual Velo", "Predicted Velo",
+                "Average CI", "Average Pinch", "Tested Hand", "YTD FB As Of",
+                "Actual − Predicted",
+            ]
+            predicted_actual_display = predicted_actual_display[[
+                "Pitcher", "Team", "Actual Velo", "Predicted Velo",
+                "Actual − Predicted", "Average CI", "Average Pinch",
+                "Tested Hand", "YTD FB As Of",
+            ]]
+            predicted_actual_display["YTD FB As Of"] = (
+                predicted_actual_display["YTD FB As Of"].map(fmt_date)
+            )
+            predicted_actual_display = predicted_actual_display.sort_values(
+                "Actual Velo", ascending=False
+            ).reset_index(drop=True)
+            st.dataframe(
+                predicted_actual_display,
+                hide_index=True,
+                use_container_width=True,
+                height=min(720, 44 + 36 * (len(predicted_actual_display) + 1)),
+                column_config={
+                    "Actual Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                    "Predicted Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                    "Actual − Predicted": st.column_config.NumberColumn(format="%+.2f mph"),
+                    "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                    "Average Pinch": st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
+            csv_download_button(
+                predicted_actual_display,
+                "Download predicted vs actual CSV",
+                "predicted_vs_actual_velo.csv",
+                "download_predicted_vs_actual_velo",
             )
 
 
