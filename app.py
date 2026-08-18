@@ -936,11 +936,21 @@ def build_summary(
         .agg(
             athlete=("athlete", "first"),
             avg_ci=("ci", "mean"),
+            ci_sd=("ci", "std"),
             ci_jumps=("ci", "count"),
             ci_test_dates=("date", "nunique"),
             first_ci_date=("date", "min"),
             last_ci_date=("date", "max"),
         )
+    )
+    # Within-pitcher coefficient of variation across CI observations in the
+    # selected dashboard window. At least two CI observations are required.
+    jump_summary["ci_cv_pct"] = np.where(
+        (jump_summary["ci_jumps"] >= 2)
+        & jump_summary["avg_ci"].notna()
+        & ~np.isclose(jump_summary["avg_ci"], 0.0),
+        jump_summary["ci_sd"] / jump_summary["avg_ci"] * 100.0,
+        np.nan,
     )
 
     # Keep count of eligible FB rows, while charting only the last YTD velo in-window.
@@ -7035,6 +7045,45 @@ with overview_tab:
         with column:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
+    # CI variability and smallest worthwhile change for the currently filtered
+    # pitcher sample. SWC uses 0.2 × the between-pitcher SD of average CI.
+    ci_cv_values = (
+        pd.to_numeric(summary.get("ci_cv_pct", pd.Series(dtype=float)), errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    mean_ci_cv = float(ci_cv_values.mean()) if not ci_cv_values.empty else np.nan
+    median_ci_cv = float(ci_cv_values.median()) if not ci_cv_values.empty else np.nan
+    between_pitcher_ci_sd = (
+        float(summary["avg_ci"].std(ddof=1))
+        if len(summary["avg_ci"].dropna()) >= 2
+        else np.nan
+    )
+    ci_swc = (
+        0.2 * between_pitcher_ci_sd
+        if pd.notna(between_pitcher_ci_sd)
+        else np.nan
+    )
+    ci_swc_pct = (
+        ci_swc / float(mean_ci) * 100.0
+        if pd.notna(ci_swc) and pd.notna(mean_ci) and not np.isclose(float(mean_ci), 0.0)
+        else np.nan
+    )
+
+    variability_cols = st.columns(3)
+    variability_metric_values = [
+        ("Median Within-Pitcher CI CV", f"{fmt(median_ci_cv)}%", BLUE),
+        ("Mean Within-Pitcher CI CV", f"{fmt(mean_ci_cv)}%", TEAL),
+        (
+            "CI Smallest Worthwhile Change",
+            f"{fmt(ci_swc)} N·s ({fmt(ci_swc_pct)}%)" if pd.notna(ci_swc) else "—",
+            ACCENT_RED,
+        ),
+    ]
+    for column, values in zip(variability_cols, variability_metric_values):
+        with column:
+            st.markdown(metric_card(*values), unsafe_allow_html=True)
+
     estimated_velo = np.nan
     if stats is not None:
         estimated_velo = stats[2] * float(fb_ci_lookup) + stats[3]
@@ -7193,15 +7242,21 @@ with overview_tab:
             st.info("No matching pitchers.")
         else:
             display = summary[[
-                "athlete", "team", "avg_fb_velo", "ytd_as_of_date", "avg_ci", "fb_records", "ci_jumps", "ci_test_dates", "first_ci_date", "last_ci_date",
+                "athlete", "team", "avg_fb_velo", "ytd_as_of_date", "avg_ci",
+                "ci_sd", "ci_cv_pct", "fb_records", "ci_jumps", "ci_test_dates",
+                "first_ci_date", "last_ci_date",
             ]].copy()
             display.columns = [
-                "Pitcher", "Team", "Last YTD FB Velo", "YTD FB As Of", "Average CI", "FB Records", "CI Jumps", "CI Test Dates", "First CI", "Last CI",
+                "Pitcher", "Team", "Last YTD FB Velo", "YTD FB As Of", "Average CI",
+                "CI SD", "CI CV (%)", "FB Records", "CI Jumps", "CI Test Dates",
+                "First CI", "Last CI",
             ]
             for date_col in ["YTD FB As Of", "First CI", "Last CI"]:
                 display[date_col] = display[date_col].map(fmt_date)
             display["Last YTD FB Velo"] = display["Last YTD FB Velo"].round(2)
             display["Average CI"] = display["Average CI"].round(2)
+            display["CI SD"] = display["CI SD"].round(2)
+            display["CI CV (%)"] = display["CI CV (%)"].round(2)
             st.dataframe(
                 display,
                 hide_index=True,
@@ -7210,6 +7265,8 @@ with overview_tab:
                 column_config={
                     "Last YTD FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
                     "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                    "CI SD": st.column_config.NumberColumn(format="%.2f N·s"),
+                    "CI CV (%)": st.column_config.NumberColumn(format="%.2f%%"),
                 },
             )
             csv_download_button(
@@ -7219,7 +7276,49 @@ with overview_tab:
                 "download_fb_velo_pitcher_results",
             )
 
-
+    # Literal bottom of the FB Velo Overview tab: distribution cut points for
+    # the principal CI metrics in the currently filtered pitcher sample.
+    with st.container(border=True):
+        st.subheader("CI Percentile Table", anchor=False)
+        st.caption(
+            "Percentiles are calculated across the pitchers currently included by the "
+            "team, date-window, and minimum-data filters. CI CV is each pitcher's "
+            "within-window SD ÷ mean × 100."
+        )
+        percentile_levels = [5, 10, 25, 50, 75, 90, 95]
+        percentile_sources = {
+            "Average CI (N·s)": pd.to_numeric(summary.get("avg_ci"), errors="coerce"),
+            "CI SD (N·s)": pd.to_numeric(summary.get("ci_sd"), errors="coerce"),
+            "CI CV (%)": pd.to_numeric(summary.get("ci_cv_pct"), errors="coerce"),
+        }
+        percentile_rows = []
+        for percentile in percentile_levels:
+            row = {"Percentile": f"P{percentile}"}
+            q = percentile / 100.0
+            for label, series in percentile_sources.items():
+                valid = series.replace([np.inf, -np.inf], np.nan).dropna()
+                row[label] = float(valid.quantile(q)) if not valid.empty else np.nan
+            percentile_rows.append(row)
+        ci_percentiles = pd.DataFrame(percentile_rows)
+        st.dataframe(
+            ci_percentiles,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Average CI (N·s)": st.column_config.NumberColumn(format="%.2f N·s"),
+                "CI SD (N·s)": st.column_config.NumberColumn(format="%.2f N·s"),
+                "CI CV (%)": st.column_config.NumberColumn(format="%.2f%%"),
+            },
+        )
+        if pd.notna(ci_swc):
+            st.caption(
+                f"Current-sample CI SWC: {ci_swc:.2f} N·s ({ci_swc_pct:.2f}% of mean CI). "
+                "SWC = 0.2 × between-pitcher SD of Average CI; it describes a small "
+                "worthwhile effect and is not the same as measurement error or an "
+                "individual athlete's normal day-to-day variation."
+            )
+        else:
+            st.caption("CI SWC requires at least two pitchers with valid Average CI values.")
 
 
 with pinch_overview_tab:
