@@ -1032,6 +1032,240 @@ def base_figure_layout(fig: go.Figure, height: int) -> go.Figure:
     return fig
 
 
+
+def ci_velo_breakpoint_analysis(
+    summary: pd.DataFrame,
+    min_pitchers_per_side: int = 5,
+) -> dict | None:
+    """Fit a continuous one-breakpoint segmented regression of FB velo on CI.
+
+    The breakpoint is searched across observed CI values, with a minimum number
+    of pitchers required on each side. AIC includes the searched breakpoint as
+    an additional model parameter, so the segmented fit is penalized versus the
+    ordinary straight-line regression.
+    """
+    required = {"avg_ci", "avg_fb_velo"}
+    if summary.empty or not required.issubset(summary.columns):
+        return None
+
+    work = (
+        summary[["avg_ci", "avg_fb_velo"]]
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+        .sort_values("avg_ci")
+        .reset_index(drop=True)
+    )
+    n = len(work)
+    min_side = max(3, int(min_pitchers_per_side))
+    if n < (2 * min_side + 2):
+        return None
+
+    x = work["avg_ci"].to_numpy(dtype=float)
+    y = work["avg_fb_velo"].to_numpy(dtype=float)
+    unique_x = np.unique(x)
+    if len(unique_x) < 5 or np.isclose(np.std(x), 0) or np.isclose(np.std(y), 0):
+        return None
+
+    def _fit(design: np.ndarray, *, parameter_count_for_aic: int) -> dict | None:
+        if design.shape[0] <= design.shape[1]:
+            return None
+        coef, *_ = np.linalg.lstsq(design, y, rcond=None)
+        predicted = design @ coef
+        residual = y - predicted
+        sse = float(np.sum(residual ** 2))
+        sst = float(np.sum((y - y.mean()) ** 2))
+        if not np.isfinite(sse) or sse < 0 or not np.isfinite(sst) or np.isclose(sst, 0):
+            return None
+        r2 = 1.0 - sse / sst
+        p = design.shape[1] - 1
+        adjusted_r2 = (
+            1.0 - (1.0 - r2) * (n - 1) / (n - p - 1)
+            if n > p + 1 else np.nan
+        )
+        rmse = float(np.sqrt(sse / n))
+        safe_sse = max(sse, np.finfo(float).tiny)
+        aic = float(n * np.log(safe_sse / n) + 2 * parameter_count_for_aic)
+        return {
+            "coef": coef,
+            "predicted": predicted,
+            "residual": residual,
+            "sse": sse,
+            "rmse": rmse,
+            "r2": float(r2),
+            "adjusted_r2": float(adjusted_r2),
+            "aic": aic,
+        }
+
+    linear_design = np.column_stack([np.ones(n), x])
+    linear = _fit(linear_design, parameter_count_for_aic=2)
+    if linear is None:
+        return None
+
+    # Midpoints between adjacent unique observed CI values are natural candidate
+    # knots because membership on each side does not change inside an interval.
+    candidates = (unique_x[:-1] + unique_x[1:]) / 2.0
+    rows: list[dict] = []
+    best_fit: dict | None = None
+
+    for breakpoint in candidates:
+        n_below = int(np.sum(x <= breakpoint))
+        n_above = int(np.sum(x > breakpoint))
+        if n_below < min_side or n_above < min_side:
+            continue
+
+        hinge = np.maximum(0.0, x - breakpoint)
+        design = np.column_stack([np.ones(n), x, hinge])
+        fit = _fit(design, parameter_count_for_aic=4)
+        if fit is None:
+            continue
+
+        intercept, slope_below, slope_change = [float(v) for v in fit["coef"]]
+        slope_above = slope_below + slope_change
+        predicted_at_break = intercept + slope_below * float(breakpoint)
+        delta_aic = linear["aic"] - fit["aic"]
+
+        row = {
+            "breakpoint": float(breakpoint),
+            "n_below": n_below,
+            "n_above": n_above,
+            "slope_below": slope_below,
+            "slope_above": slope_above,
+            "slope_change": slope_change,
+            "predicted_at_break": float(predicted_at_break),
+            "r2": fit["r2"],
+            "adjusted_r2": fit["adjusted_r2"],
+            "rmse": fit["rmse"],
+            "aic": fit["aic"],
+            "delta_aic_vs_linear": float(delta_aic),
+            "fit": fit,
+        }
+        rows.append(row)
+        if best_fit is None or row["aic"] < best_fit["aic"]:
+            best_fit = row
+
+    if best_fit is None:
+        return None
+
+    candidate_table = pd.DataFrame([
+        {k: v for k, v in row.items() if k != "fit"}
+        for row in rows
+    ]).sort_values(["aic", "breakpoint"], kind="stable").reset_index(drop=True)
+
+    return {
+        "data": work,
+        "n": n,
+        "min_pitchers_per_side": min_side,
+        "linear": linear,
+        "best": best_fit,
+        "candidates": candidate_table,
+    }
+
+
+def build_ci_velo_breakpoint_chart(
+    summary: pd.DataFrame,
+    analysis: dict | None,
+    show_labels: bool = False,
+) -> go.Figure:
+    """Plot pitcher CI/velo observations with the best continuous segmented fit."""
+    fig = go.Figure()
+    if analysis is None or analysis["data"].empty:
+        fig.add_annotation(
+            text="Not enough matched pitchers to estimate a stable CI breakpoint.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 480)
+
+    data = analysis["data"]
+    best = analysis["best"]
+    x = data["avg_ci"].to_numpy(dtype=float)
+    y = data["avg_fb_velo"].to_numpy(dtype=float)
+
+    # Pull pitcher/team labels back from the filtered summary where available.
+    labels = summary[["avg_ci", "avg_fb_velo"]].copy()
+    if "athlete" in summary.columns:
+        labels["athlete"] = summary["athlete"]
+    else:
+        labels["athlete"] = "Pitcher"
+    if "team" in summary.columns:
+        labels["team"] = summary["team"]
+    else:
+        labels["team"] = ""
+    labels = labels.replace([np.inf, -np.inf], np.nan).dropna(subset=["avg_ci", "avg_fb_velo"])
+
+    fig.add_trace(go.Scatter(
+        x=labels["avg_ci"],
+        y=labels["avg_fb_velo"],
+        mode="markers+text" if show_labels else "markers",
+        text=labels["athlete"] if show_labels else None,
+        textposition="top center",
+        textfont={"size": 10, "color": NAVY},
+        marker={
+            "size": 12,
+            "color": ACCENT_RED,
+            "opacity": 0.84,
+            "line": {"color": "#FFFFFF", "width": 1.5},
+        },
+        customdata=np.column_stack([labels["athlete"], labels["team"]]),
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Team: %{customdata[1]}<br>"
+            "Average CI: %{x:.1f} N·s<br>"
+            "Last YTD FB velo: %{y:.2f} mph<extra></extra>"
+        ),
+    ))
+
+    breakpoint = float(best["breakpoint"])
+    x_line = np.linspace(float(np.min(x)), float(np.max(x)), 240)
+    intercept, slope_below, slope_change = [float(v) for v in best["fit"]["coef"]]
+    y_segmented = intercept + slope_below * x_line + slope_change * np.maximum(0.0, x_line - breakpoint)
+
+    linear_coef = analysis["linear"]["coef"]
+    y_linear = float(linear_coef[0]) + float(linear_coef[1]) * x_line
+
+    fig.add_trace(go.Scatter(
+        x=x_line,
+        y=y_linear,
+        mode="lines",
+        name="Single linear fit",
+        line={"color": SUBTEXT, "width": 2, "dash": "dot"},
+        hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_line,
+        y=y_segmented,
+        mode="lines",
+        name="Breakpoint fit",
+        line={"color": NAVY_MID, "width": 3},
+        hovertemplate="Segmented fit: %{y:.2f} mph<extra></extra>",
+    ))
+    fig.add_vline(
+        x=breakpoint,
+        line_color=TEAL,
+        line_width=2,
+        line_dash="dash",
+        annotation_text=f"Breakpoint {breakpoint:.1f} N·s",
+        annotation_position="top left",
+        annotation_font_color=TEAL,
+    )
+
+    fig.update_xaxes(
+        title="Average concentric impulse (N·s)",
+        showgrid=True, gridcolor=GRID, zeroline=False,
+        linecolor=BORDER, tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Last YTD FB velocity (mph)",
+        showgrid=True, gridcolor=GRID, zeroline=False,
+        linecolor=BORDER, tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig = base_figure_layout(fig, 520)
+    fig.update_layout(showlegend=True, legend={"orientation": "h", "y": 1.08, "x": 0})
+    return fig
+
 def build_scatter(summary: pd.DataFrame, show_labels: bool, ci_lookup: float | None) -> go.Figure:
     fig = go.Figure()
     if summary.empty:
@@ -7215,6 +7449,128 @@ with overview_tab:
                 "fb_velo_pitcher_results.csv",
                 "download_fb_velo_pitcher_results",
             )
+
+
+    # -------------------------------------------------------------------------
+    # CI -> FB Velo breakpoint analysis
+    # -------------------------------------------------------------------------
+    with st.container(border=True):
+        st.subheader("CI → FB Velo Breakpoint Analysis", anchor=False)
+        st.caption(
+            "Exploratory continuous segmented regression. The app searches for one CI cut point "
+            "where the CI-to-velo slope changes, while requiring a minimum number of pitchers on "
+            "both sides. The breakpoint model is compared with the ordinary single-line model using AIC."
+        )
+
+        bp_control_col, bp_label_col = st.columns([1, 1])
+        with bp_control_col:
+            bp_min_side = st.number_input(
+                "Minimum pitchers on each side",
+                min_value=3,
+                max_value=20,
+                value=5,
+                step=1,
+                key="fb_ci_breakpoint_min_side",
+                help="Candidate breakpoints are ignored unless at least this many pitchers fall on each side.",
+            )
+        with bp_label_col:
+            bp_show_labels = st.checkbox(
+                "Show pitcher names",
+                value=False,
+                key="fb_ci_breakpoint_show_labels",
+            )
+
+        breakpoint_result = ci_velo_breakpoint_analysis(
+            summary,
+            min_pitchers_per_side=int(bp_min_side),
+        )
+
+        if breakpoint_result is None:
+            st.info(
+                "There are not enough eligible pitchers or enough CI spread to estimate a breakpoint "
+                "with the current filters and minimum-per-side requirement."
+            )
+        else:
+            bp = breakpoint_result["best"]
+            linear_fit = breakpoint_result["linear"]
+            delta_aic = float(bp["delta_aic_vs_linear"])
+
+            bp_cards = st.columns(4)
+            bp_card_values = [
+                ("Best CI Breakpoint", f"{bp['breakpoint']:.1f} N·s", TEAL),
+                ("Slope Below", f"{bp['slope_below']:+.3f} mph / N·s", BLUE),
+                ("Slope Above", f"{bp['slope_above']:+.3f} mph / N·s", GREEN),
+                ("ΔAIC vs Single Line", f"{delta_aic:+.2f}", NAVY_MID),
+            ]
+            for column, values in zip(bp_cards, bp_card_values):
+                with column:
+                    st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+            fit_cols = st.columns(4)
+            fit_cols[0].metric("Breakpoint R²", f"{bp['r2']:.3f}")
+            fit_cols[1].metric("Single-line R²", f"{linear_fit['r2']:.3f}")
+            fit_cols[2].metric("Pitchers ≤ breakpoint", f"{bp['n_below']}")
+            fit_cols[3].metric("Pitchers > breakpoint", f"{bp['n_above']}")
+
+            if delta_aic >= 10:
+                support_text = "The segmented model has very strong AIC support over a single straight line."
+            elif delta_aic >= 6:
+                support_text = "The segmented model has strong AIC support over a single straight line."
+            elif delta_aic >= 2:
+                support_text = "The segmented model has some AIC support over a single straight line."
+            elif delta_aic > 0:
+                support_text = "The breakpoint fit is only marginally favored; treat the cut point cautiously."
+            else:
+                support_text = "The single straight-line model is favored; there is not useful breakpoint evidence in this filtered sample."
+
+            st.info(
+                f"{support_text} Below {bp['breakpoint']:.1f} N·s, the fitted slope is "
+                f"{bp['slope_below']:+.3f} mph per 1 N·s; above it, the fitted slope is "
+                f"{bp['slope_above']:+.3f} mph per 1 N·s. This is an exploratory sample breakpoint, "
+                "not a physiological threshold."
+            )
+
+            st.plotly_chart(
+                build_ci_velo_breakpoint_chart(summary, breakpoint_result, bp_show_labels),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=(
+                    f"ci_velo_breakpoint_chart_{team_filter}_{start_date}_{end_date}_"
+                    f"{int(bp_min_side)}_{bp_show_labels}"
+                ),
+            )
+
+            with st.expander("Candidate breakpoint comparison", expanded=False):
+                candidate_display = breakpoint_result["candidates"].copy().head(15)
+                candidate_display = candidate_display.rename(columns={
+                    "breakpoint": "CI Breakpoint",
+                    "n_below": "N ≤ Breakpoint",
+                    "n_above": "N > Breakpoint",
+                    "slope_below": "Slope Below",
+                    "slope_above": "Slope Above",
+                    "r2": "R²",
+                    "adjusted_r2": "Adjusted R²",
+                    "rmse": "RMSE",
+                    "delta_aic_vs_linear": "ΔAIC vs Linear",
+                    "aic": "AIC",
+                })
+                keep_cols = [
+                    "CI Breakpoint", "N ≤ Breakpoint", "N > Breakpoint",
+                    "Slope Below", "Slope Above", "R²", "Adjusted R²",
+                    "RMSE", "ΔAIC vs Linear", "AIC",
+                ]
+                candidate_display = candidate_display[keep_cols]
+                for col in [
+                    "CI Breakpoint", "Slope Below", "Slope Above", "R²",
+                    "Adjusted R²", "RMSE", "ΔAIC vs Linear", "AIC",
+                ]:
+                    candidate_display[col] = candidate_display[col].round(3)
+                st.dataframe(
+                    candidate_display,
+                    hide_index=True,
+                    use_container_width=True,
+                    height=min(590, 44 + 36 * (len(candidate_display) + 1)),
+                )
 
 
 
