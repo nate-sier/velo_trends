@@ -457,6 +457,13 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
     jump_name_col = first_existing(jump_raw.columns.tolist(), ["Athlete", "athlete", "Player", "player", "Name", "name"])
     jump_date_col = first_existing(jump_raw.columns.tolist(), ["Date", "date", "Test Date", "test_date"])
     jump_ci_col = first_existing(jump_raw.columns.tolist(), ["Concentric Impulse [N s]", "Concentric Impulse", "CI"])
+    jump_p1_ci_col = first_existing(
+        jump_raw.columns.tolist(),
+        [
+            "P1 Concentric Impulse [N s]", "P1 Concentric Impulse",
+            "P1 CI", "p1 concentric impulse [n s]", "p1_concentric_impulse",
+        ],
+    )
     jump_peak_power_rel_col = first_existing(
         jump_raw.columns.tolist(),
         [
@@ -490,6 +497,10 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         "athlete": jump_raw[jump_name_col].astype(str).str.strip(),
         "date": parse_sheet_dates(jump_raw[jump_date_col]),
         "ci": pd.to_numeric(jump_raw[jump_ci_col], errors="coerce"),
+        "p1_ci": (
+            pd.to_numeric(jump_raw[jump_p1_ci_col], errors="coerce")
+            if jump_p1_ci_col else np.nan
+        ),
         "peak_power_rel": pd.to_numeric(
             jump_raw[jump_peak_power_rel_col], errors="coerce"
         ),
@@ -508,7 +519,7 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
 
     jump = (
         jump_base.dropna(subset=["date", "ci"])[
-            ["athlete", "date", "ci", "team", "name_key"]
+            ["athlete", "date", "ci", "p1_ci", "team", "name_key"]
         ]
         .sort_values(["athlete", "date"], kind="stable")
         .reset_index(drop=True)
@@ -938,6 +949,9 @@ def build_summary(
             avg_ci=("ci", "mean"),
             ci_sd=("ci", "std"),
             ci_jumps=("ci", "count"),
+            avg_p1_ci=("p1_ci", "mean"),
+            p1_ci_sd=("p1_ci", "std"),
+            p1_ci_jumps=("p1_ci", "count"),
             ci_test_dates=("date", "nunique"),
             first_ci_date=("date", "min"),
             last_ci_date=("date", "max"),
@@ -950,6 +964,16 @@ def build_summary(
         & jump_summary["avg_ci"].notna()
         & ~np.isclose(jump_summary["avg_ci"], 0.0),
         jump_summary["ci_sd"] / jump_summary["avg_ci"] * 100.0,
+        np.nan,
+    )
+
+    # Same within-player variability calculation for the Jump Data metric
+    # P1 Concentric Impulse [N s].
+    jump_summary["p1_ci_cv_pct"] = np.where(
+        (jump_summary["p1_ci_jumps"] >= 2)
+        & jump_summary["avg_p1_ci"].notna()
+        & ~np.isclose(jump_summary["avg_p1_ci"], 0.0),
+        jump_summary["p1_ci_sd"] / jump_summary["avg_p1_ci"] * 100.0,
         np.nan,
     )
 
@@ -7362,14 +7386,18 @@ with overview_tab:
         st.subheader("CI Percentile Table", anchor=False)
         st.caption(
             "Percentiles are calculated across the pitchers currently included by the "
-            "team, date-window, and minimum-data filters. P1 is explicitly included. "
-            "CI CV = within-window SD ÷ mean × 100."
+            "team, date-window, and minimum-data filters. 'P1 Concentric Impulse [N s]' "
+            "is treated as its own Jump Data metric—not as the 1st percentile. "
+            "CV = within-window SD ÷ mean × 100."
         )
-        percentile_levels = [1, 5, 10, 25, 50, 75, 90, 95]
+        percentile_levels = [5, 10, 25, 50, 75, 90, 95]
         percentile_sources = {
             "Average CI (N·s)": pd.to_numeric(summary.get("avg_ci"), errors="coerce"),
+            "P1 Concentric Impulse (N·s)": pd.to_numeric(summary.get("avg_p1_ci"), errors="coerce"),
             "CI SD (N·s)": pd.to_numeric(summary.get("ci_sd"), errors="coerce"),
             "CI CV (%)": pd.to_numeric(summary.get("ci_cv_pct"), errors="coerce"),
+            "P1 CI SD (N·s)": pd.to_numeric(summary.get("p1_ci_sd"), errors="coerce"),
+            "P1 CI CV (%)": pd.to_numeric(summary.get("p1_ci_cv_pct"), errors="coerce"),
             "Change-to-Noise (×)": pd.to_numeric(summary.get("ci_change_to_noise"), errors="coerce"),
             "MDC95 (N·s)": pd.to_numeric(summary.get("ci_mdc95"), errors="coerce"),
         }
@@ -7383,8 +7411,7 @@ with overview_tab:
             percentile_rows.append(row)
         ci_percentiles = pd.DataFrame(percentile_rows)
 
-        # Give the dataframe enough height to display all eight percentile rows.
-        # The prior auto-height could make the first row easy to miss behind a scroll area.
+        # Give the dataframe enough height to display all percentile rows without scrolling.
         st.dataframe(
             ci_percentiles,
             hide_index=True,
@@ -7392,8 +7419,11 @@ with overview_tab:
             height=44 + 36 * (len(ci_percentiles) + 1),
             column_config={
                 "Average CI (N·s)": st.column_config.NumberColumn(format="%.2f N·s"),
+                "P1 Concentric Impulse (N·s)": st.column_config.NumberColumn(format="%.2f N·s"),
                 "CI SD (N·s)": st.column_config.NumberColumn(format="%.2f N·s"),
                 "CI CV (%)": st.column_config.NumberColumn(format="%.2f%%"),
+                "P1 CI SD (N·s)": st.column_config.NumberColumn(format="%.2f N·s"),
+                "P1 CI CV (%)": st.column_config.NumberColumn(format="%.2f%%"),
                 "Change-to-Noise (×)": st.column_config.NumberColumn(format="%.2f×"),
                 "MDC95 (N·s)": st.column_config.NumberColumn(format="%.2f N·s"),
             },
