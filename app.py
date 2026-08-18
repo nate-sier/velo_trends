@@ -953,6 +953,61 @@ def build_summary(
         np.nan,
     )
 
+    # Change is based on the mean CI from the athlete's first and last TEST DATE
+    # inside the selected dashboard window. This avoids treating one individual
+    # jump repetition as the athlete's baseline/current value.
+    ci_by_test_date = (
+        jump_window.dropna(subset=["date", "ci"])
+        .groupby(["name_key", "date"], as_index=False)
+        .agg(ci_test_date_mean=("ci", "mean"))
+        .sort_values(["name_key", "date"], kind="stable")
+    )
+    first_ci_value = (
+        ci_by_test_date.groupby("name_key", as_index=False)
+        .head(1)[["name_key", "ci_test_date_mean"]]
+        .rename(columns={"ci_test_date_mean": "first_ci_value"})
+    )
+    last_ci_value = (
+        ci_by_test_date.groupby("name_key", as_index=False)
+        .tail(1)[["name_key", "ci_test_date_mean"]]
+        .rename(columns={"ci_test_date_mean": "last_ci_value"})
+    )
+    jump_summary = jump_summary.merge(first_ci_value, on="name_key", how="left")
+    jump_summary = jump_summary.merge(last_ci_value, on="name_key", how="left")
+
+    jump_summary["ci_change"] = np.where(
+        jump_summary["ci_test_dates"] >= 2,
+        jump_summary["last_ci_value"] - jump_summary["first_ci_value"],
+        np.nan,
+    )
+
+    # The CI SD in this dashboard is the individual's within-window variability.
+    # Since CV = SD / mean, the corresponding typical variation in CI units is SD.
+    jump_summary["ci_typical_variation"] = jump_summary["ci_sd"]
+    jump_summary["ci_change_to_noise"] = np.where(
+        (jump_summary["ci_test_dates"] >= 2)
+        & jump_summary["ci_change"].notna()
+        & jump_summary["ci_typical_variation"].notna()
+        & (jump_summary["ci_typical_variation"] > 0),
+        jump_summary["ci_change"].abs() / jump_summary["ci_typical_variation"],
+        np.nan,
+    )
+    jump_summary["ci_mdc95"] = np.where(
+        jump_summary["ci_typical_variation"].notna(),
+        1.96 * np.sqrt(2.0) * jump_summary["ci_typical_variation"],
+        np.nan,
+    )
+    valid_mdc_comparison = (
+        jump_summary["ci_change"].notna() & jump_summary["ci_mdc95"].notna()
+    )
+    jump_summary["ci_change_exceeds_mdc95"] = pd.Series(
+        np.nan, index=jump_summary.index, dtype=object
+    )
+    jump_summary.loc[valid_mdc_comparison, "ci_change_exceeds_mdc95"] = (
+        jump_summary.loc[valid_mdc_comparison, "ci_change"].abs()
+        >= jump_summary.loc[valid_mdc_comparison, "ci_mdc95"]
+    )
+
     # Keep count of eligible FB rows, while charting only the last YTD velo in-window.
     velo_window = velo_window.sort_values(["name_key", "date"], kind="stable")
     velo_counts = (
@@ -7045,8 +7100,8 @@ with overview_tab:
         with column:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
-    # CI variability and smallest worthwhile change for the currently filtered
-    # pitcher sample. SWC uses 0.2 × the between-pitcher SD of average CI.
+    # CI variability plus individualized change-vs-noise metrics for the
+    # currently filtered pitcher sample.
     ci_cv_values = (
         pd.to_numeric(summary.get("ci_cv_pct", pd.Series(dtype=float)), errors="coerce")
         .replace([np.inf, -np.inf], np.nan)
@@ -7054,29 +7109,39 @@ with overview_tab:
     )
     mean_ci_cv = float(ci_cv_values.mean()) if not ci_cv_values.empty else np.nan
     median_ci_cv = float(ci_cv_values.median()) if not ci_cv_values.empty else np.nan
-    between_pitcher_ci_sd = (
-        float(summary["avg_ci"].std(ddof=1))
-        if len(summary["avg_ci"].dropna()) >= 2
-        else np.nan
+
+    ci_change_to_noise_values = (
+        pd.to_numeric(summary.get("ci_change_to_noise", pd.Series(dtype=float)), errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
     )
-    ci_swc = (
-        0.2 * between_pitcher_ci_sd
-        if pd.notna(between_pitcher_ci_sd)
-        else np.nan
-    )
-    ci_swc_pct = (
-        ci_swc / float(mean_ci) * 100.0
-        if pd.notna(ci_swc) and pd.notna(mean_ci) and not np.isclose(float(mean_ci), 0.0)
-        else np.nan
+    median_ci_change_to_noise = (
+        float(ci_change_to_noise_values.median())
+        if not ci_change_to_noise_values.empty else np.nan
     )
 
-    variability_cols = st.columns(3)
+    ci_mdc95_values = (
+        pd.to_numeric(summary.get("ci_mdc95", pd.Series(dtype=float)), errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    median_ci_mdc95 = (
+        float(ci_mdc95_values.median())
+        if not ci_mdc95_values.empty else np.nan
+    )
+
+    variability_cols = st.columns(4)
     variability_metric_values = [
         ("Median Within-Pitcher CI CV", f"{fmt(median_ci_cv)}%", BLUE),
         ("Mean Within-Pitcher CI CV", f"{fmt(mean_ci_cv)}%", TEAL),
         (
-            "CI Smallest Worthwhile Change",
-            f"{fmt(ci_swc)} N·s ({fmt(ci_swc_pct)}%)" if pd.notna(ci_swc) else "—",
+            "Median CI Change-to-Noise",
+            f"{fmt(median_ci_change_to_noise)}×" if pd.notna(median_ci_change_to_noise) else "—",
+            GREEN,
+        ),
+        (
+            "Median CI MDC95",
+            f"{fmt(median_ci_mdc95)} N·s" if pd.notna(median_ci_mdc95) else "—",
             ACCENT_RED,
         ),
     ]
@@ -7243,20 +7308,30 @@ with overview_tab:
         else:
             display = summary[[
                 "athlete", "team", "avg_fb_velo", "ytd_as_of_date", "avg_ci",
-                "ci_sd", "ci_cv_pct", "fb_records", "ci_jumps", "ci_test_dates",
-                "first_ci_date", "last_ci_date",
+                "ci_sd", "ci_cv_pct", "first_ci_value", "last_ci_value", "ci_change",
+                "ci_change_to_noise", "ci_mdc95", "ci_change_exceeds_mdc95",
+                "fb_records", "ci_jumps", "ci_test_dates", "first_ci_date", "last_ci_date",
             ]].copy()
             display.columns = [
                 "Pitcher", "Team", "Last YTD FB Velo", "YTD FB As Of", "Average CI",
-                "CI SD", "CI CV (%)", "FB Records", "CI Jumps", "CI Test Dates",
-                "First CI", "Last CI",
+                "CI SD", "CI CV (%)", "First-Date CI", "Last-Date CI", "CI Change",
+                "Change-to-Noise", "MDC95", "Exceeds MDC95",
+                "FB Records", "CI Jumps", "CI Test Dates", "First CI", "Last CI",
             ]
+            display["Exceeds MDC95"] = (
+                display["Exceeds MDC95"].map({True: "Yes", False: "No"}).fillna("—")
+            )
             for date_col in ["YTD FB As Of", "First CI", "Last CI"]:
                 display[date_col] = display[date_col].map(fmt_date)
             display["Last YTD FB Velo"] = display["Last YTD FB Velo"].round(2)
             display["Average CI"] = display["Average CI"].round(2)
             display["CI SD"] = display["CI SD"].round(2)
             display["CI CV (%)"] = display["CI CV (%)"].round(2)
+            display["First-Date CI"] = display["First-Date CI"].round(2)
+            display["Last-Date CI"] = display["Last-Date CI"].round(2)
+            display["CI Change"] = display["CI Change"].round(2)
+            display["Change-to-Noise"] = display["Change-to-Noise"].round(2)
+            display["MDC95"] = display["MDC95"].round(2)
             st.dataframe(
                 display,
                 hide_index=True,
@@ -7267,6 +7342,11 @@ with overview_tab:
                     "Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
                     "CI SD": st.column_config.NumberColumn(format="%.2f N·s"),
                     "CI CV (%)": st.column_config.NumberColumn(format="%.2f%%"),
+                    "First-Date CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                    "Last-Date CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                    "CI Change": st.column_config.NumberColumn(format="%+.2f N·s"),
+                    "Change-to-Noise": st.column_config.NumberColumn(format="%.2f×"),
+                    "MDC95": st.column_config.NumberColumn(format="%.2f N·s"),
                 },
             )
             csv_download_button(
@@ -7282,14 +7362,16 @@ with overview_tab:
         st.subheader("CI Percentile Table", anchor=False)
         st.caption(
             "Percentiles are calculated across the pitchers currently included by the "
-            "team, date-window, and minimum-data filters. CI CV is each pitcher's "
-            "within-window SD ÷ mean × 100."
+            "team, date-window, and minimum-data filters. P1 is explicitly included. "
+            "CI CV = within-window SD ÷ mean × 100."
         )
         percentile_levels = [1, 5, 10, 25, 50, 75, 90, 95]
         percentile_sources = {
             "Average CI (N·s)": pd.to_numeric(summary.get("avg_ci"), errors="coerce"),
             "CI SD (N·s)": pd.to_numeric(summary.get("ci_sd"), errors="coerce"),
             "CI CV (%)": pd.to_numeric(summary.get("ci_cv_pct"), errors="coerce"),
+            "Change-to-Noise (×)": pd.to_numeric(summary.get("ci_change_to_noise"), errors="coerce"),
+            "MDC95 (N·s)": pd.to_numeric(summary.get("ci_mdc95"), errors="coerce"),
         }
         percentile_rows = []
         for percentile in percentile_levels:
@@ -7300,25 +7382,29 @@ with overview_tab:
                 row[label] = float(valid.quantile(q)) if not valid.empty else np.nan
             percentile_rows.append(row)
         ci_percentiles = pd.DataFrame(percentile_rows)
+
+        # Give the dataframe enough height to display all eight percentile rows.
+        # The prior auto-height could make the first row easy to miss behind a scroll area.
         st.dataframe(
             ci_percentiles,
             hide_index=True,
             use_container_width=True,
+            height=44 + 36 * (len(ci_percentiles) + 1),
             column_config={
                 "Average CI (N·s)": st.column_config.NumberColumn(format="%.2f N·s"),
                 "CI SD (N·s)": st.column_config.NumberColumn(format="%.2f N·s"),
                 "CI CV (%)": st.column_config.NumberColumn(format="%.2f%%"),
+                "Change-to-Noise (×)": st.column_config.NumberColumn(format="%.2f×"),
+                "MDC95 (N·s)": st.column_config.NumberColumn(format="%.2f N·s"),
             },
         )
-        if pd.notna(ci_swc):
-            st.caption(
-                f"Current-sample CI SWC: {ci_swc:.2f} N·s ({ci_swc_pct:.2f}% of mean CI). "
-                "SWC = 0.2 × between-pitcher SD of Average CI; it describes a small "
-                "worthwhile effect and is not the same as measurement error or an "
-                "individual athlete's normal day-to-day variation."
-            )
-        else:
-            st.caption("CI SWC requires at least two pitchers with valid Average CI values.")
+        st.caption(
+            "Change-to-Noise = |last test-date mean CI − first test-date mean CI| ÷ "
+            "within-player CI SD. MDC95 = 1.96 × √2 × within-player CI SD. "
+            "The signed CI Change remains in Pitcher Results so direction is preserved. "
+            "These are CV-derived monitoring estimates from the selected window, not a "
+            "separate laboratory test-retest reliability study."
+        )
 
 
 with pinch_overview_tab:
