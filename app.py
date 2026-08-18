@@ -8067,6 +8067,70 @@ with predicted_actual_tab:
         )
 
         with st.container(border=True):
+            st.subheader("Projected Velo Calculator", anchor=False)
+            st.caption(
+                "Enter any CI and pinch-strength values to calculate the model-projected "
+                "fastball velocity. This uses the exact same fitted coefficients as the "
+                "Combined CI + Pinch model and does not require selecting a pitcher."
+            )
+
+            calculator_default_ci = float(model_data["avg_ci"].median())
+            calculator_default_pinch = float(model_data["avg_pinch_strength"].median())
+
+            calc_left, calc_right = st.columns(2)
+            with calc_left:
+                calculator_ci = st.number_input(
+                    "CI (N·s)",
+                    min_value=0.0,
+                    value=calculator_default_ci,
+                    step=1.0,
+                    format="%.1f",
+                    key="predicted_velo_calculator_ci",
+                )
+            with calc_right:
+                calculator_pinch = st.number_input(
+                    "Pinch Strength",
+                    min_value=0.0,
+                    value=calculator_default_pinch,
+                    step=1.0,
+                    format="%.1f",
+                    key="predicted_velo_calculator_pinch",
+                )
+
+            calculator_projected_velo = (
+                combined_model["intercept"]
+                + combined_model["beta_ci"] * float(calculator_ci)
+                + combined_model["beta_pinch"] * float(calculator_pinch)
+            )
+
+            calc_result_left, calc_result_mid, calc_result_right = st.columns(3)
+            with calc_result_left:
+                st.markdown(
+                    metric_card("Entered CI", f"{float(calculator_ci):.1f} N·s", BLUE),
+                    unsafe_allow_html=True,
+                )
+            with calc_result_mid:
+                st.markdown(
+                    metric_card("Entered Pinch", f"{float(calculator_pinch):.1f}", TEAL),
+                    unsafe_allow_html=True,
+                )
+            with calc_result_right:
+                st.markdown(
+                    metric_card(
+                        "Projected FB Velo",
+                        f"{calculator_projected_velo:.2f} mph",
+                        ACCENT_RED,
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+            st.caption(
+                f"Model equation: Projected FB Velo = {combined_model['intercept']:.3f} "
+                f"+ ({combined_model['beta_ci']:.4f} × CI) "
+                f"+ ({combined_model['beta_pinch']:.4f} × Pinch)."
+            )
+
+        with st.container(border=True):
             st.subheader("Actual vs Predicted · All Eligible Pitchers", anchor=False)
             st.plotly_chart(
                 build_predicted_actual_roster_chart(combined_model),
