@@ -490,6 +490,13 @@ def _open_or_create_org_rankings_book(client: gspread.Client):
     return book, tab_name
 
 
+@st.cache_resource(show_spinner=False)
+def _cached_org_rankings_book():
+    """Resolve the rankings workbook only once per running Streamlit server."""
+    client = get_gspread_client()
+    return _open_or_create_org_rankings_book(client)
+
+
 def _org_rankings_worksheet(book, tab_name: str):
     """Use the rankings worksheet; on a new workbook, repurpose its default Sheet1."""
     try:
@@ -545,9 +552,7 @@ def save_shared_org_ranking(
         [[_sheet_safe_value(value) for value in row] for row in published.itertuples(index=False, name=None)]
     )
 
-    creds = get_credentials()
-    client = gspread.authorize(creds)
-    book, tab_name = _open_or_create_org_rankings_book(client)
+    book, tab_name = _cached_org_rankings_book()
     worksheet = _org_rankings_worksheet(book, tab_name)
 
     # A 30-org table is tiny. Keep the storage worksheet compact so this dedicated
@@ -563,10 +568,8 @@ def save_shared_org_ranking(
 @st.cache_data(ttl=ORG_RANKINGS_CACHE_TTL_SECONDS, show_spinner=False)
 def load_shared_org_ranking() -> tuple[pd.DataFrame, dict[str, str]]:
     """Load the most recently published organization ranking from Google Sheets."""
-    creds = get_credentials()
-    client = gspread.authorize(creds)
     try:
-        book, tab_name = _open_or_create_org_rankings_book(client)
+        book, tab_name = _cached_org_rankings_book()
         worksheet = _org_rankings_worksheet(book, tab_name)
     except (gspread.exceptions.APIError, ValueError):
         return pd.DataFrame(), {}
@@ -874,6 +877,12 @@ def get_credentials() -> Credentials:
         "No Google credentials were found. For local use, put service_account.json on your Desktop. "
         "For Streamlit deployment, add [gcp_service_account] to the app's Secrets settings."
     )
+
+
+@st.cache_resource(show_spinner=False)
+def get_gspread_client() -> gspread.Client:
+    """Reuse one authorized Google client instead of re-authorizing every rerun."""
+    return gspread.authorize(get_credentials())
 
 
 def read_tab(client: gspread.Client, sheet_id: str, tab_name: str) -> pd.DataFrame:
@@ -7353,6 +7362,134 @@ def require_password() -> None:
     st.stop()
 
 
+
+
+def render_org_rankings_page() -> None:
+    """Render the shared ranking without loading the heavy player-level datasets."""
+    st.subheader("Organization Performance Ranking", anchor=False)
+    st.caption(
+        "This is the shared organization ranking shown to everyone who logs in. "
+        "Each metric scores 1st = 30 points through 30th = 1 point; maximum combined score = 120."
+    )
+
+    if st.session_state.pop("org_ranking_publish_success", False):
+        st.success("Weekly organization ranking published. Everyone opening the app will now see this version.")
+
+    try:
+        shared_org_ranking, shared_org_metadata = load_shared_org_ranking()
+    except Exception as exc:
+        shared_org_ranking, shared_org_metadata = pd.DataFrame(), {}
+        st.error(f"Could not load the shared organization ranking. {exc}")
+
+    render_org_ranking_dashboard(shared_org_ranking, shared_org_metadata)
+
+    with st.expander(
+        "Update weekly ranking",
+        expanded=shared_org_ranking.empty,
+    ):
+        st.caption(
+            "Upload the new PD Pitching, PD Baserunning, and PD Hitting PDFs, verify the preview, "
+            "then publish. The app creates a separate Google spreadsheet named “Org Performance Rankings” automatically (if it does not already exist), then replaces the current shared ranking there."
+        )
+
+        ranking_as_of = st.date_input(
+            "Ranking as of",
+            value=datetime.now().date(),
+            key="org_rank_as_of_date",
+        )
+
+        upload_cols = st.columns(3)
+        with upload_cols[0]:
+            pitching_pdf = st.file_uploader(
+                "PD Pitching PDF",
+                type=["pdf"],
+                key="org_rank_pitching_pdf",
+                help="Used for FB Velo rank.",
+            )
+        with upload_cols[1]:
+            baserunning_pdf = st.file_uploader(
+                "PD Baserunning PDF",
+                type=["pdf"],
+                key="org_rank_baserunning_pdf",
+                help="Used for Sprint Speed rank.",
+            )
+        with upload_cols[2]:
+            hitting_pdf = st.file_uploader(
+                "PD Hitting PDF",
+                type=["pdf"],
+                key="org_rank_hitting_pdf",
+                help="Used for Exit Velo and p90 EV ranks.",
+            )
+
+        if not all([pitching_pdf, baserunning_pdf, hitting_pdf]):
+            st.info("Upload all three weekly PDFs to create the next shared ranking.")
+        else:
+            try:
+                pitching_pd = parse_org_pd_pdf(pitching_pdf.getvalue(), "pitching")
+                baserunning_pd = parse_org_pd_pdf(baserunning_pdf.getvalue(), "baserunning")
+                hitting_pd = parse_org_pd_pdf(hitting_pdf.getvalue(), "hitting")
+                preview_org_ranking = build_org_pd_rankings(
+                    pitching_pd, baserunning_pd, hitting_pd
+                )
+            except Exception as exc:
+                st.error(f"Could not build the organization ranking: {exc}")
+            else:
+                preview_nats = preview_org_ranking.loc[
+                    preview_org_ranking["Organization"] == "Washington Nationals"
+                ].iloc[0]
+                preview_leader = preview_org_ranking.iloc[0]
+
+                preview_cols = st.columns(4)
+                preview_values = [
+                    ("Preview Leader", str(preview_leader["Organization"]), BLUE),
+                    ("Leader Score", f"{int(preview_leader['Total Points'])} / 120", GREEN),
+                    ("Nationals Rank", str(preview_nats["Rank"]), ACCENT_RED),
+                    ("Nationals Score", f"{int(preview_nats['Total Points'])} / 120", NAVY),
+                ]
+                for column, values in zip(preview_cols, preview_values):
+                    with column:
+                        st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+                st.dataframe(
+                    preview_org_ranking[[
+                        "Rank", "Organization", "FB Velo Rank", "Sprint Speed Rank",
+                        "Exit Velo Rank", "p90 EV Rank", "Total Points"
+                    ]].rename(columns={
+                        "FB Velo Rank": "FB Rank",
+                        "Sprint Speed Rank": "Sprint Rank",
+                        "Exit Velo Rank": "EV Rank",
+                        "p90 EV Rank": "p90 Rank",
+                    }),
+                    hide_index=True,
+                    use_container_width=True,
+                    height=420,
+                )
+
+                if st.button(
+                    "Publish as shared ranking",
+                    key="publish_shared_org_ranking",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    try:
+                        save_shared_org_ranking(
+                            preview_org_ranking,
+                            ranking_as_of=ranking_as_of,
+                            pitching_filename=pitching_pdf.name,
+                            baserunning_filename=baserunning_pdf.name,
+                            hitting_filename=hitting_pdf.name,
+                        )
+                    except Exception as exc:
+                        st.error(
+                            "Could not publish the shared ranking. "
+                            f"{exc} The app will create/use a separate Google spreadsheet for rankings and will not "
+                            "add a rankings tab to the main workbook."
+                        )
+                    else:
+                        load_shared_org_ranking.clear()
+                        st.session_state["org_ranking_publish_success"] = True
+                        st.rerun()
+
 # -----------------------------------------------------------------------------
 # APP
 # -----------------------------------------------------------------------------
@@ -7365,7 +7502,7 @@ title_col, refresh_col = st.columns([5, 1])
 with title_col:
     st.markdown(
         "<h1 style='margin:0;color:#0A1F44;font-size:37px;font-weight:800;'>Performance × CI</h1>"
-        "<div style='color:#667085;font-size:12px;margin-top:4px;'>Org ranking landing page · shared weekly publishing</div>",
+        "<div style='color:#667085;font-size:12px;margin-top:4px;'>Shared org ranking · player data loads only when Performance Dashboard is opened</div>",
         unsafe_allow_html=True,
     )
 with refresh_col:
@@ -7374,6 +7511,22 @@ with refresh_col:
 if refresh:
     load_source_data.clear()
     load_shared_org_ranking.clear()
+
+# st.tabs executes every tab on every rerun. A first-position tab therefore still
+# paid the cost of all player-level Google Sheet reads before the ranking appeared.
+# The ranking is now a true lightweight landing view, and the heavy dashboard is
+# loaded only after the user explicitly opens it.
+app_view = st.radio(
+    "Dashboard view",
+    ["Org Performance Ranking", "Performance Dashboard"],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="app_view",
+)
+
+if app_view == "Org Performance Ranking":
+    render_org_rankings_page()
+    st.stop()
 
 try:
     (
@@ -9920,130 +10073,7 @@ with sprint_adv_runs_tab:
 
 
 with org_rankings_tab:
-    st.subheader("Organization Performance Ranking", anchor=False)
-    st.caption(
-        "This is the shared organization ranking shown to everyone who logs in. "
-        "Each metric scores 1st = 30 points through 30th = 1 point; maximum combined score = 120."
-    )
-
-    if st.session_state.pop("org_ranking_publish_success", False):
-        st.success("Weekly organization ranking published. Everyone opening the app will now see this version.")
-
-    try:
-        shared_org_ranking, shared_org_metadata = load_shared_org_ranking()
-    except Exception as exc:
-        shared_org_ranking, shared_org_metadata = pd.DataFrame(), {}
-        st.error(f"Could not load the shared organization ranking. {exc}")
-
-    render_org_ranking_dashboard(shared_org_ranking, shared_org_metadata)
-
-    with st.expander(
-        "Update weekly ranking",
-        expanded=shared_org_ranking.empty,
-    ):
-        st.caption(
-            "Upload the new PD Pitching, PD Baserunning, and PD Hitting PDFs, verify the preview, "
-            "then publish. The app creates a separate Google spreadsheet named “Org Performance Rankings” automatically (if it does not already exist), then replaces the current shared ranking there."
-        )
-
-        ranking_as_of = st.date_input(
-            "Ranking as of",
-            value=datetime.now().date(),
-            key="org_rank_as_of_date",
-        )
-
-        upload_cols = st.columns(3)
-        with upload_cols[0]:
-            pitching_pdf = st.file_uploader(
-                "PD Pitching PDF",
-                type=["pdf"],
-                key="org_rank_pitching_pdf",
-                help="Used for FB Velo rank.",
-            )
-        with upload_cols[1]:
-            baserunning_pdf = st.file_uploader(
-                "PD Baserunning PDF",
-                type=["pdf"],
-                key="org_rank_baserunning_pdf",
-                help="Used for Sprint Speed rank.",
-            )
-        with upload_cols[2]:
-            hitting_pdf = st.file_uploader(
-                "PD Hitting PDF",
-                type=["pdf"],
-                key="org_rank_hitting_pdf",
-                help="Used for Exit Velo and p90 EV ranks.",
-            )
-
-        if not all([pitching_pdf, baserunning_pdf, hitting_pdf]):
-            st.info("Upload all three weekly PDFs to create the next shared ranking.")
-        else:
-            try:
-                pitching_pd = parse_org_pd_pdf(pitching_pdf.getvalue(), "pitching")
-                baserunning_pd = parse_org_pd_pdf(baserunning_pdf.getvalue(), "baserunning")
-                hitting_pd = parse_org_pd_pdf(hitting_pdf.getvalue(), "hitting")
-                preview_org_ranking = build_org_pd_rankings(
-                    pitching_pd, baserunning_pd, hitting_pd
-                )
-            except Exception as exc:
-                st.error(f"Could not build the organization ranking: {exc}")
-            else:
-                preview_nats = preview_org_ranking.loc[
-                    preview_org_ranking["Organization"] == "Washington Nationals"
-                ].iloc[0]
-                preview_leader = preview_org_ranking.iloc[0]
-
-                preview_cols = st.columns(4)
-                preview_values = [
-                    ("Preview Leader", str(preview_leader["Organization"]), BLUE),
-                    ("Leader Score", f"{int(preview_leader['Total Points'])} / 120", GREEN),
-                    ("Nationals Rank", str(preview_nats["Rank"]), ACCENT_RED),
-                    ("Nationals Score", f"{int(preview_nats['Total Points'])} / 120", NAVY),
-                ]
-                for column, values in zip(preview_cols, preview_values):
-                    with column:
-                        st.markdown(metric_card(*values), unsafe_allow_html=True)
-
-                st.dataframe(
-                    preview_org_ranking[[
-                        "Rank", "Organization", "FB Velo Rank", "Sprint Speed Rank",
-                        "Exit Velo Rank", "p90 EV Rank", "Total Points"
-                    ]].rename(columns={
-                        "FB Velo Rank": "FB Rank",
-                        "Sprint Speed Rank": "Sprint Rank",
-                        "Exit Velo Rank": "EV Rank",
-                        "p90 EV Rank": "p90 Rank",
-                    }),
-                    hide_index=True,
-                    use_container_width=True,
-                    height=420,
-                )
-
-                if st.button(
-                    "Publish as shared ranking",
-                    key="publish_shared_org_ranking",
-                    type="primary",
-                    use_container_width=True,
-                ):
-                    try:
-                        save_shared_org_ranking(
-                            preview_org_ranking,
-                            ranking_as_of=ranking_as_of,
-                            pitching_filename=pitching_pdf.name,
-                            baserunning_filename=baserunning_pdf.name,
-                            hitting_filename=hitting_pdf.name,
-                        )
-                    except Exception as exc:
-                        st.error(
-                            "Could not publish the shared ranking. "
-                            f"{exc} The app will create/use a separate Google spreadsheet for rankings and will not "
-                            "add a rankings tab to the main workbook."
-                        )
-                    else:
-                        load_shared_org_ranking.clear()
-                        st.session_state["org_ranking_publish_success"] = True
-                        st.rerun()
-
+    render_org_rankings_page()
 
 with sc_opportunity_tab:
     st.subheader("S&C Opportunity — Pitchers", anchor=False)
