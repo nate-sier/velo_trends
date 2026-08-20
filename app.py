@@ -471,56 +471,32 @@ def _org_rankings_sheet_target() -> tuple[str, str]:
     return sheet_name, tab_name
 
 
-@st.cache_resource(show_spinner=False)
-def _org_rankings_runtime_state() -> dict[str, str]:
-    """Small server-wide state used only until a newly-created sheet ID is put in Secrets.
-
-    cache_resource is shared across Streamlit user sessions on the same running server,
-    so a sheet created by one publisher is immediately visible to other users. The ID
-    still needs to be copied to ORG_RANKINGS_SHEET_ID once so it survives a server restart.
-    """
-    return {"sheet_id": ""}
-
-
 def _resolved_org_rankings_sheet_id() -> str:
-    """Resolve the dedicated spreadsheet by ID only; never search Google Drive by title."""
-    configured = secret_or_default("ORG_RANKINGS_SHEET_ID", "").strip()
-    if configured:
-        return configured
-    return str(_org_rankings_runtime_state().get("sheet_id", "")).strip()
+    """Return the manually-created dedicated rankings spreadsheet ID from Secrets."""
+    return secret_or_default("ORG_RANKINGS_SHEET_ID", "").strip()
 
 
 @st.cache_resource(show_spinner=False)
 def _open_org_rankings_book_by_id(sheet_id: str):
-    """Open the tiny rankings workbook directly by ID.
-
-    This intentionally avoids client.open(title), which performs a Drive file search and
-    was the source of the very slow / apparently stuck landing page on cold starts.
-    """
+    """Open the dedicated rankings workbook directly by ID; never search/create Drive files."""
     if not sheet_id:
-        raise ValueError("No rankings spreadsheet ID is configured.")
+        raise ValueError(
+            "ORG_RANKINGS_SHEET_ID is not configured. Create a blank Google Sheet in your own Drive, "
+            "share it with the app service account as Editor, then add its spreadsheet ID to Streamlit Secrets."
+        )
     return get_gspread_client().open_by_key(sheet_id)
 
 
-def _create_org_rankings_book():
-    """Create a brand-new rankings spreadsheet only when a user explicitly publishes."""
-    sheet_name, tab_name = _org_rankings_sheet_target()
-    client = get_gspread_client()
-    book = client.create(sheet_name)
-    _org_rankings_runtime_state()["sheet_id"] = str(book.id)
-    return book, tab_name
-
-
-def _get_org_rankings_book(*, create_if_missing: bool = False):
-    """Get the rankings workbook without any title-based Drive lookup."""
+def _get_org_rankings_book():
+    """Open the manually-created rankings workbook. The app never creates Drive files."""
     _, tab_name = _org_rankings_sheet_target()
     sheet_id = _resolved_org_rankings_sheet_id()
-    if sheet_id:
-        return _open_org_rankings_book_by_id(sheet_id), tab_name, False
-    if create_if_missing:
-        book, tab_name = _create_org_rankings_book()
-        return book, tab_name, True
-    return None, tab_name, False
+    if not sheet_id:
+        raise ValueError(
+            "ORG_RANKINGS_SHEET_ID is not configured. Create a blank Google Sheet in your own Drive, "
+            "share it with the app service account as Editor, then add its spreadsheet ID to Streamlit Secrets."
+        )
+    return _open_org_rankings_book_by_id(sheet_id), tab_name
 
 
 def _org_rankings_worksheet(book, tab_name: str):
@@ -578,7 +554,7 @@ def save_shared_org_ranking(
         [[_sheet_safe_value(value) for value in row] for row in published.itertuples(index=False, name=None)]
     )
 
-    book, tab_name, was_created = _get_org_rankings_book(create_if_missing=True)
+    book, tab_name = _get_org_rankings_book()
     worksheet = _org_rankings_worksheet(book, tab_name)
 
     worksheet.resize(
@@ -587,7 +563,7 @@ def save_shared_org_ranking(
     )
     worksheet.clear()
     worksheet.update(values=values, range_name="A1", value_input_option="USER_ENTERED")
-    return str(book.id), bool(was_created)
+    return str(book.id), False
 
 
 @st.cache_data(ttl=ORG_RANKINGS_CACHE_TTL_SECONDS, show_spinner=False)
@@ -888,7 +864,7 @@ def get_credentials() -> Credentials:
     """Use Streamlit secrets when deployed; fall back to local JSON for local runs."""
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive.readonly",
     ]
 
     try:
@@ -7402,18 +7378,13 @@ def render_org_rankings_page() -> None:
     )
 
     if st.session_state.pop("org_ranking_publish_success", False):
-        st.success("Weekly organization ranking published. Everyone opening this running app will now see this version.")
-        created_sheet_id = str(st.session_state.pop("org_ranking_sheet_id_after_publish", "")).strip()
-        created_new_sheet = bool(st.session_state.pop("org_ranking_created_new_sheet", False))
-        if created_new_sheet and created_sheet_id and not secret_or_default("ORG_RANKINGS_SHEET_ID", "").strip():
-            st.warning(
-                "The app just created the dedicated rankings spreadsheet. Add the ID below to Streamlit Secrets once "
-                "so the same shared ranking survives app restarts/redeployments."
-            )
-            st.code(f'ORG_RANKINGS_SHEET_ID = "{created_sheet_id}"', language="toml")
+        st.success("Weekly organization ranking published. Everyone who opens the app will now see this version.")
+        published_sheet_id = str(st.session_state.pop("org_ranking_sheet_id_after_publish", "")).strip()
+        st.session_state.pop("org_ranking_created_new_sheet", None)
+        if published_sheet_id:
             st.link_button(
                 "Open rankings spreadsheet",
-                f"https://docs.google.com/spreadsheets/d/{created_sheet_id}",
+                f"https://docs.google.com/spreadsheets/d/{published_sheet_id}",
                 use_container_width=False,
             )
 
@@ -7425,10 +7396,10 @@ def render_org_rankings_page() -> None:
         st.error(f"Could not load the shared organization ranking. {exc}")
 
     if not _resolved_org_rankings_sheet_id():
-        st.info(
-            "Shared ranking storage has not been initialized yet. The page is intentionally not contacting Google Drive, "
-            "so it loads immediately. Upload the three PDFs below and publish once; the app will create a dedicated "
-            "spreadsheet and show you the one ORG_RANKINGS_SHEET_ID line to save in Streamlit Secrets."
+        st.warning(
+            "Shared ranking storage is not configured yet. Create one blank Google Sheet in your own Drive, "
+            "share it with the app's service-account email as Editor, and add its spreadsheet ID to Streamlit Secrets as "
+            "ORG_RANKINGS_SHEET_ID. The app will never try to create a Drive file itself."
         )
 
     render_org_ranking_dashboard(shared_org_ranking, shared_org_metadata)
@@ -7438,8 +7409,9 @@ def render_org_rankings_page() -> None:
         expanded=shared_org_ranking.empty,
     ):
         st.caption(
-            "Upload the new PD Pitching, PD Baserunning, and PD Hitting PDFs, verify the preview, "
-            "then publish. The app uses one tiny dedicated Google spreadsheet. If no rankings spreadsheet is configured yet, the first publish creates it; normal page loads never search Google Drive by spreadsheet title."
+            "Upload the new PD Pitching, PD Baserunning, and PD Hitting PDFs, verify the preview, then publish. "
+            "The shared ranking is written only to the dedicated spreadsheet configured by ORG_RANKINGS_SHEET_ID; "
+            "the app never creates Drive files or adds a tab to the main workbook."
         )
 
         ranking_as_of = st.date_input(
@@ -7515,14 +7487,22 @@ def render_org_rankings_page() -> None:
                     height=420,
                 )
 
+                ranking_storage_ready = bool(_resolved_org_rankings_sheet_id())
+                if not ranking_storage_ready:
+                    st.warning(
+                        "Publishing is disabled until ORG_RANKINGS_SHEET_ID is added to Streamlit Secrets. "
+                        "You can still verify the parsed weekly ranking above."
+                    )
+
                 if st.button(
                     "Publish as shared ranking",
                     key="publish_shared_org_ranking",
                     type="primary",
                     use_container_width=True,
+                    disabled=not ranking_storage_ready,
                 ):
                     try:
-                        published_sheet_id, created_new_sheet = save_shared_org_ranking(
+                        published_sheet_id, _ = save_shared_org_ranking(
                             preview_org_ranking,
                             ranking_as_of=ranking_as_of,
                             pitching_filename=pitching_pdf.name,
@@ -7530,12 +7510,11 @@ def render_org_rankings_page() -> None:
                             hitting_filename=hitting_pdf.name,
                         )
                         st.session_state["org_ranking_sheet_id_after_publish"] = published_sheet_id
-                        st.session_state["org_ranking_created_new_sheet"] = created_new_sheet
                     except Exception as exc:
                         st.error(
                             "Could not publish the shared ranking. "
-                            f"{exc} The app will create/use a separate Google spreadsheet for rankings and will not "
-                            "add a rankings tab to the main workbook."
+                            f"{exc} Verify that ORG_RANKINGS_SHEET_ID points to the blank dedicated spreadsheet "
+                            "and that the service account has Editor access to it."
                         )
                     else:
                         load_shared_org_ranking.clear()
