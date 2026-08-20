@@ -123,7 +123,7 @@ BORDER = "#DDE4EE"
 GRID = "#E8EDF3"
 
 st.set_page_config(
-    page_title="Performance × CI",
+    page_title="S&C Influenced Performance Rankings",
     page_icon="⚾",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -825,6 +825,7 @@ def render_org_ranking_dashboard(
         linecolor=BORDER,
     )
     st.plotly_chart(chart, use_container_width=True, config={"displayModeBar": False})
+    st.markdown("**But our strength staff sucks**")
 
     display_cols = [
         "Rank", "Organization",
@@ -7475,7 +7476,6 @@ def render_org_rankings_page() -> None:
     """Render the shared ranking without loading the heavy player-level datasets."""
     st.subheader("S&C Influenced Performance Rankings", anchor=False)
     st.caption(
-        "This is the shared organization ranking shown to everyone who logs in. "
         "Each included metric scores 1st = 30 points through 30th = 1 point."
     )
 
@@ -7679,13 +7679,13 @@ if refresh:
 # loaded only after the user explicitly opens it.
 app_view = st.radio(
     "Dashboard view",
-    ["Org Performance Ranking", "Performance Dashboard"],
+    ["S&C Influenced Performance Rankings", "Performance Dashboard"],
     horizontal=True,
     label_visibility="collapsed",
     key="app_view",
 )
 
-if app_view == "Org Performance Ranking":
+if app_view == "S&C Influenced Performance Rankings":
     render_org_rankings_page()
     st.stop()
 
@@ -7883,7 +7883,7 @@ sprint_adv_runs_summary = build_baserunning_sprint_outcome_summary(
     sprint_adv_runs_tab,
     sc_opportunity_tab,
 ) = st.tabs([
-    "Org Performance Ranking",
+    "S&C Influenced Performance Rankings",
     "FB Velo Overview",
     "Pinch Grip Overview",
     "Peak Power [W] × Pitching Velo",
