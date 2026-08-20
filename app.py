@@ -499,22 +499,28 @@ def _get_org_rankings_book():
     return _open_org_rankings_book_by_id(sheet_id), tab_name
 
 
-def _org_rankings_worksheet(book, tab_name: str):
-    """Use the rankings worksheet; on a new workbook, repurpose its default Sheet1."""
+def _org_rankings_worksheet(book, tab_name: str, *, for_write: bool = False):
+    """Return the rankings worksheet without requiring a perfectly blank new workbook.
+
+    If the dedicated workbook has only one worksheet (for example the default
+    ``Sheet1``), use that worksheet as the rankings store.  On publish, rename it
+    to the configured rankings tab and overwrite its contents.  On read, leave the
+    title/content alone so an uninitialized workbook is treated as "not published"
+    rather than as a fatal configuration error.
+    """
     try:
         return book.worksheet(tab_name)
     except gspread.exceptions.WorksheetNotFound:
         worksheets = book.worksheets()
         if len(worksheets) == 1:
             worksheet = worksheets[0]
-            # Every newly-created Google spreadsheet starts with one Sheet1.
-            # Rename that default sheet instead of adding another worksheet.
-            if not worksheet.get_all_values():
+            if for_write and worksheet.title != tab_name:
                 worksheet.update_title(tab_name)
-                return worksheet
+            return worksheet
         raise ValueError(
-            f"The dedicated rankings spreadsheet '{book.title}' exists, but its "
-            f"'{tab_name}' worksheet is missing and the existing worksheet is not blank."
+            f"The dedicated rankings spreadsheet '{book.title}' does not contain "
+            f"a '{tab_name}' worksheet and has multiple worksheets, so the app cannot "
+            "safely determine which one should store the rankings."
         )
 
 
@@ -555,7 +561,7 @@ def save_shared_org_ranking(
     )
 
     book, tab_name = _get_org_rankings_book()
-    worksheet = _org_rankings_worksheet(book, tab_name)
+    worksheet = _org_rankings_worksheet(book, tab_name, for_write=True)
 
     worksheet.resize(
         rows=max(40, len(values) + 5),
@@ -575,7 +581,7 @@ def load_shared_org_ranking(sheet_id: str) -> tuple[pd.DataFrame, dict[str, str]
     try:
         book = _open_org_rankings_book_by_id(sheet_id)
         _, tab_name = _org_rankings_sheet_target()
-        worksheet = _org_rankings_worksheet(book, tab_name)
+        worksheet = _org_rankings_worksheet(book, tab_name, for_write=False)
         records = worksheet.get_all_records()
     except Exception as exc:
         raise RuntimeError(f"Could not read the dedicated rankings spreadsheet: {exc}") from exc
@@ -592,6 +598,16 @@ def load_shared_org_ranking(sheet_id: str) -> tuple[pd.DataFrame, dict[str, str]
     }
     missing = sorted(required - set(stored.columns))
     if missing:
+        # A newly-created dedicated workbook may contain a title/note in its default
+        # worksheet. Until the first publish, treat that as simply "no ranking yet"
+        # instead of blocking the landing page. Once ranking-like columns exist, keep
+        # strict validation so partial/corrupt published data is never shown silently.
+        ranking_like_headers = {
+            "Rank", "Organization", "FB Velo", "Sprint Speed",
+            "Exit Velo", "p90 EV", "Total Points"
+        }
+        if not (ranking_like_headers & set(stored.columns)):
+            return pd.DataFrame(), {"sheet_id": sheet_id}
         raise ValueError(
             "The shared Org Rankings worksheet is missing required column(s): "
             + ", ".join(missing)
