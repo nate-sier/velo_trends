@@ -7473,7 +7473,7 @@ def require_password() -> None:
 
 def render_org_rankings_page() -> None:
     """Render the shared ranking without loading the heavy player-level datasets."""
-    st.subheader("Organization Performance Ranking", anchor=False)
+    st.subheader("S&C Influenced Performance Rankings", anchor=False)
     st.caption(
         "This is the shared organization ranking shown to everyone who logs in. "
         "Each included metric scores 1st = 30 points through 30th = 1 point."
