@@ -73,6 +73,36 @@ TEAM_ALIASES = {
     "PALMBEACH": "FCL",
 }
 
+# MLB organizations used by the weekly Player Development PDF ranking tab.
+ORG_PD_TEAMS = [
+    "Arizona Diamondbacks", "Atlanta Braves", "Athletics", "Baltimore Orioles",
+    "Boston Red Sox", "Chicago Cubs", "Chicago White Sox", "Cincinnati Reds",
+    "Cleveland Guardians", "Colorado Rockies", "Detroit Tigers", "Houston Astros",
+    "Kansas City Royals", "Los Angeles Angels", "Los Angeles Dodgers",
+    "Miami Marlins", "Milwaukee Brewers", "Minnesota Twins", "New York Mets",
+    "New York Yankees", "Philadelphia Phillies", "Pittsburgh Pirates",
+    "San Diego Padres", "San Francisco Giants", "Seattle Mariners",
+    "St. Louis Cardinals", "Tampa Bay Rays", "Texas Rangers",
+    "Toronto Blue Jays", "Washington Nationals",
+]
+
+# Offsets are the number of extracted PDF value lines after the organization name.
+# The Nationals PD reports use a stable one-row-per-organization layout.
+ORG_PD_REPORT_SPECS = {
+    "pitching": {
+        "title": "PD Pitching",
+        "metrics": {"FB Velo": 1},
+    },
+    "baserunning": {
+        "title": "PD Baserunning",
+        "metrics": {"Sprint Speed": 4},
+    },
+    "hitting": {
+        "title": "PD Hitting",
+        "metrics": {"Exit Velo": 7, "p90 EV": 8},
+    },
+}
+
 # -----------------------------------------------------------------------------
 # DESIGN SYSTEM
 # -----------------------------------------------------------------------------
@@ -282,6 +312,139 @@ def fmt_date(value) -> str:
         return "—"
     value = pd.Timestamp(value)
     return f"{value.strftime('%b')} {value.day}, {value.year}"
+
+
+_ORG_PD_VALUE_RANK_RE = re.compile(r"^(-?\d+(?:\.\d+)?)%?\s*\((\d{1,2})\)$")
+
+
+def _normalize_pdf_line(value: str) -> str:
+    """Collapse PDF extraction whitespace so team/value matching is stable."""
+    return " ".join(str(value).replace("\u00a0", " ").split()).strip()
+
+
+def _pdf_reader_from_bytes(pdf_bytes: bytes):
+    """Load a PDF reader lazily so the main dashboard still starts cleanly."""
+    from io import BytesIO
+
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        try:
+            from PyPDF2 import PdfReader
+        except ImportError as exc:
+            raise ImportError(
+                "The Org Performance Ranking tab needs a PDF parser. "
+                "Add 'pypdf>=5.0.0' to requirements.txt."
+            ) from exc
+    return PdfReader(BytesIO(pdf_bytes))
+
+
+@st.cache_data(show_spinner=False)
+def parse_org_pd_pdf(pdf_bytes: bytes, report_kind: str) -> pd.DataFrame:
+    """Parse the metric values and parenthetical ranks from one weekly PD PDF."""
+    kind = str(report_kind).strip().lower()
+    if kind not in ORG_PD_REPORT_SPECS:
+        raise ValueError(f"Unknown PD report kind: {report_kind}")
+
+    spec = ORG_PD_REPORT_SPECS[kind]
+    reader = _pdf_reader_from_bytes(pdf_bytes)
+    raw_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    if not raw_text.strip():
+        raise ValueError("No text could be extracted from the PDF.")
+    if str(spec["title"]).lower() not in raw_text.lower():
+        raise ValueError(
+            f"This file does not look like the {spec['title']} report. "
+            "Check that it was uploaded into the correct slot."
+        )
+
+    lines = [_normalize_pdf_line(line) for line in raw_text.splitlines()]
+    lines = [line for line in lines if line]
+    line_positions: dict[str, int] = {}
+    for idx, line in enumerate(lines):
+        if line in ORG_PD_TEAMS and line not in line_positions:
+            line_positions[line] = idx
+
+    missing_teams = [team for team in ORG_PD_TEAMS if team not in line_positions]
+    if missing_teams:
+        preview = ", ".join(missing_teams[:5])
+        more = "..." if len(missing_teams) > 5 else ""
+        raise ValueError(
+            f"Could not find all 30 organizations in the {spec['title']} PDF. "
+            f"Missing: {preview}{more}"
+        )
+
+    rows = []
+    for team in ORG_PD_TEAMS:
+        team_idx = line_positions[team]
+        row = {"Organization": team}
+        for metric, offset in spec["metrics"].items():
+            value_idx = team_idx + int(offset)
+            if value_idx >= len(lines):
+                raise ValueError(f"{metric} could not be read for {team}.")
+            token = lines[value_idx]
+            match = _ORG_PD_VALUE_RANK_RE.match(token)
+            if not match:
+                raise ValueError(
+                    f"Unexpected {metric} format for {team}: '{token}'. "
+                    "The weekly report layout may have changed."
+                )
+            value = float(match.group(1))
+            rank = int(match.group(2))
+            if not 1 <= rank <= 30:
+                raise ValueError(f"Invalid {metric} rank for {team}: {rank}")
+            row[metric] = value
+            row[f"{metric} Rank"] = rank
+        rows.append(row)
+
+    parsed = pd.DataFrame(rows)
+    for metric in spec["metrics"]:
+        ranks = sorted(parsed[f"{metric} Rank"].astype(int).tolist())
+        if ranks != list(range(1, 31)):
+            raise ValueError(
+                f"The {metric} ranks in the {spec['title']} PDF are not a complete 1–30 set. "
+                "The PDF may have been parsed incorrectly or its layout may have changed."
+            )
+    return parsed
+
+
+def build_org_pd_rankings(
+    pitching_pd: pd.DataFrame,
+    baserunning_pd: pd.DataFrame,
+    hitting_pd: pd.DataFrame,
+) -> pd.DataFrame:
+    """Combine four organization metric ranks using 1st=30 points ... 30th=1 point."""
+    ranking = pitching_pd.merge(baserunning_pd, on="Organization", how="inner")
+    ranking = ranking.merge(hitting_pd, on="Organization", how="inner")
+    if len(ranking) != 30:
+        raise ValueError(f"Expected 30 organizations after merging the PDFs; found {len(ranking)}.")
+
+    scoring = [
+        ("FB Velo Rank", "FB Velo Pts"),
+        ("Sprint Speed Rank", "Sprint Pts"),
+        ("Exit Velo Rank", "Exit Velo Pts"),
+        ("p90 EV Rank", "p90 EV Pts"),
+    ]
+    for rank_col, points_col in scoring:
+        ranking[points_col] = 31 - pd.to_numeric(ranking[rank_col], errors="raise").astype(int)
+
+    point_cols = [points_col for _, points_col in scoring]
+    ranking["Total Points"] = ranking[point_cols].sum(axis=1).astype(int)
+    ranking["Overall Rank"] = (
+        ranking["Total Points"].rank(method="min", ascending=False).astype(int)
+    )
+    tied_score_counts = ranking["Total Points"].value_counts()
+    ranking["Rank"] = ranking.apply(
+        lambda row: (
+            f"T-{int(row['Overall Rank'])}"
+            if int(tied_score_counts.loc[row["Total Points"]]) > 1
+            else str(int(row["Overall Rank"]))
+        ),
+        axis=1,
+    )
+    ranking = ranking.sort_values(
+        ["Total Points", "Organization"], ascending=[False, True], kind="stable"
+    ).reset_index(drop=True)
+    return ranking
 
 
 def ci_bucket_start(values: pd.Series, width: float) -> pd.Series:
@@ -7070,6 +7233,7 @@ sprint_adv_runs_summary = build_baserunning_sprint_outcome_summary(
     if_reaction_power_tab,
     sprint_nbsr_tab,
     sprint_adv_runs_tab,
+    org_rankings_tab,
     sc_opportunity_tab,
 ) = st.tabs([
     "FB Velo Overview",
@@ -7083,6 +7247,7 @@ sprint_adv_runs_summary = build_baserunning_sprint_outcome_summary(
     "Rel PP × IF Reaction 3ft",
     "Sprint Speed × nBSR",
     "Sprint Speed × Adv Runs",
+    "Org Performance Ranking",
     "S&C Opportunity",
 ])
 
@@ -9419,6 +9584,176 @@ with sprint_adv_runs_tab:
         tab_key="sprint_adv_runs",
         default_bucket_width=0.5,
     )
+
+
+with org_rankings_tab:
+    st.subheader("Organization Performance Ranking", anchor=False)
+    st.caption(
+        "Upload the current weekly PD Pitching, PD Baserunning, and PD Hitting PDFs. "
+        "The dashboard reads the metric ranks in parentheses and scores each metric as "
+        "1st = 30 points through 30th = 1 point. Maximum combined score = 120."
+    )
+
+    upload_cols = st.columns(3)
+    with upload_cols[0]:
+        pitching_pdf = st.file_uploader(
+            "PD Pitching PDF",
+            type=["pdf"],
+            key="org_rank_pitching_pdf",
+            help="Used for FB Velo rank.",
+        )
+    with upload_cols[1]:
+        baserunning_pdf = st.file_uploader(
+            "PD Baserunning PDF",
+            type=["pdf"],
+            key="org_rank_baserunning_pdf",
+            help="Used for Sprint Speed rank.",
+        )
+    with upload_cols[2]:
+        hitting_pdf = st.file_uploader(
+            "PD Hitting PDF",
+            type=["pdf"],
+            key="org_rank_hitting_pdf",
+            help="Used for Exit Velo and p90 EV ranks.",
+        )
+
+    if not all([pitching_pdf, baserunning_pdf, hitting_pdf]):
+        st.info(
+            "Upload all three weekly PDFs to build the 30-organization ranking. "
+            "Next week, replace these three files with the new reports and the ranking recalculates automatically."
+        )
+    else:
+        try:
+            pitching_pd = parse_org_pd_pdf(pitching_pdf.getvalue(), "pitching")
+            baserunning_pd = parse_org_pd_pdf(baserunning_pdf.getvalue(), "baserunning")
+            hitting_pd = parse_org_pd_pdf(hitting_pdf.getvalue(), "hitting")
+            org_ranking = build_org_pd_rankings(pitching_pd, baserunning_pd, hitting_pd)
+        except Exception as exc:
+            st.error(f"Could not build the organization ranking: {exc}")
+        else:
+            nats_row = org_ranking.loc[
+                org_ranking["Organization"] == "Washington Nationals"
+            ].iloc[0]
+            leader_row = org_ranking.iloc[0]
+
+            kpi_cols = st.columns(4)
+            kpi_values = [
+                ("Nationals Rank", str(nats_row["Rank"]), ACCENT_RED),
+                ("Nationals Score", f"{int(nats_row['Total Points'])} / 120", NAVY),
+                ("Current Leader", str(leader_row["Organization"]), BLUE),
+                ("Leader Score", f"{int(leader_row['Total Points'])} / 120", GREEN),
+            ]
+            for column, values in zip(kpi_cols, kpi_values):
+                with column:
+                    st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+            chart_data = org_ranking.sort_values(
+                ["Total Points", "Organization"], ascending=[False, True]
+            ).copy()
+            chart = go.Figure()
+            chart.add_trace(
+                go.Bar(
+                    x=chart_data["Total Points"],
+                    y=chart_data["Organization"],
+                    orientation="h",
+                    marker={
+                        "color": [
+                            ACCENT_RED if team == "Washington Nationals" else BLUE
+                            for team in chart_data["Organization"]
+                        ]
+                    },
+                    text=chart_data["Total Points"].astype(str),
+                    textposition="outside",
+                    cliponaxis=False,
+                    customdata=np.column_stack([
+                        chart_data["Rank"],
+                        chart_data["FB Velo Rank"],
+                        chart_data["Sprint Speed Rank"],
+                        chart_data["Exit Velo Rank"],
+                        chart_data["p90 EV Rank"],
+                    ]),
+                    hovertemplate=(
+                        "<b>%{y}</b><br>Overall rank: %{customdata[0]}<br>"
+                        "Total points: %{x}<br><br>"
+                        "FB Velo rank: %{customdata[1]}<br>"
+                        "Sprint Speed rank: %{customdata[2]}<br>"
+                        "Exit Velo rank: %{customdata[3]}<br>"
+                        "p90 EV rank: %{customdata[4]}<extra></extra>"
+                    ),
+                )
+            )
+            chart.update_layout(
+                paper_bgcolor=CARD_BG,
+                plot_bgcolor=CARD_BG,
+                font={"family": "Inter, Avenir Next, Arial, sans-serif", "color": TEXT},
+                margin={"l": 20, "r": 55, "t": 20, "b": 50},
+                height=900,
+                showlegend=False,
+            )
+            chart.update_xaxes(
+                title="Combined points (max 120)",
+                range=[0, 124],
+                showgrid=True,
+                gridcolor=GRID,
+                zeroline=False,
+                linecolor=BORDER,
+            )
+            chart.update_yaxes(
+                title=None,
+                autorange="reversed",
+                showgrid=False,
+                linecolor=BORDER,
+            )
+            st.plotly_chart(chart, use_container_width=True, config={"displayModeBar": False})
+
+            display_cols = [
+                "Rank", "Organization",
+                "FB Velo", "FB Velo Rank", "FB Velo Pts",
+                "Sprint Speed", "Sprint Speed Rank", "Sprint Pts",
+                "Exit Velo", "Exit Velo Rank", "Exit Velo Pts",
+                "p90 EV", "p90 EV Rank", "p90 EV Pts",
+                "Total Points",
+            ]
+            ranking_display = org_ranking[display_cols].copy()
+            ranking_display = ranking_display.rename(columns={
+                "FB Velo Rank": "FB Rank",
+                "FB Velo Pts": "FB Pts",
+                "Sprint Speed Rank": "Sprint Rank",
+                "Exit Velo Rank": "EV Rank",
+                "Exit Velo Pts": "EV Pts",
+                "p90 EV Rank": "p90 Rank",
+                "p90 EV Pts": "p90 Pts",
+            })
+            st.dataframe(
+                ranking_display,
+                hide_index=True,
+                use_container_width=True,
+                height=760,
+                column_config={
+                    "FB Velo": st.column_config.NumberColumn(format="%.1f mph"),
+                    "Sprint Speed": st.column_config.NumberColumn(format="%.1f ft/s"),
+                    "Exit Velo": st.column_config.NumberColumn(format="%.1f mph"),
+                    "p90 EV": st.column_config.NumberColumn(format="%.1f mph"),
+                    "Total Points": st.column_config.NumberColumn(format="%d"),
+                },
+            )
+            csv_download_button(
+                ranking_display,
+                "Download organization ranking CSV",
+                "organization_performance_ranking.csv",
+                "download_organization_performance_ranking",
+            )
+
+            with st.expander("Scoring and source check"):
+                st.markdown(
+                    "**Scoring:** points = `31 - metric rank`. The four metrics are weighted equally. "
+                    "FB Velo comes from the Pitching PDF, Sprint Speed from the Baserunning PDF, "
+                    "and Exit Velo + p90 EV from the Hitting PDF. Tied combined scores remain tied."
+                )
+                st.caption(
+                    f"Pitching: {pitching_pdf.name} · Baserunning: {baserunning_pdf.name} · "
+                    f"Hitting: {hitting_pdf.name}"
+                )
 
 
 with sc_opportunity_tab:
