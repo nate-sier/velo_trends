@@ -450,6 +450,62 @@ def build_org_pd_rankings(
     return ranking
 
 
+ORG_HITTING_SCORE_MODES = {
+    "Both hitting metrics": ["Exit Velo Pts", "p90 EV Pts"],
+    "Exit Velo only": ["Exit Velo Pts"],
+    "p90 EV only": ["p90 EV Pts"],
+}
+
+
+def apply_org_ranking_metric_filter(
+    ranking: pd.DataFrame,
+    hitting_mode: str = "Both hitting metrics",
+) -> tuple[pd.DataFrame, int, list[str]]:
+    """Re-score the org ranking while always retaining FB Velo and Sprint Speed.
+
+    The weekly published sheet keeps all four raw metric ranks/points. This helper
+    only changes the viewer's scoring/display so either hitting metric can be
+    filtered out without re-uploading or re-publishing the PDFs.
+    """
+    if ranking is None or ranking.empty:
+        return pd.DataFrame(), 0, []
+
+    selected_hitting_points = ORG_HITTING_SCORE_MODES.get(
+        hitting_mode, ORG_HITTING_SCORE_MODES["Both hitting metrics"]
+    )
+    point_cols = ["FB Velo Pts", "Sprint Pts", *selected_hitting_points]
+    missing = [col for col in point_cols if col not in ranking.columns]
+    if missing:
+        raise ValueError(
+            "Organization ranking is missing scoring column(s): " + ", ".join(missing)
+        )
+
+    out = ranking.copy()
+    out["Total Points"] = out[point_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1).astype(int)
+    out["Overall Rank"] = out["Total Points"].rank(method="min", ascending=False).astype(int)
+    tied_score_counts = out["Total Points"].value_counts()
+    out["Rank"] = out.apply(
+        lambda row: (
+            f"T-{int(row['Overall Rank'])}"
+            if int(tied_score_counts.loc[row["Total Points"]]) > 1
+            else str(int(row["Overall Rank"]))
+        ),
+        axis=1,
+    )
+    out = out.sort_values(
+        ["Total Points", "Organization"], ascending=[False, True], kind="stable"
+    ).reset_index(drop=True)
+
+    included_metrics = ["FB Velo", "Sprint Speed"]
+    if "Exit Velo Pts" in selected_hitting_points:
+        included_metrics.append("Exit Velo")
+    if "p90 EV Pts" in selected_hitting_points:
+        included_metrics.append("p90 EV")
+
+    max_points = 30 * len(point_cols)
+    return out, max_points, included_metrics
+
+
 def _sheet_safe_value(value):
     """Convert pandas/numpy values to simple values accepted by gspread."""
     if value is None or pd.isna(value):
@@ -646,19 +702,33 @@ def load_shared_org_ranking(sheet_id: str) -> tuple[pd.DataFrame, dict[str, str]
     return ranking, metadata
 
 
-def render_org_ranking_dashboard(org_ranking: pd.DataFrame, metadata: dict[str, str] | None = None) -> None:
-    """Render the shared/current organization ranking consistently."""
+def render_org_ranking_dashboard(
+    org_ranking: pd.DataFrame,
+    metadata: dict[str, str] | None = None,
+    hitting_mode: str = "Both hitting metrics",
+) -> None:
+    """Render the shared/current organization ranking with a selectable hitting score."""
     if org_ranking is None or org_ranking.empty:
         st.info("No shared organization ranking has been published yet.")
         return
 
+    try:
+        scored_ranking, max_points, included_metrics = apply_org_ranking_metric_filter(
+            org_ranking, hitting_mode
+        )
+    except Exception as exc:
+        st.error(f"Could not apply the organization ranking metric filter. {exc}")
+        return
+
     metadata = metadata or {}
-    nats_match = org_ranking.loc[org_ranking["Organization"] == "Washington Nationals"]
+    nats_match = scored_ranking.loc[
+        scored_ranking["Organization"] == "Washington Nationals"
+    ]
     if nats_match.empty:
         st.error("Washington Nationals are missing from the current organization ranking.")
         return
     nats_row = nats_match.iloc[0]
-    leader_row = org_ranking.iloc[0]
+    leader_row = scored_ranking.iloc[0]
 
     as_of = metadata.get("ranking_as_of", "")
     updated = metadata.get("updated_at", "")
@@ -673,26 +743,41 @@ def render_org_ranking_dashboard(org_ranking: pd.DataFrame, metadata: dict[str, 
         caption = f"Shared weekly ranking · as of {as_of_label}"
         if updated:
             try:
-                updated_label = pd.Timestamp(updated).strftime("%b %d, %Y at %I:%M %p").replace(" 0", " ")
+                updated_label = pd.Timestamp(updated).strftime(
+                    "%b %d, %Y at %I:%M %p"
+                ).replace(" 0", " ")
                 caption += f" · published {updated_label}"
             except Exception:
                 pass
         st.caption(caption)
 
+    score_label = " + ".join(included_metrics)
+    st.caption(f"Current scoring view: {score_label} · maximum {max_points} points")
+
     kpi_cols = st.columns(4)
     kpi_values = [
         ("Nationals Rank", str(nats_row["Rank"]), ACCENT_RED),
-        ("Nationals Score", f"{int(nats_row['Total Points'])} / 120", NAVY),
+        ("Nationals Score", f"{int(nats_row['Total Points'])} / {max_points}", NAVY),
         ("Current Leader", str(leader_row["Organization"]), BLUE),
-        ("Leader Score", f"{int(leader_row['Total Points'])} / 120", GREEN),
+        ("Leader Score", f"{int(leader_row['Total Points'])} / {max_points}", GREEN),
     ]
     for column, values in zip(kpi_cols, kpi_values):
         with column:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
-    chart_data = org_ranking.sort_values(
-        ["Total Points", "Organization"], ascending=[False, True]
-    ).copy()
+    chart_data = scored_ranking.copy()
+    custom_cols = ["Rank", "FB Velo Rank", "Sprint Speed Rank"]
+    hover_lines = [
+        "FB Velo rank: %{customdata[1]}",
+        "Sprint Speed rank: %{customdata[2]}",
+    ]
+    if "Exit Velo" in included_metrics:
+        custom_cols.append("Exit Velo Rank")
+        hover_lines.append(f"Exit Velo rank: %{{customdata[{len(custom_cols) - 1}]}}")
+    if "p90 EV" in included_metrics:
+        custom_cols.append("p90 EV Rank")
+        hover_lines.append(f"p90 EV rank: %{{customdata[{len(custom_cols) - 1}]}}")
+
     chart = go.Figure()
     chart.add_trace(
         go.Bar(
@@ -708,20 +793,12 @@ def render_org_ranking_dashboard(org_ranking: pd.DataFrame, metadata: dict[str, 
             text=chart_data["Total Points"].astype(int).astype(str),
             textposition="outside",
             cliponaxis=False,
-            customdata=np.column_stack([
-                chart_data["Rank"],
-                chart_data["FB Velo Rank"],
-                chart_data["Sprint Speed Rank"],
-                chart_data["Exit Velo Rank"],
-                chart_data["p90 EV Rank"],
-            ]),
+            customdata=chart_data[custom_cols].to_numpy(),
             hovertemplate=(
                 "<b>%{y}</b><br>Overall rank: %{customdata[0]}<br>"
                 "Total points: %{x}<br><br>"
-                "FB Velo rank: %{customdata[1]}<br>"
-                "Sprint Speed rank: %{customdata[2]}<br>"
-                "Exit Velo rank: %{customdata[3]}<br>"
-                "p90 EV rank: %{customdata[4]}<extra></extra>"
+                + "<br>".join(hover_lines)
+                + "<extra></extra>"
             ),
         )
     )
@@ -734,8 +811,8 @@ def render_org_ranking_dashboard(org_ranking: pd.DataFrame, metadata: dict[str, 
         showlegend=False,
     )
     chart.update_xaxes(
-        title="Combined points (max 120)",
-        range=[0, 124],
+        title=f"Combined points (max {max_points})",
+        range=[0, max_points + 4],
         showgrid=True,
         gridcolor=GRID,
         zeroline=False,
@@ -753,11 +830,14 @@ def render_org_ranking_dashboard(org_ranking: pd.DataFrame, metadata: dict[str, 
         "Rank", "Organization",
         "FB Velo", "FB Velo Rank", "FB Velo Pts",
         "Sprint Speed", "Sprint Speed Rank", "Sprint Pts",
-        "Exit Velo", "Exit Velo Rank", "Exit Velo Pts",
-        "p90 EV", "p90 EV Rank", "p90 EV Pts",
-        "Total Points",
     ]
-    ranking_display = org_ranking[display_cols].copy()
+    if "Exit Velo" in included_metrics:
+        display_cols.extend(["Exit Velo", "Exit Velo Rank", "Exit Velo Pts"])
+    if "p90 EV" in included_metrics:
+        display_cols.extend(["p90 EV", "p90 EV Rank", "p90 EV Pts"])
+    display_cols.append("Total Points")
+
+    ranking_display = scored_ranking[display_cols].copy()
     ranking_display = ranking_display.rename(columns={
         "FB Velo Rank": "FB Rank",
         "FB Velo Pts": "FB Pts",
@@ -767,18 +847,22 @@ def render_org_ranking_dashboard(org_ranking: pd.DataFrame, metadata: dict[str, 
         "p90 EV Rank": "p90 Rank",
         "p90 EV Pts": "p90 Pts",
     })
+    column_config = {
+        "FB Velo": st.column_config.NumberColumn(format="%.1f mph"),
+        "Sprint Speed": st.column_config.NumberColumn(format="%.1f ft/s"),
+        "Total Points": st.column_config.NumberColumn(format="%d"),
+    }
+    if "Exit Velo" in included_metrics:
+        column_config["Exit Velo"] = st.column_config.NumberColumn(format="%.1f mph")
+    if "p90 EV" in included_metrics:
+        column_config["p90 EV"] = st.column_config.NumberColumn(format="%.1f mph")
+
     st.dataframe(
         ranking_display,
         hide_index=True,
         use_container_width=True,
         height=760,
-        column_config={
-            "FB Velo": st.column_config.NumberColumn(format="%.1f mph"),
-            "Sprint Speed": st.column_config.NumberColumn(format="%.1f ft/s"),
-            "Exit Velo": st.column_config.NumberColumn(format="%.1f mph"),
-            "p90 EV": st.column_config.NumberColumn(format="%.1f mph"),
-            "Total Points": st.column_config.NumberColumn(format="%d"),
-        },
+        column_config=column_config,
     )
     csv_download_button(
         ranking_display,
@@ -788,10 +872,12 @@ def render_org_ranking_dashboard(org_ranking: pd.DataFrame, metadata: dict[str, 
     )
 
     with st.expander("Scoring and source check"):
+        included_text = ", ".join(included_metrics)
         st.markdown(
-            "**Scoring:** points = `31 - metric rank`. The four metrics are weighted equally. "
-            "FB Velo comes from the Pitching PDF, Sprint Speed from the Baserunning PDF, "
-            "and Exit Velo + p90 EV from the Hitting PDF. Tied combined scores remain tied."
+            f"**Scoring:** points = `31 - metric rank`. This view includes **{included_text}** "
+            f"for a maximum of **{max_points} points**. The weekly shared sheet still stores all four "
+            "raw metrics, so changing the hitting filter does not require re-uploading or re-publishing the PDFs. "
+            "Tied combined scores remain tied."
         )
         source_parts = []
         if metadata.get("pitching_pdf"):
@@ -7390,7 +7476,19 @@ def render_org_rankings_page() -> None:
     st.subheader("Organization Performance Ranking", anchor=False)
     st.caption(
         "This is the shared organization ranking shown to everyone who logs in. "
-        "Each metric scores 1st = 30 points through 30th = 1 point; maximum combined score = 120."
+        "Each included metric scores 1st = 30 points through 30th = 1 point."
+    )
+
+    hitting_mode = st.radio(
+        "Hitting metrics included in score",
+        ["Both hitting metrics", "Exit Velo only", "p90 EV only"],
+        horizontal=True,
+        key="org_rank_hitting_mode",
+        help=(
+            "FB Velo and Sprint Speed are always included. Choose whether the score uses both hitting "
+            "metrics or filters out one of them. This only changes the ranking view; the shared weekly "
+            "data still stores all four metrics."
+        ),
     )
 
     if st.session_state.pop("org_ranking_publish_success", False):
@@ -7418,7 +7516,11 @@ def render_org_rankings_page() -> None:
             "ORG_RANKINGS_SHEET_ID. The app will never try to create a Drive file itself."
         )
 
-    render_org_ranking_dashboard(shared_org_ranking, shared_org_metadata)
+    render_org_ranking_dashboard(
+        shared_org_ranking,
+        shared_org_metadata,
+        hitting_mode=hitting_mode,
+    )
 
     with st.expander(
         "Update weekly ranking",
@@ -7426,8 +7528,8 @@ def render_org_rankings_page() -> None:
     ):
         st.caption(
             "Upload the new PD Pitching, PD Baserunning, and PD Hitting PDFs, verify the preview, then publish. "
-            "The shared ranking is written only to the dedicated spreadsheet configured by ORG_RANKINGS_SHEET_ID; "
-            "the app never creates Drive files or adds a tab to the main workbook."
+            "All four raw metric ranks are stored in the shared sheet. The hitting-metric control above can then "
+            "re-score the same weekly data with both, Exit Velo only, or p90 EV only."
         )
 
         ranking_as_of = st.date_input(
@@ -7456,7 +7558,7 @@ def render_org_rankings_page() -> None:
                 "PD Hitting PDF",
                 type=["pdf"],
                 key="org_rank_hitting_pdf",
-                help="Used for Exit Velo and p90 EV ranks.",
+                help="Stores both Exit Velo and p90 EV ranks.",
             )
 
         if not all([pitching_pdf, baserunning_pdf, hitting_pdf]):
@@ -7466,8 +7568,11 @@ def render_org_rankings_page() -> None:
                 pitching_pd = parse_org_pd_pdf(pitching_pdf.getvalue(), "pitching")
                 baserunning_pd = parse_org_pd_pdf(baserunning_pdf.getvalue(), "baserunning")
                 hitting_pd = parse_org_pd_pdf(hitting_pdf.getvalue(), "hitting")
-                preview_org_ranking = build_org_pd_rankings(
+                full_preview_org_ranking = build_org_pd_rankings(
                     pitching_pd, baserunning_pd, hitting_pd
+                )
+                preview_org_ranking, preview_max_points, preview_metrics = apply_org_ranking_metric_filter(
+                    full_preview_org_ranking, hitting_mode
                 )
             except Exception as exc:
                 st.error(f"Could not build the organization ranking: {exc}")
@@ -7480,24 +7585,31 @@ def render_org_rankings_page() -> None:
                 preview_cols = st.columns(4)
                 preview_values = [
                     ("Preview Leader", str(preview_leader["Organization"]), BLUE),
-                    ("Leader Score", f"{int(preview_leader['Total Points'])} / 120", GREEN),
+                    ("Leader Score", f"{int(preview_leader['Total Points'])} / {preview_max_points}", GREEN),
                     ("Nationals Rank", str(preview_nats["Rank"]), ACCENT_RED),
-                    ("Nationals Score", f"{int(preview_nats['Total Points'])} / 120", NAVY),
+                    ("Nationals Score", f"{int(preview_nats['Total Points'])} / {preview_max_points}", NAVY),
                 ]
                 for column, values in zip(preview_cols, preview_values):
                     with column:
                         st.markdown(metric_card(*values), unsafe_allow_html=True)
 
+                preview_display_cols = [
+                    "Rank", "Organization", "FB Velo Rank", "Sprint Speed Rank"
+                ]
+                preview_rename = {
+                    "FB Velo Rank": "FB Rank",
+                    "Sprint Speed Rank": "Sprint Rank",
+                }
+                if "Exit Velo" in preview_metrics:
+                    preview_display_cols.append("Exit Velo Rank")
+                    preview_rename["Exit Velo Rank"] = "EV Rank"
+                if "p90 EV" in preview_metrics:
+                    preview_display_cols.append("p90 EV Rank")
+                    preview_rename["p90 EV Rank"] = "p90 Rank"
+                preview_display_cols.append("Total Points")
+
                 st.dataframe(
-                    preview_org_ranking[[
-                        "Rank", "Organization", "FB Velo Rank", "Sprint Speed Rank",
-                        "Exit Velo Rank", "p90 EV Rank", "Total Points"
-                    ]].rename(columns={
-                        "FB Velo Rank": "FB Rank",
-                        "Sprint Speed Rank": "Sprint Rank",
-                        "Exit Velo Rank": "EV Rank",
-                        "p90 EV Rank": "p90 Rank",
-                    }),
+                    preview_org_ranking[preview_display_cols].rename(columns=preview_rename),
                     hide_index=True,
                     use_container_width=True,
                     height=420,
@@ -7518,8 +7630,10 @@ def render_org_rankings_page() -> None:
                     disabled=not ranking_storage_ready,
                 ):
                     try:
+                        # Always publish all four base metrics. The page-level hitting filter is a
+                        # presentation/scoring choice and can be changed later without republishing.
                         published_sheet_id, _ = save_shared_org_ranking(
-                            preview_org_ranking,
+                            full_preview_org_ranking,
                             ranking_as_of=ranking_as_of,
                             pitching_filename=pitching_pdf.name,
                             baserunning_filename=baserunning_pdf.name,
@@ -7529,7 +7643,7 @@ def render_org_rankings_page() -> None:
                     except Exception as exc:
                         st.error(
                             "Could not publish the shared ranking. "
-                            f"{exc} Verify that ORG_RANKINGS_SHEET_ID points to the blank dedicated spreadsheet "
+                            f"{exc} Verify that ORG_RANKINGS_SHEET_ID points to the dedicated spreadsheet "
                             "and that the service account has Editor access to it."
                         )
                     else:
