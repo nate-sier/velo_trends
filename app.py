@@ -54,6 +54,7 @@ POTENTIAL_PEAK_POWER_REL_INCREASE = 5.0
 POTENTIAL_PEAK_POWER_INCREASE = 500.0
 MIN_SPRINT_MONTH_DATA_DATES = 14
 ORG_RANKINGS_TAB = "Org Rankings"
+ORG_RANKINGS_SPREADSHEET_NAME = "Org Performance Rankings"
 ORG_RANKINGS_CACHE_TTL_SECONDS = 60
 
 # Only these affiliate / roster groups are available in the dashboard.
@@ -461,12 +462,51 @@ def _sheet_safe_value(value):
 
 
 def _org_rankings_sheet_target() -> tuple[str, str]:
-    """Return the shared spreadsheet ID and worksheet name used for published rankings."""
-    sheet_id = secret_or_default("ORG_RANKINGS_SHEET_ID", "").strip()
-    if not sheet_id:
-        sheet_id = secret_or_default("SHEET_ID", DEFAULT_SHEET_ID).strip()
+    """Return the dedicated rankings workbook name and worksheet name.
+
+    The ranking store is intentionally identified by its own workbook name instead
+    of a spreadsheet ID from the main app. The app will create this whole Google
+    spreadsheet automatically if it does not exist.
+    """
+    sheet_name = (
+        secret_or_default("ORG_RANKINGS_SHEET_NAME", ORG_RANKINGS_SPREADSHEET_NAME).strip()
+        or ORG_RANKINGS_SPREADSHEET_NAME
+    )
     tab_name = secret_or_default("ORG_RANKINGS_TAB", ORG_RANKINGS_TAB).strip() or ORG_RANKINGS_TAB
-    return sheet_id, tab_name
+    return sheet_name, tab_name
+
+
+def _open_or_create_org_rankings_book(client: gspread.Client):
+    """Open the dedicated rankings spreadsheet, creating the whole workbook if needed."""
+    sheet_name, tab_name = _org_rankings_sheet_target()
+
+    try:
+        book = client.open(sheet_name)
+    except gspread.exceptions.SpreadsheetNotFound:
+        # This creates an ENTIRELY NEW Google spreadsheet owned by the service
+        # account. It does not touch the main Performance × CI spreadsheet.
+        book = client.create(sheet_name)
+
+    return book, tab_name
+
+
+def _org_rankings_worksheet(book, tab_name: str):
+    """Use the rankings worksheet; on a new workbook, repurpose its default Sheet1."""
+    try:
+        return book.worksheet(tab_name)
+    except gspread.exceptions.WorksheetNotFound:
+        worksheets = book.worksheets()
+        if len(worksheets) == 1:
+            worksheet = worksheets[0]
+            # Every newly-created Google spreadsheet starts with one Sheet1.
+            # Rename that default sheet instead of adding a second worksheet.
+            if not worksheet.get_all_values():
+                worksheet.update_title(tab_name)
+                return worksheet
+        raise ValueError(
+            f"The dedicated rankings spreadsheet '{book.title}' exists, but its "
+            f"'{tab_name}' worksheet is missing and the existing worksheet is not blank."
+        )
 
 
 def save_shared_org_ranking(
@@ -505,19 +545,17 @@ def save_shared_org_ranking(
         [[_sheet_safe_value(value) for value in row] for row in published.itertuples(index=False, name=None)]
     )
 
-    sheet_id, tab_name = _org_rankings_sheet_target()
     creds = get_credentials()
     client = gspread.authorize(creds)
-    book = client.open_by_key(sheet_id)
-    try:
-        worksheet = book.worksheet(tab_name)
-    except gspread.exceptions.WorksheetNotFound:
-        worksheet = book.add_worksheet(
-            title=tab_name,
-            rows=max(100, len(values) + 10),
-            cols=max(30, len(published.columns) + 5),
-        )
+    book, tab_name = _open_or_create_org_rankings_book(client)
+    worksheet = _org_rankings_worksheet(book, tab_name)
 
+    # A 30-org table is tiny. Keep the storage worksheet compact so this dedicated
+    # workbook stays far below Google Sheets' 10-million-cell limit.
+    worksheet.resize(
+        rows=max(40, len(values) + 5),
+        cols=max(16, len(published.columns) + 2),
+    )
     worksheet.clear()
     worksheet.update(values=values, range_name="A1", value_input_option="USER_ENTERED")
 
@@ -525,13 +563,12 @@ def save_shared_org_ranking(
 @st.cache_data(ttl=ORG_RANKINGS_CACHE_TTL_SECONDS, show_spinner=False)
 def load_shared_org_ranking() -> tuple[pd.DataFrame, dict[str, str]]:
     """Load the most recently published organization ranking from Google Sheets."""
-    sheet_id, tab_name = _org_rankings_sheet_target()
     creds = get_credentials()
     client = gspread.authorize(creds)
-    book = client.open_by_key(sheet_id)
     try:
-        worksheet = book.worksheet(tab_name)
-    except gspread.exceptions.WorksheetNotFound:
+        book, tab_name = _open_or_create_org_rankings_book(client)
+        worksheet = _org_rankings_worksheet(book, tab_name)
+    except (gspread.exceptions.APIError, ValueError):
         return pd.DataFrame(), {}
 
     records = worksheet.get_all_records()
@@ -818,7 +855,7 @@ def get_credentials() -> Credentials:
     """Use Streamlit secrets when deployed; fall back to local JSON for local runs."""
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/drive",
     ]
 
     try:
@@ -9906,7 +9943,7 @@ with org_rankings_tab:
     ):
         st.caption(
             "Upload the new PD Pitching, PD Baserunning, and PD Hitting PDFs, verify the preview, "
-            "then publish. Publishing replaces the current shared ranking in Google Sheets."
+            "then publish. The app creates a separate Google spreadsheet named “Org Performance Rankings” automatically (if it does not already exist), then replaces the current shared ranking there."
         )
 
         ranking_as_of = st.date_input(
@@ -9999,7 +10036,8 @@ with org_rankings_tab:
                     except Exception as exc:
                         st.error(
                             "Could not publish the shared ranking. "
-                            f"{exc} Make sure the Google service account has Editor access to the rankings spreadsheet."
+                            f"{exc} The app will create/use a separate Google spreadsheet for rankings and will not "
+                            "add a rankings tab to the main workbook."
                         )
                     else:
                         load_shared_org_ranking.clear()
