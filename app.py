@@ -10881,3 +10881,4 @@ with sc_opportunity_tab:
             st.dataframe(hitter_under_display, hide_index=True, use_container_width=True, height=min(660, 44 + 36 * (len(hitter_under_display) + 1)), column_config={
                 "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Projected Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Bat-Speed Residual": st.column_config.NumberColumn(format="%+.2f mph"), "YTD Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "P90 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "Projected P90 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "P90 Exit-Velo Residual": st.column_config.NumberColumn(format="%+.2f mph")})
             csv_download_button(hitter_under_display, "Download hitters underperforming CI CSV", "hitters_underperforming_ci.csv", "download_hitters_underperforming_ci")
+
