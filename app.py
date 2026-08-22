@@ -2669,6 +2669,95 @@ def bat_correlation_stats(
     return r, r * r, float(slope), float(intercept)
 
 
+def fit_simple_projection_model(
+    pairs: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+) -> dict | None:
+    """Fit a simple OLS model and retain uncertainty needed for change projections."""
+    if pairs is None or pairs.empty:
+        return None
+    data = pairs[[x_col, y_col]].dropna().copy().reset_index(drop=True)
+    n = len(data)
+    if n < 3:
+        return None
+
+    x_values = data[x_col].to_numpy(dtype=float)
+    y_values = data[y_col].to_numpy(dtype=float)
+    if np.isclose(np.std(x_values), 0) or np.isclose(np.std(y_values), 0):
+        return None
+
+    x = np.column_stack([np.ones(n), x_values])
+    coef, _, _, _ = np.linalg.lstsq(x, y_values, rcond=None)
+    predicted = x @ coef
+    residual = y_values - predicted
+    df_residual = n - 2
+    ss_residual = float(np.sum(residual ** 2))
+    sigma2 = ss_residual / df_residual if df_residual > 0 else np.nan
+    covariance = (
+        sigma2 * np.linalg.pinv(x.T @ x)
+        if df_residual > 0
+        else np.full((2, 2), np.nan, dtype=float)
+    )
+    rmse = float(np.sqrt(np.mean(residual ** 2)))
+
+    cv_predicted = np.full(n, np.nan, dtype=float)
+    for row_index in range(n):
+        mask = np.ones(n, dtype=bool)
+        mask[row_index] = False
+        x_train = x[mask]
+        y_train = y_values[mask]
+        if len(y_train) < 2 or np.linalg.matrix_rank(x_train) < 2:
+            continue
+        train_coef, _, _, _ = np.linalg.lstsq(x_train, y_train, rcond=None)
+        cv_predicted[row_index] = x[row_index] @ train_coef
+    valid_cv = np.isfinite(cv_predicted)
+    cv_rmse = (
+        float(np.sqrt(np.mean((y_values - cv_predicted) ** 2)))
+        if valid_cv.all()
+        else np.nan
+    )
+
+    return {
+        "intercept": float(coef[0]),
+        "slope": float(coef[1]),
+        "covariance": covariance,
+        "sigma2": sigma2,
+        "df_residual": df_residual,
+        "rmse": rmse,
+        "cv_rmse": cv_rmse,
+        "n": n,
+    }
+
+
+def approx_t_critical_95(df_residual: int | float) -> float:
+    """Two-sided 95% Student-t critical value using a small Cornish-Fisher approximation."""
+    try:
+        df = float(df_residual)
+    except (TypeError, ValueError):
+        return 1.96
+    if not np.isfinite(df) or df <= 0:
+        return 1.96
+
+    z = 1.959963984540054
+    inv_df = 1.0 / df
+    return float(
+        z
+        + (z ** 3 + z) * inv_df / 4.0
+        + (5.0 * z ** 5 + 16.0 * z ** 3 + 3.0 * z) * inv_df ** 2 / 96.0
+        + (3.0 * z ** 7 + 19.0 * z ** 5 + 17.0 * z ** 3 - 15.0 * z)
+        * inv_df ** 3
+        / 384.0
+    )
+
+
+def format_interval(low: float, high: float, unit: str = "mph") -> str:
+    """Format a signed projection interval for table display."""
+    if not np.isfinite(low) or not np.isfinite(high):
+        return "—"
+    return f"{float(low):+.2f} to {float(high):+.2f} {unit}"
+
+
 def bat_ci_band_summary(
     pairs: pd.DataFrame,
     band_width: int,
@@ -5184,6 +5273,8 @@ def _fit_cross_sectional_variant(
         if df_residual > 0 and pd.notna(r2) else np.nan
     )
 
+    sigma2 = np.nan
+    covariance = np.full((k + 1, k + 1), np.nan, dtype=float)
     if df_residual > 0:
         sigma2 = ss_residual / df_residual
         covariance = sigma2 * np.linalg.pinv(x.T @ x)
@@ -5227,6 +5318,8 @@ def _fit_cross_sectional_variant(
         "data": data,
         "coef": coef,
         "standard_errors": standard_errors,
+        "covariance": covariance,
+        "sigma2": sigma2,
         "predicted": predicted,
         "residual": residual,
         "r2": r2,
@@ -5298,6 +5391,9 @@ def fit_combined_overview_model(
         "se_intercept": float(combined["standard_errors"][0]),
         "se_ci": float(combined["standard_errors"][1]),
         "se_pinch": float(combined["standard_errors"][2]),
+        "covariance": combined["covariance"],
+        "sigma2": combined["sigma2"],
+        "df_residual": combined["df_residual"],
         "r2": combined["r2"],
         "adjusted_r2": combined["adjusted_r2"],
         "rmse": combined["rmse"],
@@ -7816,11 +7912,17 @@ def ci_bodyweight_projection_scenarios(
     current_ci: float,
     current_bw_kg: float,
     added_weight_lbs: float,
+    low_ratio_change_pct: float = -10.0,
+    middle_ratio_change_pct: float = 0.0,
+    high_ratio_change_pct: float = 10.0,
 ) -> pd.DataFrame:
-    """Project CI after a BW change at 90%, 100%, and 110% of current CI/BW."""
+    """Project CI after a BW change across three fully adjustable CI/BW scenarios."""
     current_ci = float(current_ci)
     current_bw_kg = float(current_bw_kg)
     added_weight_lbs = float(added_weight_lbs)
+    low_ratio_change_pct = float(low_ratio_change_pct)
+    middle_ratio_change_pct = float(middle_ratio_change_pct)
+    high_ratio_change_pct = float(high_ratio_change_pct)
     if current_bw_kg <= 0 or current_ci <= 0:
         return pd.DataFrame()
 
@@ -7829,12 +7931,17 @@ def ci_bodyweight_projection_scenarios(
     if projected_bw_kg <= 0:
         return pd.DataFrame()
 
-    multipliers = [0.90, 1.00, 1.10]
-    labels = ["Low · 90% ratio", "Maintain · 100% ratio", "High · 110% ratio"]
+    ratio_changes = [low_ratio_change_pct, middle_ratio_change_pct, high_ratio_change_pct]
+    labels = [
+        f"Low · {low_ratio_change_pct:+.0f}% ratio",
+        f"Middle · {middle_ratio_change_pct:+.0f}% ratio",
+        f"High · {high_ratio_change_pct:+.0f}% ratio",
+    ]
     out = pd.DataFrame({
         "Scenario": labels,
-        "Ratio Multiplier": multipliers,
+        "CI/BW Change (%)": ratio_changes,
     })
+    out["Ratio Multiplier"] = 1.0 + out["CI/BW Change (%)"] / 100.0
     out["Projected BW (kg)"] = projected_bw_kg
     out["Projected BW (lbs)"] = projected_bw_kg * 2.2046226218
     out["Projected CI/BW"] = current_ratio * out["Ratio Multiplier"]
@@ -8060,6 +8167,9 @@ current_pinch_summary = build_current_pinch_summary(
     team_filter=team_filter,
 )
 bat_projection_stats = bat_correlation_stats(bat_monthly_pairs)
+bat_projection_model = fit_simple_projection_model(
+    bat_monthly_pairs, "avg_ci", "monthly_avg_bat_speed"
+)
 (
     org_rankings_tab,
     overview_tab,
@@ -9262,11 +9372,14 @@ with combined_model_tab:
 
 
 with bw_projection_tab:
+    st.markdown("### Bodyweight → CI → Performance Projection")
+    st.caption("Projection build: 2026-08-22 v3 · adjustable Low / Middle / High CI/BW scenarios + 95% CI + individual PI")
     st.caption(
         "Bodyweight scenarios use the athlete's latest valid Jump Data test inside the selected "
-        "date range. Projected CI is calculated from the new bodyweight while CI/BW is allowed "
-        "to range from 90% to 110% of the athlete's current CI/BW ratio. Output changes are "
-        "model-based associations from the existing dashboard relationships, not causal guarantees."
+        "date range. You independently set the low, middle, and high CI/BW changes relative to the athlete's current ratio. "
+        "The scenario range, 95% confidence interval, "
+        "and approximate 95% individual prediction range represent different sources of uncertainty. "
+        "All output changes are model-based associations, not causal guarantees."
     )
 
     projection_mode = st.radio(
@@ -9277,7 +9390,12 @@ with bw_projection_tab:
     )
 
     if projection_mode == "Hitter":
-        if bat_projection_stats is None or bat_monthly_pairs.empty or current_ci_bw_summary.empty:
+        if (
+            bat_projection_stats is None
+            or bat_projection_model is None
+            or bat_monthly_pairs.empty
+            or current_ci_bw_summary.empty
+        ):
             st.info(
                 "Hitter projections need eligible bat-speed × CI data plus a current CI/bodyweight test "
                 "under the selected filters."
@@ -9304,8 +9422,9 @@ with bw_projection_tab:
                     hitter_projection_data["athlete"] == selected_hitter
                 ].iloc[0]
 
-                control_left, control_right = st.columns([1, 2])
-                with control_left:
+                st.markdown("**Projection assumptions**")
+                control_weight, control_low, control_middle, control_high = st.columns(4)
+                with control_weight:
                     added_weight_lbs = st.slider(
                         "Bodyweight added (lbs)",
                         min_value=0.0,
@@ -9314,16 +9433,48 @@ with bw_projection_tab:
                         step=1.0,
                         key=f"bw_projection_hitter_weight_{player['name_key']}",
                     )
-                with control_right:
-                    st.caption(
-                        "The center scenario preserves the athlete's current CI/BW ratio. "
-                        "The low/high scenarios use 90% and 110% of that starting ratio."
+                with control_low:
+                    low_ratio_change_pct = st.slider(
+                        "Low CI/BW change (%)",
+                        min_value=-40.0,
+                        max_value=40.0,
+                        value=-10.0,
+                        step=1.0,
+                        key=f"bw_projection_hitter_ratio_low_{player['name_key']}",
+                    )
+                with control_middle:
+                    middle_ratio_change_pct = st.slider(
+                        "Middle CI/BW change (%)",
+                        min_value=-40.0,
+                        max_value=40.0,
+                        value=0.0,
+                        step=1.0,
+                        key=f"bw_projection_hitter_ratio_middle_{player['name_key']}",
+                    )
+                with control_high:
+                    high_ratio_change_pct = st.slider(
+                        "High CI/BW change (%)",
+                        min_value=-40.0,
+                        max_value=40.0,
+                        value=10.0,
+                        step=1.0,
+                        key=f"bw_projection_hitter_ratio_high_{player['name_key']}",
                     )
 
+                if not (low_ratio_change_pct <= middle_ratio_change_pct <= high_ratio_change_pct):
+                    st.error("Set the CI/BW scenarios so Low ≤ Middle ≤ High.")
+                    st.stop()
+
                 scenarios = ci_bodyweight_projection_scenarios(
-                    player["current_ci"], player["current_bw_kg"], added_weight_lbs
+                    player["current_ci"],
+                    player["current_bw_kg"],
+                    added_weight_lbs,
+                    low_ratio_change_pct,
+                    middle_ratio_change_pct,
+                    high_ratio_change_pct,
                 )
-                _, _, bat_slope, bat_intercept = bat_projection_stats
+                bat_slope = float(bat_projection_model["slope"])
+                bat_intercept = float(bat_projection_model["intercept"])
                 baseline_model_bat = bat_intercept + bat_slope * float(player["current_ci"])
                 scenarios["Projected Bat Speed"] = (
                     bat_intercept + bat_slope * scenarios["Projected CI"]
@@ -9331,6 +9482,44 @@ with bw_projection_tab:
                 scenarios["Projected Bat Speed Change"] = (
                     scenarios["Projected Bat Speed"] - baseline_model_bat
                 )
+
+                bat_cov = np.asarray(bat_projection_model["covariance"], dtype=float)
+                bat_tcrit = approx_t_critical_95(bat_projection_model["df_residual"])
+                bat_predictive_rmse = (
+                    float(bat_projection_model["cv_rmse"])
+                    if pd.notna(bat_projection_model["cv_rmse"])
+                    else float(bat_projection_model["rmse"])
+                )
+                ci_lows = []
+                ci_highs = []
+                pi_lows = []
+                pi_highs = []
+                for _, scenario in scenarios.iterrows():
+                    delta_ci = float(scenario["CI Change"])
+                    change = float(scenario["Projected Bat Speed Change"])
+                    contrast = np.array([0.0, delta_ci], dtype=float)
+                    change_var = float(contrast @ bat_cov @ contrast)
+                    change_se = np.sqrt(max(change_var, 0.0)) if np.isfinite(change_var) else np.nan
+                    ci_lows.append(change - bat_tcrit * change_se)
+                    ci_highs.append(change + bat_tcrit * change_se)
+                    prediction_se = (
+                        np.sqrt(max(change_var, 0.0) + bat_predictive_rmse ** 2)
+                        if np.isfinite(change_var) and np.isfinite(bat_predictive_rmse)
+                        else np.nan
+                    )
+                    pi_lows.append(change - bat_tcrit * prediction_se)
+                    pi_highs.append(change + bat_tcrit * prediction_se)
+
+                scenarios["95% CI Low"] = ci_lows
+                scenarios["95% CI High"] = ci_highs
+                scenarios["95% Prediction Low"] = pi_lows
+                scenarios["95% Prediction High"] = pi_highs
+                scenarios["95% Mean-Change CI"] = [
+                    format_interval(low, high) for low, high in zip(ci_lows, ci_highs)
+                ]
+                scenarios["Approx. 95% Individual PI"] = [
+                    format_interval(low, high) for low, high in zip(pi_lows, pi_highs)
+                ]
 
                 current_cols = st.columns(4)
                 current_values = [
@@ -9345,26 +9534,29 @@ with bw_projection_tab:
 
                 low_change = float(scenarios["Projected Bat Speed Change"].min())
                 high_change = float(scenarios["Projected Bat Speed Change"].max())
-                center_row = scenarios.loc[np.isclose(scenarios["Ratio Multiplier"], 1.0)].iloc[0]
-                projected_cols = st.columns(3)
+                center_row = scenarios.iloc[1]
+                projected_cols = st.columns(4)
                 projected_values = [
                     ("Projected BW", f"{float(center_row['Projected BW (lbs)']):.1f} lb", BLUE),
-                    ("CI if Ratio Maintained", f"{float(center_row['Projected CI']):.1f} N·s", TEAL),
-                    ("Potential Bat Speed Change", f"{low_change:+.2f} to {high_change:+.2f} mph", ACCENT_RED),
+                    ("Middle-Scenario CI", f"{float(center_row['Projected CI']):.1f} N·s", TEAL),
+                    ("Scenario Bat Speed Change", f"{low_change:+.2f} to {high_change:+.2f} mph", ACCENT_RED),
+                    ("Middle-Scenario 95% CI", str(center_row["95% Mean-Change CI"]), NAVY_MID),
                 ]
                 for column, values in zip(projected_cols, projected_values):
                     with column:
                         st.markdown(metric_card(*values), unsafe_allow_html=True)
 
                 hitter_display = scenarios[[
-                    "Scenario", "Projected BW (lbs)", "Projected CI/BW", "Projected CI",
+                    "Scenario", "CI/BW Change (%)", "Projected BW (lbs)", "Projected CI/BW", "Projected CI",
                     "CI Change", "Projected Bat Speed", "Projected Bat Speed Change",
+                    "95% Mean-Change CI", "Approx. 95% Individual PI",
                 ]].copy()
                 st.dataframe(
                     hitter_display,
                     hide_index=True,
                     use_container_width=True,
                     column_config={
+                        "CI/BW Change (%)": st.column_config.NumberColumn(format="%+.0f%%"),
                         "Projected BW (lbs)": st.column_config.NumberColumn(format="%.1f lb"),
                         "Projected CI/BW": st.column_config.NumberColumn(format="%.3f N·s/kg"),
                         "Projected CI": st.column_config.NumberColumn(format="%.1f N·s"),
@@ -9374,7 +9566,9 @@ with bw_projection_tab:
                     },
                 )
                 st.caption(
-                    f"Bat-speed model: {bat_intercept:.3f} + ({bat_slope:.4f} × CI). "
+                    f"Bat-speed model: {bat_intercept:.3f} + ({bat_slope:.4f} × CI), n={bat_projection_model['n']}. "
+                    f"The 95% CI describes uncertainty in the estimated mean change. The approximate individual range "
+                    f"adds out-of-sample model error (LOOCV RMSE {bat_predictive_rmse:.2f} mph). "
                     f"Current output shown above is the athlete's latest eligible monthly bat-speed value "
                     f"as of {fmt_date(player['bat_speed_as_of'])}."
                 )
@@ -9422,8 +9616,9 @@ with bw_projection_tab:
                     pitcher_projection_data["athlete"] == selected_pitcher
                 ].iloc[0]
 
-                input_left, input_mid, input_right = st.columns(3)
-                with input_left:
+                st.markdown("**Projection assumptions**")
+                input_weight, input_pinch = st.columns(2)
+                with input_weight:
                     added_weight_lbs = st.slider(
                         "Bodyweight added (lbs)",
                         min_value=0.0,
@@ -9432,7 +9627,7 @@ with bw_projection_tab:
                         step=1.0,
                         key=f"bw_projection_pitcher_weight_{player['name_key']}",
                     )
-                with input_mid:
+                with input_pinch:
                     pinch_change = st.slider(
                         "Pinch strength change",
                         min_value=-10.0,
@@ -9441,12 +9636,48 @@ with bw_projection_tab:
                         step=0.5,
                         key=f"bw_projection_pitcher_pinch_{player['name_key']}",
                     )
-                with input_right:
-                    projected_pinch = max(0.0, float(player["current_pinch"]) + float(pinch_change))
-                    st.metric("Projected Pinch", f"{projected_pinch:.1f}", delta=f"{pinch_change:+.1f}")
 
+                input_low, input_middle, input_high = st.columns(3)
+                with input_low:
+                    low_ratio_change_pct = st.slider(
+                        "Low CI/BW change (%)",
+                        min_value=-40.0,
+                        max_value=40.0,
+                        value=-10.0,
+                        step=1.0,
+                        key=f"bw_projection_pitcher_ratio_low_{player['name_key']}",
+                    )
+                with input_middle:
+                    middle_ratio_change_pct = st.slider(
+                        "Middle CI/BW change (%)",
+                        min_value=-40.0,
+                        max_value=40.0,
+                        value=0.0,
+                        step=1.0,
+                        key=f"bw_projection_pitcher_ratio_middle_{player['name_key']}",
+                    )
+                with input_high:
+                    high_ratio_change_pct = st.slider(
+                        "High CI/BW change (%)",
+                        min_value=-40.0,
+                        max_value=40.0,
+                        value=10.0,
+                        step=1.0,
+                        key=f"bw_projection_pitcher_ratio_high_{player['name_key']}",
+                    )
+
+                if not (low_ratio_change_pct <= middle_ratio_change_pct <= high_ratio_change_pct):
+                    st.error("Set the CI/BW scenarios so Low ≤ Middle ≤ High.")
+                    st.stop()
+
+                projected_pinch = max(0.0, float(player["current_pinch"]) + float(pinch_change))
                 scenarios = ci_bodyweight_projection_scenarios(
-                    player["current_ci"], player["current_bw_kg"], added_weight_lbs
+                    player["current_ci"],
+                    player["current_bw_kg"],
+                    added_weight_lbs,
+                    low_ratio_change_pct,
+                    middle_ratio_change_pct,
+                    high_ratio_change_pct,
                 )
                 baseline_model_velo = (
                     combined_model["intercept"]
@@ -9469,6 +9700,45 @@ with bw_projection_tab:
                     combined_model["beta_pinch"] * (projected_pinch - float(player["current_pinch"]))
                 )
 
+                pitcher_cov = np.asarray(combined_model["covariance"], dtype=float)
+                pitcher_tcrit = approx_t_critical_95(combined_model["df_residual"])
+                pitcher_predictive_rmse = (
+                    float(combined_model["cv_rmse"])
+                    if pd.notna(combined_model["cv_rmse"])
+                    else float(combined_model["rmse"])
+                )
+                ci_lows = []
+                ci_highs = []
+                pi_lows = []
+                pi_highs = []
+                delta_pinch = projected_pinch - float(player["current_pinch"])
+                for _, scenario in scenarios.iterrows():
+                    delta_ci = float(scenario["CI Change"])
+                    change = float(scenario["Projected Velo Change"])
+                    contrast = np.array([0.0, delta_ci, delta_pinch], dtype=float)
+                    change_var = float(contrast @ pitcher_cov @ contrast)
+                    change_se = np.sqrt(max(change_var, 0.0)) if np.isfinite(change_var) else np.nan
+                    ci_lows.append(change - pitcher_tcrit * change_se)
+                    ci_highs.append(change + pitcher_tcrit * change_se)
+                    prediction_se = (
+                        np.sqrt(max(change_var, 0.0) + pitcher_predictive_rmse ** 2)
+                        if np.isfinite(change_var) and np.isfinite(pitcher_predictive_rmse)
+                        else np.nan
+                    )
+                    pi_lows.append(change - pitcher_tcrit * prediction_se)
+                    pi_highs.append(change + pitcher_tcrit * prediction_se)
+
+                scenarios["95% CI Low"] = ci_lows
+                scenarios["95% CI High"] = ci_highs
+                scenarios["95% Prediction Low"] = pi_lows
+                scenarios["95% Prediction High"] = pi_highs
+                scenarios["95% Mean-Change CI"] = [
+                    format_interval(low, high) for low, high in zip(ci_lows, ci_highs)
+                ]
+                scenarios["Approx. 95% Individual PI"] = [
+                    format_interval(low, high) for low, high in zip(pi_lows, pi_highs)
+                ]
+
                 current_cols = st.columns(5)
                 current_values = [
                     ("Current BW", f"{float(player['current_bw_lbs']):.1f} lb", BLUE),
@@ -9483,28 +9753,30 @@ with bw_projection_tab:
 
                 low_change = float(scenarios["Projected Velo Change"].min())
                 high_change = float(scenarios["Projected Velo Change"].max())
-                center_row = scenarios.loc[np.isclose(scenarios["Ratio Multiplier"], 1.0)].iloc[0]
-                projected_cols = st.columns(4)
+                center_row = scenarios.iloc[1]
+                projected_cols = st.columns(5)
                 projected_values = [
                     ("Projected BW", f"{float(center_row['Projected BW (lbs)']):.1f} lb", BLUE),
-                    ("CI if Ratio Maintained", f"{float(center_row['Projected CI']):.1f} N·s", TEAL),
+                    ("Middle-Scenario CI", f"{float(center_row['Projected CI']):.1f} N·s", TEAL),
                     ("Projected Pinch", f"{projected_pinch:.1f}", GREEN),
-                    ("Potential Velo Change", f"{low_change:+.2f} to {high_change:+.2f} mph", ACCENT_RED),
+                    ("Scenario Velo Change", f"{low_change:+.2f} to {high_change:+.2f} mph", ACCENT_RED),
+                    ("Middle-Scenario 95% CI", str(center_row["95% Mean-Change CI"]), NAVY_MID),
                 ]
                 for column, values in zip(projected_cols, projected_values):
                     with column:
                         st.markdown(metric_card(*values), unsafe_allow_html=True)
 
                 pitcher_display = scenarios[[
-                    "Scenario", "Projected BW (lbs)", "Projected CI/BW", "Projected CI", "CI Change",
+                    "Scenario", "CI/BW Change (%)", "Projected BW (lbs)", "Projected CI/BW", "Projected CI", "CI Change",
                     "Projected Pinch", "Projected FB Velo", "Projected Velo Change",
-                    "CI Contribution", "Pinch Contribution",
+                    "CI Contribution", "Pinch Contribution", "95% Mean-Change CI", "Approx. 95% Individual PI",
                 ]].copy()
                 st.dataframe(
                     pitcher_display,
                     hide_index=True,
                     use_container_width=True,
                     column_config={
+                        "CI/BW Change (%)": st.column_config.NumberColumn(format="%+.0f%%"),
                         "Projected BW (lbs)": st.column_config.NumberColumn(format="%.1f lb"),
                         "Projected CI/BW": st.column_config.NumberColumn(format="%.3f N·s/kg"),
                         "Projected CI": st.column_config.NumberColumn(format="%.1f N·s"),
@@ -9519,7 +9791,9 @@ with bw_projection_tab:
                 st.caption(
                     f"Pitcher model: {combined_model['intercept']:.3f} + "
                     f"({combined_model['beta_ci']:.4f} × CI) + "
-                    f"({combined_model['beta_pinch']:.4f} × Pinch). "
+                    f"({combined_model['beta_pinch']:.4f} × Pinch), n={combined_model['n_pitchers']}. "
+                    f"The 95% CI uses the full CI/pinch coefficient covariance matrix. The approximate individual range "
+                    f"adds out-of-sample model error (LOOCV RMSE {pitcher_predictive_rmse:.2f} mph). "
                     f"Current pinch is the latest valid test ({fmt_date(player['current_pinch_date'])}); "
                     f"current FB velo is the final YTD value as of {fmt_date(player['ytd_as_of_date'])}."
                 )
@@ -10881,4 +11155,3 @@ with sc_opportunity_tab:
             st.dataframe(hitter_under_display, hide_index=True, use_container_width=True, height=min(660, 44 + 36 * (len(hitter_under_display) + 1)), column_config={
                 "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Projected Bat Speed": st.column_config.NumberColumn(format="%.2f mph"), "Bat-Speed Residual": st.column_config.NumberColumn(format="%+.2f mph"), "YTD Average CI": st.column_config.NumberColumn(format="%.2f N·s"), "P90 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "Projected P90 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"), "P90 Exit-Velo Residual": st.column_config.NumberColumn(format="%+.2f mph")})
             csv_download_button(hitter_under_display, "Download hitters underperforming CI CSV", "hitters_underperforming_ci.csv", "download_hitters_underperforming_ci")
-
