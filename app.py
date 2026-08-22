@@ -1069,6 +1069,17 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
     jump_name_col = first_existing(jump_raw.columns.tolist(), ["Athlete", "athlete", "Player", "player", "Name", "name"])
     jump_date_col = first_existing(jump_raw.columns.tolist(), ["Date", "date", "Test Date", "test_date"])
     jump_ci_col = first_existing(jump_raw.columns.tolist(), ["Concentric Impulse [N s]", "Concentric Impulse", "CI"])
+    jump_bw_kg_col = first_existing(
+        jump_raw.columns.tolist(),
+        ["BW (kg)", "BW kg", "Bodyweight (kg)", "Body Weight (kg)", "bodyweight_kg", "bw_kg"],
+    )
+    jump_bw_lbs_col = first_existing(
+        jump_raw.columns.tolist(),
+        ["BW (lbs)", "BW lbs", "Bodyweight (lbs)", "Body Weight (lbs)", "bodyweight_lbs", "bw_lbs"],
+    )
+    jump_position_col = first_existing(
+        jump_raw.columns.tolist(), ["Position", "position", "Pos", "pos"]
+    )
     jump_p1_ci_col = first_existing(
         jump_raw.columns.tolist(),
         [
@@ -1104,11 +1115,27 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
     ]
     if missing_jump:
         raise ValueError(f"Jump Data is missing required column(s): {', '.join(missing_jump)}.")
+    if jump_bw_kg_col is None and jump_bw_lbs_col is None:
+        raise ValueError(
+            "Jump Data must contain BW (kg) and/or BW (lbs) for the bodyweight projection tab."
+        )
 
     jump_base = pd.DataFrame({
         "athlete": jump_raw[jump_name_col].astype(str).str.strip(),
         "date": parse_sheet_dates(jump_raw[jump_date_col]),
         "ci": pd.to_numeric(jump_raw[jump_ci_col], errors="coerce"),
+        "bw_kg": (
+            pd.to_numeric(jump_raw[jump_bw_kg_col], errors="coerce")
+            if jump_bw_kg_col else np.nan
+        ),
+        "bw_lbs": (
+            pd.to_numeric(jump_raw[jump_bw_lbs_col], errors="coerce")
+            if jump_bw_lbs_col else np.nan
+        ),
+        "position": (
+            jump_raw[jump_position_col].astype(str).str.strip()
+            if jump_position_col else ""
+        ),
         "p1_ci": (
             pd.to_numeric(jump_raw[jump_p1_ci_col], errors="coerce")
             if jump_p1_ci_col else np.nan
@@ -1121,6 +1148,12 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         ),
         "team_raw": jump_raw[jump_team_col].astype(str).str.strip() if jump_team_col else "",
     })
+    jump_base["bw_kg"] = jump_base["bw_kg"].where(
+        jump_base["bw_kg"].notna(), jump_base["bw_lbs"] / 2.2046226218
+    )
+    jump_base["bw_lbs"] = jump_base["bw_lbs"].where(
+        jump_base["bw_lbs"].notna(), jump_base["bw_kg"] * 2.2046226218
+    )
     jump_base["team"] = jump_base["team_raw"].map(normalize_team)
     jump_base["name_key"] = jump_base["athlete"].map(canonical_name)
     jump_base = jump_base[
@@ -1131,7 +1164,10 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
 
     jump = (
         jump_base.dropna(subset=["date", "ci"])[
-            ["athlete", "date", "ci", "p1_ci", "team", "name_key"]
+            [
+                "athlete", "date", "ci", "bw_kg", "bw_lbs", "position",
+                "p1_ci", "team", "name_key",
+            ]
         ]
         .sort_values(["athlete", "date"], kind="stable")
         .reset_index(drop=True)
@@ -7673,6 +7709,149 @@ if refresh:
     load_source_data.clear()
     load_shared_org_ranking.clear()
 
+
+# -----------------------------------------------------------------------------
+# BODYWEIGHT / CI / OUTPUT PROJECTIONS
+# -----------------------------------------------------------------------------
+def build_current_ci_bw_summary(
+    jump: pd.DataFrame,
+    start_date,
+    end_date,
+    team_filter: str,
+) -> pd.DataFrame:
+    """Return each athlete's latest valid test-date mean CI and bodyweight."""
+    columns = [
+        "name_key", "athlete", "team", "position", "current_date",
+        "current_ci", "current_bw_kg", "current_bw_lbs", "current_ci_bw_ratio",
+    ]
+    if jump is None or jump.empty:
+        return pd.DataFrame(columns=columns)
+
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    work = jump[
+        (jump["date"] >= start)
+        & (jump["date"] <= end)
+        & jump["ci"].notna()
+        & jump["bw_kg"].notna()
+        & (jump["bw_kg"] > 0)
+    ].copy()
+    if team_filter != "All Teams":
+        work = work[work["team"] == team_filter].copy()
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+
+    by_date = (
+        work.groupby(["name_key", "date"], as_index=False)
+        .agg(
+            athlete=("athlete", "first"),
+            team=("team", "last"),
+            position=("position", "last"),
+            current_ci=("ci", "mean"),
+            current_bw_kg=("bw_kg", "mean"),
+            current_bw_lbs=("bw_lbs", "mean"),
+        )
+        .sort_values(["name_key", "date"], kind="stable")
+    )
+    latest = (
+        by_date.groupby("name_key", as_index=False)
+        .tail(1)
+        .rename(columns={"date": "current_date"})
+        .copy()
+    )
+    latest["current_ci_bw_ratio"] = (
+        latest["current_ci"] / latest["current_bw_kg"]
+    )
+    return latest[columns].sort_values(["team", "athlete"], kind="stable").reset_index(drop=True)
+
+
+def build_current_pinch_summary(
+    pinch: pd.DataFrame,
+    start_date,
+    end_date,
+    team_filter: str,
+) -> pd.DataFrame:
+    """Return each pitcher's latest valid pinch test-date value."""
+    columns = [
+        "name_key", "athlete", "team", "current_pinch_date",
+        "current_pinch", "pinch_hand",
+    ]
+    if pinch is None or pinch.empty:
+        return pd.DataFrame(columns=columns)
+
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    work = pinch[
+        (pinch["date"] >= start)
+        & (pinch["date"] <= end)
+        & pinch["pinch_strength"].notna()
+    ].copy()
+    if team_filter != "All Teams" and "team" in work.columns:
+        # Some Pinch Grip sheets do not carry a team field. Only enforce the
+        # team filter where the cleaned pinch row has an assigned team.
+        assigned = work["team"].notna()
+        work = work[(~assigned) | (work["team"] == team_filter)].copy()
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+
+    by_date = (
+        work.groupby(["name_key", "date"], as_index=False)
+        .agg(
+            athlete=("athlete", "first"),
+            team=("team", "last"),
+            current_pinch=("pinch_strength", "mean"),
+            pinch_hand=("pinch_hand", "first"),
+        )
+        .sort_values(["name_key", "date"], kind="stable")
+    )
+    latest = (
+        by_date.groupby("name_key", as_index=False)
+        .tail(1)
+        .rename(columns={"date": "current_pinch_date"})
+    )
+    return latest[columns].reset_index(drop=True)
+
+
+def ci_bodyweight_projection_scenarios(
+    current_ci: float,
+    current_bw_kg: float,
+    added_weight_lbs: float,
+) -> pd.DataFrame:
+    """Project CI after a BW change at 90%, 100%, and 110% of current CI/BW."""
+    current_ci = float(current_ci)
+    current_bw_kg = float(current_bw_kg)
+    added_weight_lbs = float(added_weight_lbs)
+    if current_bw_kg <= 0 or current_ci <= 0:
+        return pd.DataFrame()
+
+    current_ratio = current_ci / current_bw_kg
+    projected_bw_kg = current_bw_kg + added_weight_lbs / 2.2046226218
+    if projected_bw_kg <= 0:
+        return pd.DataFrame()
+
+    multipliers = [0.90, 1.00, 1.10]
+    labels = ["Low · 90% ratio", "Maintain · 100% ratio", "High · 110% ratio"]
+    out = pd.DataFrame({
+        "Scenario": labels,
+        "Ratio Multiplier": multipliers,
+    })
+    out["Projected BW (kg)"] = projected_bw_kg
+    out["Projected BW (lbs)"] = projected_bw_kg * 2.2046226218
+    out["Projected CI/BW"] = current_ratio * out["Ratio Multiplier"]
+    out["Projected CI"] = out["Projected BW (kg)"] * out["Projected CI/BW"]
+    out["CI Change"] = out["Projected CI"] - current_ci
+    return out
+
+
+def _projection_player_options(df: pd.DataFrame) -> list[str]:
+    if df is None or df.empty or "athlete" not in df.columns:
+        return []
+    return (
+        df.dropna(subset=["athlete"])
+        .sort_values(["team", "athlete"], kind="stable")
+        ["athlete"].astype(str).drop_duplicates().tolist()
+    )
+
 # st.tabs executes every tab on every rerun. A first-position tab therefore still
 # paid the cost of all player-level Google Sheet reads before the ranking appeared.
 # The ranking is now a true lightweight landing view, and the heavy dashboard is
@@ -7868,6 +8047,19 @@ sprint_adv_runs_summary = build_baserunning_sprint_outcome_summary(
     outcome_col="adv_runs",
     team_filter=team_filter,
 )
+current_ci_bw_summary = build_current_ci_bw_summary(
+    jump=jump,
+    start_date=start_date,
+    end_date=end_date,
+    team_filter=team_filter,
+)
+current_pinch_summary = build_current_pinch_summary(
+    pinch=pinch,
+    start_date=start_date,
+    end_date=end_date,
+    team_filter=team_filter,
+)
+bat_projection_stats = bat_correlation_stats(bat_monthly_pairs)
 (
     org_rankings_tab,
     overview_tab,
@@ -7875,6 +8067,7 @@ sprint_adv_runs_summary = build_baserunning_sprint_outcome_summary(
     power_pitch_tab,
     combined_model_tab,
     predicted_actual_tab,
+    bw_projection_tab,
     sprint_overview_tab,
     bat_overview_tab,
     exit_velo_overview_tab,
@@ -7889,6 +8082,7 @@ sprint_adv_runs_summary = build_baserunning_sprint_outcome_summary(
     "Peak Power [W] × Pitching Velo",
     "Combined CI + Pinch Overview",
     "Predicted vs Actual Velo",
+    "BW + CI Projections",
     "Sprint Speed Overview",
     "Bat Speed Overview",
     "P90 Exit Velo Overview",
@@ -9064,6 +9258,271 @@ with combined_model_tab:
                 "combined_pitcher_results.csv",
                 "download_combined_pitcher_results",
             )
+
+
+
+with bw_projection_tab:
+    st.caption(
+        "Bodyweight scenarios use the athlete's latest valid Jump Data test inside the selected "
+        "date range. Projected CI is calculated from the new bodyweight while CI/BW is allowed "
+        "to range from 90% to 110% of the athlete's current CI/BW ratio. Output changes are "
+        "model-based associations from the existing dashboard relationships, not causal guarantees."
+    )
+
+    projection_mode = st.radio(
+        "Projection type",
+        ["Hitter", "Pitcher"],
+        horizontal=True,
+        key="bw_projection_mode",
+    )
+
+    if projection_mode == "Hitter":
+        if bat_projection_stats is None or bat_monthly_pairs.empty or current_ci_bw_summary.empty:
+            st.info(
+                "Hitter projections need eligible bat-speed × CI data plus a current CI/bodyweight test "
+                "under the selected filters."
+            )
+        else:
+            hitter_pairs = bat_monthly_pairs[[
+                "name_key", "athlete", "team", "monthly_avg_bat_speed", "bat_speed_as_of", "avg_ci"
+            ]].copy()
+            hitter_projection_data = current_ci_bw_summary.merge(
+                hitter_pairs,
+                on="name_key",
+                how="inner",
+                suffixes=("", "_model"),
+            )
+            hitter_options = _projection_player_options(hitter_projection_data)
+            if not hitter_options:
+                st.info("No hitters have both current CI/bodyweight and eligible bat-speed data.")
+            else:
+                hitter_key = "bw_projection_hitter"
+                if st.session_state.get(hitter_key) not in hitter_options:
+                    st.session_state[hitter_key] = hitter_options[0]
+                selected_hitter = st.selectbox("Hitter", hitter_options, key=hitter_key)
+                player = hitter_projection_data.loc[
+                    hitter_projection_data["athlete"] == selected_hitter
+                ].iloc[0]
+
+                control_left, control_right = st.columns([1, 2])
+                with control_left:
+                    added_weight_lbs = st.slider(
+                        "Bodyweight added (lbs)",
+                        min_value=0.0,
+                        max_value=40.0,
+                        value=10.0,
+                        step=1.0,
+                        key=f"bw_projection_hitter_weight_{player['name_key']}",
+                    )
+                with control_right:
+                    st.caption(
+                        "The center scenario preserves the athlete's current CI/BW ratio. "
+                        "The low/high scenarios use 90% and 110% of that starting ratio."
+                    )
+
+                scenarios = ci_bodyweight_projection_scenarios(
+                    player["current_ci"], player["current_bw_kg"], added_weight_lbs
+                )
+                _, _, bat_slope, bat_intercept = bat_projection_stats
+                baseline_model_bat = bat_intercept + bat_slope * float(player["current_ci"])
+                scenarios["Projected Bat Speed"] = (
+                    bat_intercept + bat_slope * scenarios["Projected CI"]
+                )
+                scenarios["Projected Bat Speed Change"] = (
+                    scenarios["Projected Bat Speed"] - baseline_model_bat
+                )
+
+                current_cols = st.columns(4)
+                current_values = [
+                    ("Current BW", f"{float(player['current_bw_lbs']):.1f} lb", BLUE),
+                    ("Current CI", f"{float(player['current_ci']):.1f} N·s", NAVY_MID),
+                    ("Current CI/BW", f"{float(player['current_ci_bw_ratio']):.3f} N·s/kg", TEAL),
+                    ("Current Bat Speed", f"{float(player['monthly_avg_bat_speed']):.2f} mph", GREEN),
+                ]
+                for column, values in zip(current_cols, current_values):
+                    with column:
+                        st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+                low_change = float(scenarios["Projected Bat Speed Change"].min())
+                high_change = float(scenarios["Projected Bat Speed Change"].max())
+                center_row = scenarios.loc[np.isclose(scenarios["Ratio Multiplier"], 1.0)].iloc[0]
+                projected_cols = st.columns(3)
+                projected_values = [
+                    ("Projected BW", f"{float(center_row['Projected BW (lbs)']):.1f} lb", BLUE),
+                    ("CI if Ratio Maintained", f"{float(center_row['Projected CI']):.1f} N·s", TEAL),
+                    ("Potential Bat Speed Change", f"{low_change:+.2f} to {high_change:+.2f} mph", ACCENT_RED),
+                ]
+                for column, values in zip(projected_cols, projected_values):
+                    with column:
+                        st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+                hitter_display = scenarios[[
+                    "Scenario", "Projected BW (lbs)", "Projected CI/BW", "Projected CI",
+                    "CI Change", "Projected Bat Speed", "Projected Bat Speed Change",
+                ]].copy()
+                st.dataframe(
+                    hitter_display,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "Projected BW (lbs)": st.column_config.NumberColumn(format="%.1f lb"),
+                        "Projected CI/BW": st.column_config.NumberColumn(format="%.3f N·s/kg"),
+                        "Projected CI": st.column_config.NumberColumn(format="%.1f N·s"),
+                        "CI Change": st.column_config.NumberColumn(format="%+.1f N·s"),
+                        "Projected Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
+                        "Projected Bat Speed Change": st.column_config.NumberColumn(format="%+.2f mph"),
+                    },
+                )
+                st.caption(
+                    f"Bat-speed model: {bat_intercept:.3f} + ({bat_slope:.4f} × CI). "
+                    f"Current output shown above is the athlete's latest eligible monthly bat-speed value "
+                    f"as of {fmt_date(player['bat_speed_as_of'])}."
+                )
+
+    else:
+        if combined_model is None or combined_model.get("data") is None or combined_model["data"].empty:
+            st.info(
+                "Pitcher projections need the eligible Combined CI + Pinch model under the selected filters."
+            )
+        elif current_ci_bw_summary.empty or current_pinch_summary.empty:
+            st.info(
+                "Pitcher projections need a current CI/bodyweight test and a current pinch test under the selected filters."
+            )
+        else:
+            pitcher_model_data = combined_model["data"][[
+                "name_key", "athlete", "team", "avg_fb_velo", "ytd_as_of_date",
+                "avg_ci", "avg_pinch_strength",
+            ]].copy()
+            pitcher_projection_data = (
+                current_ci_bw_summary.merge(
+                    pitcher_model_data,
+                    on="name_key",
+                    how="inner",
+                    suffixes=("", "_model"),
+                )
+                .merge(
+                    current_pinch_summary[[
+                        "name_key", "current_pinch_date", "current_pinch", "pinch_hand"
+                    ]],
+                    on="name_key",
+                    how="inner",
+                )
+            )
+            pitcher_options = _projection_player_options(pitcher_projection_data)
+            if not pitcher_options:
+                st.info(
+                    "No pitchers have current CI/bodyweight, current pinch, and eligible velocity-model data together."
+                )
+            else:
+                pitcher_key = "bw_projection_pitcher"
+                if st.session_state.get(pitcher_key) not in pitcher_options:
+                    st.session_state[pitcher_key] = pitcher_options[0]
+                selected_pitcher = st.selectbox("Pitcher", pitcher_options, key=pitcher_key)
+                player = pitcher_projection_data.loc[
+                    pitcher_projection_data["athlete"] == selected_pitcher
+                ].iloc[0]
+
+                input_left, input_mid, input_right = st.columns(3)
+                with input_left:
+                    added_weight_lbs = st.slider(
+                        "Bodyweight added (lbs)",
+                        min_value=0.0,
+                        max_value=40.0,
+                        value=10.0,
+                        step=1.0,
+                        key=f"bw_projection_pitcher_weight_{player['name_key']}",
+                    )
+                with input_mid:
+                    pinch_change = st.slider(
+                        "Pinch strength change",
+                        min_value=-10.0,
+                        max_value=20.0,
+                        value=0.0,
+                        step=0.5,
+                        key=f"bw_projection_pitcher_pinch_{player['name_key']}",
+                    )
+                with input_right:
+                    projected_pinch = max(0.0, float(player["current_pinch"]) + float(pinch_change))
+                    st.metric("Projected Pinch", f"{projected_pinch:.1f}", delta=f"{pinch_change:+.1f}")
+
+                scenarios = ci_bodyweight_projection_scenarios(
+                    player["current_ci"], player["current_bw_kg"], added_weight_lbs
+                )
+                baseline_model_velo = (
+                    combined_model["intercept"]
+                    + combined_model["beta_ci"] * float(player["current_ci"])
+                    + combined_model["beta_pinch"] * float(player["current_pinch"])
+                )
+                scenarios["Projected Pinch"] = projected_pinch
+                scenarios["Projected FB Velo"] = (
+                    combined_model["intercept"]
+                    + combined_model["beta_ci"] * scenarios["Projected CI"]
+                    + combined_model["beta_pinch"] * projected_pinch
+                )
+                scenarios["Projected Velo Change"] = (
+                    scenarios["Projected FB Velo"] - baseline_model_velo
+                )
+                scenarios["CI Contribution"] = (
+                    combined_model["beta_ci"] * (scenarios["Projected CI"] - float(player["current_ci"]))
+                )
+                scenarios["Pinch Contribution"] = (
+                    combined_model["beta_pinch"] * (projected_pinch - float(player["current_pinch"]))
+                )
+
+                current_cols = st.columns(5)
+                current_values = [
+                    ("Current BW", f"{float(player['current_bw_lbs']):.1f} lb", BLUE),
+                    ("Current CI", f"{float(player['current_ci']):.1f} N·s", NAVY_MID),
+                    ("Current CI/BW", f"{float(player['current_ci_bw_ratio']):.3f} N·s/kg", TEAL),
+                    ("Current Pinch", f"{float(player['current_pinch']):.1f}", GREEN),
+                    ("Current FB Velo", f"{float(player['avg_fb_velo']):.2f} mph", ACCENT_RED),
+                ]
+                for column, values in zip(current_cols, current_values):
+                    with column:
+                        st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+                low_change = float(scenarios["Projected Velo Change"].min())
+                high_change = float(scenarios["Projected Velo Change"].max())
+                center_row = scenarios.loc[np.isclose(scenarios["Ratio Multiplier"], 1.0)].iloc[0]
+                projected_cols = st.columns(4)
+                projected_values = [
+                    ("Projected BW", f"{float(center_row['Projected BW (lbs)']):.1f} lb", BLUE),
+                    ("CI if Ratio Maintained", f"{float(center_row['Projected CI']):.1f} N·s", TEAL),
+                    ("Projected Pinch", f"{projected_pinch:.1f}", GREEN),
+                    ("Potential Velo Change", f"{low_change:+.2f} to {high_change:+.2f} mph", ACCENT_RED),
+                ]
+                for column, values in zip(projected_cols, projected_values):
+                    with column:
+                        st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+                pitcher_display = scenarios[[
+                    "Scenario", "Projected BW (lbs)", "Projected CI/BW", "Projected CI", "CI Change",
+                    "Projected Pinch", "Projected FB Velo", "Projected Velo Change",
+                    "CI Contribution", "Pinch Contribution",
+                ]].copy()
+                st.dataframe(
+                    pitcher_display,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "Projected BW (lbs)": st.column_config.NumberColumn(format="%.1f lb"),
+                        "Projected CI/BW": st.column_config.NumberColumn(format="%.3f N·s/kg"),
+                        "Projected CI": st.column_config.NumberColumn(format="%.1f N·s"),
+                        "CI Change": st.column_config.NumberColumn(format="%+.1f N·s"),
+                        "Projected Pinch": st.column_config.NumberColumn(format="%.1f"),
+                        "Projected FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                        "Projected Velo Change": st.column_config.NumberColumn(format="%+.2f mph"),
+                        "CI Contribution": st.column_config.NumberColumn(format="%+.2f mph"),
+                        "Pinch Contribution": st.column_config.NumberColumn(format="%+.2f mph"),
+                    },
+                )
+                st.caption(
+                    f"Pitcher model: {combined_model['intercept']:.3f} + "
+                    f"({combined_model['beta_ci']:.4f} × CI) + "
+                    f"({combined_model['beta_pinch']:.4f} × Pinch). "
+                    f"Current pinch is the latest valid test ({fmt_date(player['current_pinch_date'])}); "
+                    f"current FB velo is the final YTD value as of {fmt_date(player['ytd_as_of_date'])}."
+                )
 
 
 with predicted_actual_tab:
