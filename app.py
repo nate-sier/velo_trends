@@ -9373,7 +9373,7 @@ with combined_model_tab:
 
 with bw_projection_tab:
     st.markdown("### Bodyweight → CI → Performance Projection")
-    st.caption("Projection build: 2026-08-22 v3 · adjustable Low / Middle / High CI/BW scenarios + 95% CI + individual PI")
+    st.caption("Projection build: 2026-08-22 v4 · manual starting pinch fallback + live pinch-driven velo projection + adjustable CI/BW scenarios + 95% CI + individual PI")
     st.caption(
         "Bodyweight scenarios use the athlete's latest valid Jump Data test inside the selected "
         "date range. You independently set the low, middle, and high CI/BW changes relative to the athlete's current ratio. "
@@ -9578,34 +9578,40 @@ with bw_projection_tab:
             st.info(
                 "Pitcher projections need the eligible Combined CI + Pinch model under the selected filters."
             )
-        elif current_ci_bw_summary.empty or current_pinch_summary.empty:
+        elif current_ci_bw_summary.empty:
             st.info(
-                "Pitcher projections need a current CI/bodyweight test and a current pinch test under the selected filters."
+                "Pitcher projections need a current CI/bodyweight test under the selected filters."
             )
         else:
-            pitcher_model_data = combined_model["data"][[
+            # Select pitchers from the regular CI + FB-velo pool so a missing
+            # pinch test does not remove the athlete from this projection tab.
+            # The already-fitted Combined CI + Pinch model is applied afterward.
+            pitcher_model_data = summary[[
                 "name_key", "athlete", "team", "avg_fb_velo", "ytd_as_of_date",
-                "avg_ci", "avg_pinch_strength",
             ]].copy()
-            pitcher_projection_data = (
-                current_ci_bw_summary.merge(
-                    pitcher_model_data,
-                    on="name_key",
-                    how="inner",
-                    suffixes=("", "_model"),
-                )
-                .merge(
+            pitcher_projection_data = current_ci_bw_summary.merge(
+                pitcher_model_data,
+                on="name_key",
+                how="inner",
+                suffixes=("", "_model"),
+            )
+            if current_pinch_summary is not None and not current_pinch_summary.empty:
+                pitcher_projection_data = pitcher_projection_data.merge(
                     current_pinch_summary[[
                         "name_key", "current_pinch_date", "current_pinch", "pinch_hand"
                     ]],
                     on="name_key",
-                    how="inner",
+                    how="left",
                 )
-            )
+            else:
+                pitcher_projection_data["current_pinch_date"] = pd.NaT
+                pitcher_projection_data["current_pinch"] = np.nan
+                pitcher_projection_data["pinch_hand"] = np.nan
+
             pitcher_options = _projection_player_options(pitcher_projection_data)
             if not pitcher_options:
                 st.info(
-                    "No pitchers have current CI/bodyweight, current pinch, and eligible velocity-model data together."
+                    "No pitchers have current CI/bodyweight and eligible FB-velocity data together."
                 )
             else:
                 pitcher_key = "bw_projection_pitcher"
@@ -9617,7 +9623,10 @@ with bw_projection_tab:
                 ].iloc[0]
 
                 st.markdown("**Projection assumptions**")
-                input_weight, input_pinch = st.columns(2)
+                has_observed_pinch = pd.notna(player.get("current_pinch"))
+                model_pinch_default = float(combined_model["data"]["avg_pinch_strength"].median())
+
+                input_weight, input_start_pinch, input_pinch = st.columns(3)
                 with input_weight:
                     added_weight_lbs = st.slider(
                         "Bodyweight added (lbs)",
@@ -9627,6 +9636,25 @@ with bw_projection_tab:
                         step=1.0,
                         key=f"bw_projection_pitcher_weight_{player['name_key']}",
                     )
+                with input_start_pinch:
+                    if has_observed_pinch:
+                        starting_pinch = float(player["current_pinch"])
+                        st.metric("Starting pinch", f"{starting_pinch:.1f}")
+                        st.caption(f"Latest recorded test · {fmt_date(player['current_pinch_date'])}")
+                    else:
+                        starting_pinch = st.number_input(
+                            "Starting pinch strength",
+                            min_value=0.0,
+                            max_value=100.0,
+                            value=float(round(model_pinch_default, 1)),
+                            step=0.5,
+                            key=f"bw_projection_pitcher_start_pinch_{player['name_key']}",
+                            help=(
+                                "No valid pinch test was found for this pitcher in the selected date range. "
+                                "Enter the starting value you want the CI + pinch velocity model to use."
+                            ),
+                        )
+                        st.caption("Manual starting value · no recorded pinch found in the selected window")
                 with input_pinch:
                     pinch_change = st.slider(
                         "Pinch strength change",
@@ -9636,6 +9664,12 @@ with bw_projection_tab:
                         step=0.5,
                         key=f"bw_projection_pitcher_pinch_{player['name_key']}",
                     )
+
+                projected_pinch_preview = max(0.0, float(starting_pinch) + float(pinch_change))
+                st.caption(
+                    f"Pitcher model pinch input: {float(starting_pinch):.1f} starting + "
+                    f"{float(pinch_change):+.1f} change = {projected_pinch_preview:.1f} projected pinch."
+                )
 
                 input_low, input_middle, input_high = st.columns(3)
                 with input_low:
@@ -9670,7 +9704,7 @@ with bw_projection_tab:
                     st.error("Set the CI/BW scenarios so Low ≤ Middle ≤ High.")
                     st.stop()
 
-                projected_pinch = max(0.0, float(player["current_pinch"]) + float(pinch_change))
+                projected_pinch = max(0.0, float(starting_pinch) + float(pinch_change))
                 scenarios = ci_bodyweight_projection_scenarios(
                     player["current_ci"],
                     player["current_bw_kg"],
@@ -9682,7 +9716,7 @@ with bw_projection_tab:
                 baseline_model_velo = (
                     combined_model["intercept"]
                     + combined_model["beta_ci"] * float(player["current_ci"])
-                    + combined_model["beta_pinch"] * float(player["current_pinch"])
+                    + combined_model["beta_pinch"] * float(starting_pinch)
                 )
                 scenarios["Projected Pinch"] = projected_pinch
                 scenarios["Projected FB Velo"] = (
@@ -9697,7 +9731,7 @@ with bw_projection_tab:
                     combined_model["beta_ci"] * (scenarios["Projected CI"] - float(player["current_ci"]))
                 )
                 scenarios["Pinch Contribution"] = (
-                    combined_model["beta_pinch"] * (projected_pinch - float(player["current_pinch"]))
+                    combined_model["beta_pinch"] * (projected_pinch - float(starting_pinch))
                 )
 
                 pitcher_cov = np.asarray(combined_model["covariance"], dtype=float)
@@ -9711,7 +9745,7 @@ with bw_projection_tab:
                 ci_highs = []
                 pi_lows = []
                 pi_highs = []
-                delta_pinch = projected_pinch - float(player["current_pinch"])
+                delta_pinch = projected_pinch - float(starting_pinch)
                 for _, scenario in scenarios.iterrows():
                     delta_ci = float(scenario["CI Change"])
                     change = float(scenario["Projected Velo Change"])
@@ -9744,7 +9778,7 @@ with bw_projection_tab:
                     ("Current BW", f"{float(player['current_bw_lbs']):.1f} lb", BLUE),
                     ("Current CI", f"{float(player['current_ci']):.1f} N·s", NAVY_MID),
                     ("Current CI/BW", f"{float(player['current_ci_bw_ratio']):.3f} N·s/kg", TEAL),
-                    ("Current Pinch", f"{float(player['current_pinch']):.1f}", GREEN),
+                    ("Starting Pinch", f"{float(starting_pinch):.1f}", GREEN),
                     ("Current FB Velo", f"{float(player['avg_fb_velo']):.2f} mph", ACCENT_RED),
                 ]
                 for column, values in zip(current_cols, current_values):
@@ -9794,8 +9828,12 @@ with bw_projection_tab:
                     f"({combined_model['beta_pinch']:.4f} × Pinch), n={combined_model['n_pitchers']}. "
                     f"The 95% CI uses the full CI/pinch coefficient covariance matrix. The approximate individual range "
                     f"adds out-of-sample model error (LOOCV RMSE {pitcher_predictive_rmse:.2f} mph). "
-                    f"Current pinch is the latest valid test ({fmt_date(player['current_pinch_date'])}); "
-                    f"current FB velo is the final YTD value as of {fmt_date(player['ytd_as_of_date'])}."
+                    + (
+                        f"Starting pinch is the latest valid test ({fmt_date(player['current_pinch_date'])}); "
+                        if has_observed_pinch
+                        else "Starting pinch is manually entered because no valid test was found in the selected window; "
+                    )
+                    + f"current FB velo is the final YTD value as of {fmt_date(player['ytd_as_of_date'])}."
                 )
 
 
