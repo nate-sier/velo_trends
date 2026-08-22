@@ -9372,6 +9372,7 @@ with combined_model_tab:
 
 
 with bw_projection_tab:
+    st.markdown("**This makes a ton of assumptions and these calculations should be taken very mich with a grain of salt. There is a ton of variability involved in these**")
     st.markdown("### Bodyweight → CI → Performance Projection")
     st.caption("Projection build: 2026-08-22 v4 · manual starting pinch fallback + live pinch-driven velo projection + adjustable CI/BW scenarios + 95% CI + individual PI")
     st.caption(
