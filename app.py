@@ -9676,10 +9676,7 @@ with combined_model_tab:
             "plus variation in both predictors. Each pitcher contributes one row."
         )
     else:
-        train_test_eval = evaluate_combined_train_test_split(
-            combined_model, test_fraction=0.30, random_state=42
-        )
-        cols = st.columns(5)
+        cols = st.columns(4)
         values = [
             ("Pitchers", str(combined_model["n_pitchers"]), BLUE),
             ("Model R²", f"{combined_model['r2']:.2f}", ACCENT_RED),
@@ -9690,15 +9687,6 @@ with combined_model_tab:
                 NAVY_MID,
             ),
             ("RMSE", f"{combined_model['rmse']:.2f} mph", GREEN),
-            (
-                "Testing RMSE",
-                (
-                    f"{train_test_eval['test_metrics']['rmse']:.2f} mph"
-                    if train_test_eval is not None
-                    else "—"
-                ),
-                NAVY,
-            ),
         ]
         for column, metric_values in zip(cols, values):
             with column:
@@ -9720,21 +9708,11 @@ with combined_model_tab:
         ci_association_10 = combined_model["beta_ci"] * 10.0
         pinch_association_10 = combined_model["beta_pinch"] * 10.0
         both_association_10 = ci_association_10 + pinch_association_10
-        effect_cols = st.columns(5)
+        effect_cols = st.columns(4)
         effect_values = [
             ("Partial CI Association · +10 N·s", f"{ci_association_10:+.2f} mph", BLUE),
             ("Partial Pinch Association · +10", f"{pinch_association_10:+.2f} mph", TEAL),
             ("Both Predictors +10", f"{both_association_10:+.2f} mph", ACCENT_RED),
-            (
-                "Testing R²",
-                (
-                    f"{train_test_eval['test_metrics']['r2']:.2f}"
-                    if train_test_eval is not None
-                    and pd.notna(train_test_eval['test_metrics']['r2'])
-                    else "—"
-                ),
-                GREEN,
-            ),
             (
                 "CI–Pinch r",
                 f"{combined_model['ci_pinch_r']:+.2f}"
@@ -9745,150 +9723,6 @@ with combined_model_tab:
         for column, metric_values in zip(effect_cols, effect_values):
             with column:
                 st.markdown(metric_card(*metric_values), unsafe_allow_html=True)
-
-        with st.container(border=True):
-            st.subheader("Model Testing — Training vs Testing", anchor=False)
-            st.markdown(
-                "**Simple idea:** the model gets to learn from **70% of the pitchers**. "
-                "We then freeze the equation and ask it to predict the remaining **30% of pitchers that it never saw**."
-            )
-
-            if train_test_eval is None:
-                st.info(
-                    "There are not enough eligible pitchers for a useful 70/30 split. "
-                    "The combined model can still be fit, but a separate testing set would be too small."
-                )
-            else:
-                train_metrics = train_test_eval["train_metrics"]
-                test_metrics = train_test_eval["test_metrics"]
-                split_cols = st.columns(4)
-                split_values = [
-                    (
-                        "Training R²",
-                        f"{train_metrics['r2']:.2f}" if pd.notna(train_metrics["r2"]) else "—",
-                        BLUE,
-                    ),
-                    (
-                        "Testing R²",
-                        f"{test_metrics['r2']:.2f}" if pd.notna(test_metrics["r2"]) else "—",
-                        ACCENT_RED,
-                    ),
-                    ("Training RMSE", f"{train_metrics['rmse']:.2f} mph", GREEN),
-                    ("Testing RMSE", f"{test_metrics['rmse']:.2f} mph", NAVY),
-                ]
-                for column, metric_values in zip(split_cols, split_values):
-                    with column:
-                        st.markdown(metric_card(*metric_values), unsafe_allow_html=True)
-
-                st.markdown(
-                    f"**Who is in each group?** {train_test_eval['train_n']} pitchers are used to build the equation "
-                    f"and {train_test_eval['test_n']} pitchers are held back for testing. The split is fixed so the same "
-                    "pitchers stay in the training and testing groups each time the app reruns."
-                )
-
-                explain_left, explain_right = st.columns(2)
-                with explain_left:
-                    st.markdown("**Training R² — how well did the model learn the data it was given?**")
-                    st.caption(
-                        "R² describes how much of the difference in FB velo between the TRAINING pitchers is accounted "
-                        "for by CI and pinch grip. A high training R² can look impressive, but by itself it does not prove "
-                        "the model will work on another pitcher."
-                    )
-                    st.markdown("**Training RMSE — how far off was it on pitchers it already learned from?**")
-                    st.caption(
-                        "RMSE is prediction error in mph. For example, a training RMSE of 0.8 mph means the fitted values "
-                        "are typically about 0.8 mph away from actual FB velo in the data used to build the model."
-                    )
-                with explain_right:
-                    st.markdown("**Testing R² — does the relationship carry over to pitchers the model never saw?**")
-                    st.caption(
-                        "This is the more important R² for judging whether the model generalizes. Positive is better. "
-                        "A value near 0 means CI + pinch are not doing much better than a simple average on the testing pitchers. "
-                        "A negative value means the model is doing worse than that simple average on this held-out group."
-                    )
-                    st.markdown("**Testing RMSE — how wrong are the new-pitcher predictions in mph?**")
-                    st.caption(
-                        "This is usually the easiest number to interpret. If testing RMSE is 1.4 mph, the model's held-out "
-                        "predictions are off by roughly 1.4 mph on average in an RMSE sense. Lower is better."
-                    )
-
-                test_mae = test_metrics["mae"]
-                test_bias = test_metrics["bias"]
-                extra_cols = st.columns(2)
-                with extra_cols[0]:
-                    st.markdown(metric_card("Testing MAE", f"{test_mae:.2f} mph", TEAL), unsafe_allow_html=True)
-                    st.caption(
-                        "MAE is the average absolute miss. It is even more literal than RMSE: a 1.0 mph MAE means the "
-                        "testing predictions missed actual velo by 1.0 mph on average."
-                    )
-                with extra_cols[1]:
-                    st.markdown(metric_card("Testing Bias", f"{test_bias:+.2f} mph", NAVY_MID), unsafe_allow_html=True)
-                    st.caption(
-                        "Bias shows direction. Near 0 is ideal. Positive means actual velo tended to be higher than predicted; "
-                        "negative means the model tended to predict too high."
-                    )
-
-                train_test_gap = test_metrics["rmse"] - train_metrics["rmse"]
-                if test_metrics["rmse"] > train_metrics["rmse"] * 1.5 and train_test_gap >= 0.5:
-                    st.warning(
-                        "The model performs noticeably worse on the testing pitchers than on the training pitchers. "
-                        "That is a sign the model may be overfitting this sample, so individual projections should be treated cautiously."
-                    )
-                elif pd.notna(test_metrics["r2"]) and test_metrics["r2"] <= 0:
-                    st.warning(
-                        "Testing R² is at or below 0. In this particular held-out group, CI + pinch did not outperform "
-                        "a simple mean-velo prediction."
-                    )
-                else:
-                    st.success(
-                        "The testing results are not showing an obvious collapse relative to training. That does not prove "
-                        "causality, but it is a better sign than judging the model only on the pitchers used to fit it."
-                    )
-
-                st.markdown("**Testing pitchers: actual vs predicted FB velo**")
-                st.plotly_chart(
-                    build_combined_train_test_chart(train_test_eval),
-                    use_container_width=True,
-                    config={"displayModeBar": False},
-                    key=(
-                        f"combined_train_test_chart_{team_filter}_{start_date}_{end_date}_"
-                        f"{min_ci_jumps}_{min_pinch_tests}_{min_velo_records}"
-                    ),
-                )
-                st.caption(
-                    "Each dot is a pitcher the model did not see during training. Dots close to the dashed line were predicted well. "
-                    "The farther a dot is from the line, the larger the prediction error."
-                )
-
-                with st.expander("Show which pitchers are in the training and testing sets", expanded=False):
-                    split_display = pd.concat([
-                        train_test_eval["train"], train_test_eval["test"]
-                    ], ignore_index=True)[[
-                        "athlete", "split", "avg_ci", "avg_pinch_strength", "avg_fb_velo",
-                        "split_predicted_fb_velo", "split_error_fb_velo",
-                    ]].copy()
-                    split_display.columns = [
-                        "Pitcher", "Group", "Average CI", "Average Pinch", "Actual FB Velo",
-                        "Predicted FB Velo", "Actual − Predicted",
-                    ]
-                    st.dataframe(
-                        split_display.sort_values(["Group", "Pitcher"]),
-                        hide_index=True,
-                        use_container_width=True,
-                        column_config={
-                            "Average CI": st.column_config.NumberColumn(format="%.1f N·s"),
-                            "Average Pinch": st.column_config.NumberColumn(format="%.1f"),
-                            "Actual FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                            "Predicted FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
-                            "Actual − Predicted": st.column_config.NumberColumn(format="%+.2f mph"),
-                        },
-                    )
-
-                st.caption(
-                    "Important: this 70/30 split is being used to EVALUATE the relationship. The main combined equation and "
-                    "projection calculator still refit CI + pinch on all eligible pitchers so they can use all available data "
-                    "after we have separately checked how well the relationship generalizes."
-                )
 
         with st.container(border=True):
             st.subheader("Model Comparison — Is Pinch Worth Adding?", anchor=False)
@@ -9999,7 +9833,7 @@ with combined_model_tab:
 
                 st.caption(
                     "These scores compare models fitted to all eligible pitchers under the current filters. They are model-selection "
-                    "criteria, not measures of causality and not a replacement for the separate held-out testing results above."
+                    "criteria, not measures of causality; they are tools for comparing the competing models on the same pitcher sample."
                 )
 
         with st.container(border=True):
