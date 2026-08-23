@@ -5266,6 +5266,8 @@ def _fit_cross_sectional_variant(
     ss_residual = float(np.sum(residual ** 2))
     r2 = float(1.0 - ss_residual / ss_total) if ss_total > 0 else np.nan
     rmse = float(np.sqrt(np.mean(residual ** 2)))
+    mae = float(np.mean(np.abs(residual)))
+    residual_bias = float(np.mean(residual))
 
     df_residual = n - k - 1
     adjusted_r2 = (
@@ -5275,18 +5277,35 @@ def _fit_cross_sectional_variant(
 
     sigma2 = np.nan
     covariance = np.full((k + 1, k + 1), np.nan, dtype=float)
+    xtx_inv = np.linalg.pinv(x.T @ x)
     if df_residual > 0:
         sigma2 = ss_residual / df_residual
-        covariance = sigma2 * np.linalg.pinv(x.T @ x)
+        covariance = sigma2 * xtx_inv
         standard_errors = np.sqrt(
             np.maximum(np.diag(covariance), 0.0)
         )
     else:
         standard_errors = np.full(k + 1, np.nan)
 
+    # Classical influence diagnostics. These are descriptive diagnostics for
+    # this pitcher-level OLS fit; thresholds shown in the UI are heuristics.
+    leverage = np.sum((x @ xtx_inv) * x, axis=1)
+    leverage = np.clip(leverage, 0.0, 1.0)
+    if pd.notna(sigma2) and sigma2 > 0:
+        denom = np.sqrt(np.maximum(sigma2 * (1.0 - leverage), 1e-12))
+        studentized_residual = residual / denom
+        cooks_distance = (
+            (residual ** 2) / ((k + 1) * sigma2)
+            * leverage / np.maximum((1.0 - leverage) ** 2, 1e-12)
+        )
+    else:
+        studentized_residual = np.full(n, np.nan, dtype=float)
+        cooks_distance = np.full(n, np.nan, dtype=float)
+
     # Leave one pitcher out at a time. Because the input has exactly one row
     # per pitcher, this is ordinary leave-one-observation-out validation.
     cv_predicted = np.full(n, np.nan, dtype=float)
+    jackknife_coef = np.full((n, k + 1), np.nan, dtype=float)
     for row_index in range(n):
         train_mask = np.ones(n, dtype=bool)
         train_mask[row_index] = False
@@ -5300,19 +5319,39 @@ def _fit_cross_sectional_variant(
         train_coef, _, _, _ = np.linalg.lstsq(
             x_train, y_train, rcond=None
         )
+        jackknife_coef[row_index] = train_coef
         cv_predicted[row_index] = x[row_index] @ train_coef
 
     valid_cv = np.isfinite(cv_predicted)
+    cv_error = np.full(n, np.nan, dtype=float)
     if valid_cv.all():
         cv_error = y - cv_predicted
         cv_rmse = float(np.sqrt(np.mean(cv_error ** 2)))
+        cv_mae = float(np.mean(np.abs(cv_error)))
+        cv_bias = float(np.mean(cv_error))
+        press = float(np.sum(cv_error ** 2))
         cv_r2 = (
-            float(1.0 - np.sum(cv_error ** 2) / ss_total)
+            float(1.0 - press / ss_total)
             if ss_total > 0 else np.nan
         )
+        if not np.isclose(np.std(cv_predicted), 0):
+            calibration_x = np.column_stack([np.ones(n), cv_predicted])
+            calibration_coef, _, _, _ = np.linalg.lstsq(
+                calibration_x, y, rcond=None
+            )
+            cv_calibration_intercept = float(calibration_coef[0])
+            cv_calibration_slope = float(calibration_coef[1])
+        else:
+            cv_calibration_intercept = np.nan
+            cv_calibration_slope = np.nan
     else:
         cv_rmse = np.nan
+        cv_mae = np.nan
+        cv_bias = np.nan
+        press = np.nan
         cv_r2 = np.nan
+        cv_calibration_intercept = np.nan
+        cv_calibration_slope = np.nan
 
     return {
         "data": data,
@@ -5325,9 +5364,21 @@ def _fit_cross_sectional_variant(
         "r2": r2,
         "adjusted_r2": adjusted_r2,
         "rmse": rmse,
+        "mae": mae,
+        "residual_bias": residual_bias,
+        "leverage": leverage,
+        "studentized_residual": studentized_residual,
+        "cooks_distance": cooks_distance,
         "cv_predicted": cv_predicted,
+        "cv_error": cv_error,
         "cv_rmse": cv_rmse,
+        "cv_mae": cv_mae,
+        "cv_bias": cv_bias,
+        "press": press,
         "cv_r2": cv_r2,
+        "cv_calibration_intercept": cv_calibration_intercept,
+        "cv_calibration_slope": cv_calibration_slope,
+        "jackknife_coef": jackknife_coef,
         "n": n,
         "k": k,
         "df_residual": df_residual,
@@ -5351,6 +5402,10 @@ def fit_combined_overview_model(
     data["predicted_fb_velo"] = combined["predicted"]
     data["residual_fb_velo"] = combined["residual"]
     data["cv_predicted_fb_velo"] = combined["cv_predicted"]
+    data["cv_error_fb_velo"] = combined["cv_error"]
+    data["leverage"] = combined["leverage"]
+    data["studentized_residual"] = combined["studentized_residual"]
+    data["cooks_distance"] = combined["cooks_distance"]
 
     y_sd = float(data["avg_fb_velo"].std(ddof=0))
     ci_sd = float(data["avg_ci"].std(ddof=0))
@@ -5397,8 +5452,16 @@ def fit_combined_overview_model(
         "r2": combined["r2"],
         "adjusted_r2": combined["adjusted_r2"],
         "rmse": combined["rmse"],
+        "mae": combined["mae"],
+        "residual_bias": combined["residual_bias"],
         "cv_rmse": combined["cv_rmse"],
+        "cv_mae": combined["cv_mae"],
+        "cv_bias": combined["cv_bias"],
+        "press": combined["press"],
         "cv_r2": combined["cv_r2"],
+        "cv_calibration_intercept": combined["cv_calibration_intercept"],
+        "cv_calibration_slope": combined["cv_calibration_slope"],
+        "jackknife_coef": combined["jackknife_coef"],
         "standardized_beta_ci": standardized_beta_ci,
         "standardized_beta_pinch": standardized_beta_pinch,
         "ci_pinch_r": ci_pinch_r,
@@ -5417,6 +5480,252 @@ def fit_combined_overview_model(
             "avg_fb_velo", ascending=False
         ).reset_index(drop=True),
     }
+
+
+def combined_information_criteria(model: dict | None) -> pd.DataFrame:
+    """Compare CI-only, pinch-only, and combined models with AICc and BIC.
+
+    All candidate models are fit to the exact same pitcher rows. For the
+    information-criterion penalty, K includes the regression coefficients
+    (including the intercept) plus the residual-variance parameter.
+    """
+    columns = [
+        "Model", "Predictors", "N", "Parameters", "R²",
+        "AICc", "ΔAICc", "BIC", "ΔBIC",
+    ]
+    if model is None or "data" not in model:
+        return pd.DataFrame(columns=columns)
+
+    data = model["data"].dropna(
+        subset=["avg_ci", "avg_pinch_strength", "avg_fb_velo"]
+    ).copy().reset_index(drop=True)
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+
+    candidates = [
+        ("CI only", "CI", ["avg_ci"]),
+        ("Pinch only", "Pinch", ["avg_pinch_strength"]),
+        ("CI + Pinch", "CI + Pinch", ["avg_ci", "avg_pinch_strength"]),
+    ]
+
+    rows = []
+    for label, predictor_label, predictors in candidates:
+        fit = _fit_cross_sectional_variant(data, predictors)
+        if fit is None:
+            continue
+
+        n = int(fit["n"])
+        # Intercept + slopes + residual variance.
+        k_params = int(fit["k"]) + 2
+        residual = np.asarray(fit["residual"], dtype=float)
+        rss = float(np.sum(residual ** 2))
+        if n <= 0 or rss <= 0:
+            continue
+
+        sigma2_mle = max(rss / n, np.finfo(float).tiny)
+        log_likelihood = float(
+            -0.5 * n * (
+                np.log(2.0 * np.pi)
+                + 1.0
+                + np.log(sigma2_mle)
+            )
+        )
+        aic = float(-2.0 * log_likelihood + 2.0 * k_params)
+        if n > k_params + 1:
+            aicc = float(
+                aic
+                + (2.0 * k_params * (k_params + 1.0))
+                / (n - k_params - 1.0)
+            )
+        else:
+            aicc = np.inf
+        bic = float(-2.0 * log_likelihood + np.log(n) * k_params)
+
+        rows.append({
+            "Model": label,
+            "Predictors": predictor_label,
+            "N": n,
+            "Parameters": k_params,
+            "R²": float(fit["r2"]),
+            "AICc": aicc,
+            "BIC": bic,
+        })
+
+    comparison = pd.DataFrame(rows)
+    if comparison.empty:
+        return pd.DataFrame(columns=columns)
+
+    finite_aicc = comparison["AICc"].replace([np.inf, -np.inf], np.nan)
+    finite_bic = comparison["BIC"].replace([np.inf, -np.inf], np.nan)
+    best_aicc = finite_aicc.min(skipna=True)
+    best_bic = finite_bic.min(skipna=True)
+    comparison["ΔAICc"] = comparison["AICc"] - best_aicc
+    comparison["ΔBIC"] = comparison["BIC"] - best_bic
+    return comparison[columns]
+
+
+def _information_criterion_support(delta: float, criterion: str) -> str:
+    """Return a short plain-language label for an information-criterion delta."""
+    if pd.isna(delta):
+        return "Unavailable"
+    delta = float(delta)
+    if np.isclose(delta, 0.0):
+        return "Best"
+    if criterion.upper() == "BIC":
+        if delta <= 2:
+            return "Similar support"
+        if delta <= 6:
+            return "Less support"
+        if delta <= 10:
+            return "Strongly less supported"
+        return "Very strongly less supported"
+    if delta <= 2:
+        return "Similar support"
+    if delta <= 4:
+        return "Somewhat less supported"
+    if delta <= 7:
+        return "Considerably less supported"
+    if delta <= 10:
+        return "Much less supported"
+    return "Very little support"
+
+
+def evaluate_combined_train_test_split(
+    model: dict | None,
+    test_fraction: float = 0.30,
+    random_state: int = 42,
+) -> dict | None:
+    """Evaluate CI + pinch -> FB velo on a fixed pitcher-level train/test split.
+
+    Each pitcher contributes exactly one row. Coefficients for this evaluation are
+    estimated on the training pitchers only, then applied unchanged to the held-out
+    testing pitchers. The fixed seed keeps the split reproducible across reruns.
+    """
+    if model is None or "data" not in model:
+        return None
+
+    data = model["data"].dropna(
+        subset=["avg_ci", "avg_pinch_strength", "avg_fb_velo"]
+    ).copy().reset_index(drop=True)
+    n = len(data)
+    if n < 6:
+        return None
+
+    test_n = max(2, int(np.ceil(n * float(test_fraction))))
+    # Need at least 4 training pitchers for intercept + two predictors.
+    test_n = min(test_n, n - 4)
+    if test_n < 2:
+        return None
+
+    rng = np.random.default_rng(int(random_state))
+    test_idx = np.sort(rng.choice(n, size=test_n, replace=False))
+    test_mask = np.zeros(n, dtype=bool)
+    test_mask[test_idx] = True
+    train_mask = ~test_mask
+
+    train = data.loc[train_mask].copy().reset_index(drop=True)
+    test = data.loc[test_mask].copy().reset_index(drop=True)
+
+    x_train = np.column_stack([
+        np.ones(len(train)),
+        train["avg_ci"].to_numpy(dtype=float),
+        train["avg_pinch_strength"].to_numpy(dtype=float),
+    ])
+    y_train = train["avg_fb_velo"].to_numpy(dtype=float)
+    if len(train) <= 3 or np.linalg.matrix_rank(x_train) < 3:
+        return None
+
+    coef, _, _, _ = np.linalg.lstsq(x_train, y_train, rcond=None)
+
+    def _predict(frame: pd.DataFrame) -> np.ndarray:
+        x = np.column_stack([
+            np.ones(len(frame)),
+            frame["avg_ci"].to_numpy(dtype=float),
+            frame["avg_pinch_strength"].to_numpy(dtype=float),
+        ])
+        return x @ coef
+
+    train_pred = _predict(train)
+    test_pred = _predict(test)
+    train_actual = train["avg_fb_velo"].to_numpy(dtype=float)
+    test_actual = test["avg_fb_velo"].to_numpy(dtype=float)
+
+    def _metrics(actual: np.ndarray, predicted: np.ndarray) -> dict:
+        error = actual - predicted
+        rmse = float(np.sqrt(np.mean(error ** 2)))
+        mae = float(np.mean(np.abs(error)))
+        bias = float(np.mean(error))
+        ss_total = float(np.sum((actual - actual.mean()) ** 2))
+        ss_resid = float(np.sum(error ** 2))
+        r2 = float(1.0 - ss_resid / ss_total) if ss_total > 0 else np.nan
+        return {"r2": r2, "rmse": rmse, "mae": mae, "bias": bias}
+
+    train_metrics = _metrics(train_actual, train_pred)
+    test_metrics = _metrics(test_actual, test_pred)
+
+    train["split"] = "Training"
+    train["split_predicted_fb_velo"] = train_pred
+    train["split_error_fb_velo"] = train_actual - train_pred
+    test["split"] = "Testing"
+    test["split_predicted_fb_velo"] = test_pred
+    test["split_error_fb_velo"] = test_actual - test_pred
+
+    return {
+        "train": train,
+        "test": test,
+        "coef": coef,
+        "train_metrics": train_metrics,
+        "test_metrics": test_metrics,
+        "train_n": len(train),
+        "test_n": len(test),
+        "test_fraction": float(test_fraction),
+        "random_state": int(random_state),
+    }
+
+
+def build_combined_train_test_chart(evaluation: dict) -> go.Figure:
+    """Show held-out testing pitchers: actual versus model-predicted FB velo."""
+    test = evaluation["test"].copy()
+    actual = test["avg_fb_velo"].to_numpy(dtype=float)
+    predicted = test["split_predicted_fb_velo"].to_numpy(dtype=float)
+    low = float(np.nanmin(np.concatenate([actual, predicted]))) - 0.5
+    high = float(np.nanmax(np.concatenate([actual, predicted]))) + 0.5
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=predicted,
+        y=actual,
+        mode="markers+text",
+        text=test["athlete"].astype(str),
+        textposition="top center",
+        marker={"size": 10, "color": ACCENT_RED, "line": {"width": 1, "color": "#FFFFFF"}},
+        customdata=np.column_stack([
+            test["athlete"].astype(str),
+            test["avg_ci"].to_numpy(dtype=float),
+            test["avg_pinch_strength"].to_numpy(dtype=float),
+        ]),
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>Predicted: %{x:.2f} mph"
+            "<br>Actual: %{y:.2f} mph<br>Average CI: %{customdata[1]:.1f} N·s"
+            "<br>Average Pinch: %{customdata[2]:.1f}<extra></extra>"
+        ),
+        name="Testing pitchers",
+    ))
+    fig.add_trace(go.Scatter(
+        x=[low, high], y=[low, high], mode="lines",
+        line={"dash": "dash", "color": SUBTEXT},
+        hoverinfo="skip", showlegend=False,
+    ))
+    fig.update_layout(
+        paper_bgcolor=CARD_BG, plot_bgcolor=CARD_BG,
+        font={"family": "Inter, Avenir Next, Arial, sans-serif", "color": TEXT},
+        margin={"l": 20, "r": 20, "t": 20, "b": 50},
+        height=430, showlegend=False,
+        xaxis_title="Predicted FB Velo (mph)", yaxis_title="Actual FB Velo (mph)",
+    )
+    fig.update_xaxes(range=[low, high], showgrid=True, gridcolor=GRID, zeroline=False)
+    fig.update_yaxes(range=[low, high], showgrid=True, gridcolor=GRID, zeroline=False)
+    return fig
 
 
 def build_combined_actual_predicted_chart(
@@ -5684,6 +5993,256 @@ def build_combined_model_comparison_chart(
     )
     return base_figure_layout(fig, 390)
 
+
+
+def build_combined_cv_actual_predicted_chart(
+    model: dict | None,
+    show_labels: bool = False,
+) -> go.Figure:
+    """Plot leave-one-pitcher-out predictions against actual FB velo."""
+    fig = go.Figure()
+    if model is None or model["data"].empty:
+        fig.add_annotation(
+            text="The combined overview model could not be fit.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 440)
+
+    data = model["data"].dropna(
+        subset=["cv_predicted_fb_velo", "avg_fb_velo"]
+    ).copy()
+    if data.empty:
+        fig.add_annotation(
+            text="Leave-one-pitcher-out predictions are unavailable.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 440)
+
+    customdata = np.column_stack([
+        data["athlete"], data["team"], data["avg_ci"],
+        data["avg_pinch_strength"], data["avg_fb_velo"],
+        data["cv_error_fb_velo"],
+    ])
+    fig.add_trace(go.Scatter(
+        x=data["cv_predicted_fb_velo"],
+        y=data["avg_fb_velo"],
+        mode="markers+text" if show_labels else "markers",
+        text=data["athlete"] if show_labels else None,
+        textposition="top center",
+        textfont={"size": 9, "color": NAVY},
+        marker={
+            "size": 13, "color": TEAL, "opacity": 0.86,
+            "line": {"color": "#FFFFFF", "width": 2},
+        },
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Team: %{customdata[1]}<br>"
+            "Average CI: %{customdata[2]:.2f} N·s<br>"
+            "Average pinch: %{customdata[3]:.2f}<br>"
+            "Actual final YTD FB velo: %{customdata[4]:.2f} mph<br>"
+            "LOO predicted: %{x:.2f} mph<br>"
+            "LOO error (actual − predicted): %{customdata[5]:+.2f} mph"
+            "<extra></extra>"
+        ),
+    ))
+
+    values = np.concatenate([
+        data["cv_predicted_fb_velo"].to_numpy(dtype=float),
+        data["avg_fb_velo"].to_numpy(dtype=float),
+    ])
+    lower = float(np.nanmin(values)) - 0.5
+    upper = float(np.nanmax(values)) + 0.5
+    if np.isclose(lower, upper):
+        lower -= 0.5
+        upper += 0.5
+    fig.add_trace(go.Scatter(
+        x=[lower, upper], y=[lower, upper], mode="lines",
+        line={"color": NAVY_MID, "width": 2, "dash": "dash"},
+        hoverinfo="skip",
+    ))
+    fig.update_xaxes(
+        title="LOO predicted final YTD FB velo (mph)",
+        range=[lower, upper], showgrid=True, gridcolor=GRID,
+        zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Actual final YTD FB velo (mph)",
+        range=[lower, upper], showgrid=True, gridcolor=GRID,
+        zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 440)
+
+
+def build_combined_residual_diagnostic_chart(
+    model: dict | None,
+) -> go.Figure:
+    """Plot fitted values against residuals, with Cook's distance in hover."""
+    fig = go.Figure()
+    if model is None or model["data"].empty:
+        fig.add_annotation(
+            text="Residual diagnostics are unavailable.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 440)
+
+    data = model["data"].dropna(
+        subset=["predicted_fb_velo", "residual_fb_velo"]
+    ).copy()
+    cook = pd.to_numeric(data["cooks_distance"], errors="coerce").fillna(0.0)
+    if len(cook) and float(cook.max()) > 0:
+        marker_size = 11 + 16 * np.sqrt(cook / float(cook.max()))
+    else:
+        marker_size = np.full(len(data), 13.0)
+
+    customdata = np.column_stack([
+        data["athlete"], data["team"], data["avg_ci"],
+        data["avg_pinch_strength"], data["leverage"],
+        data["studentized_residual"], data["cooks_distance"],
+    ])
+    fig.add_trace(go.Scatter(
+        x=data["predicted_fb_velo"],
+        y=data["residual_fb_velo"],
+        mode="markers",
+        marker={
+            "size": marker_size,
+            "color": ACCENT_RED,
+            "opacity": 0.78,
+            "line": {"color": "#FFFFFF", "width": 1.5},
+        },
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Team: %{customdata[1]}<br>"
+            "Average CI: %{customdata[2]:.2f} N·s<br>"
+            "Average pinch: %{customdata[3]:.2f}<br>"
+            "Fitted FB velo: %{x:.2f} mph<br>"
+            "Residual: %{y:+.2f} mph<br>"
+            "Leverage: %{customdata[4]:.3f}<br>"
+            "Studentized residual: %{customdata[5]:+.2f}<br>"
+            "Cook's D: %{customdata[6]:.3f}<extra></extra>"
+        ),
+    ))
+    fig.add_hline(y=0, line_dash="dash", line_color=NAVY_MID, line_width=2)
+    fig.update_xaxes(
+        title="Fitted final YTD FB velo (mph)",
+        showgrid=True, gridcolor=GRID, zeroline=False,
+        linecolor=BORDER, tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Residual: actual − fitted (mph)",
+        showgrid=True, gridcolor=GRID, zeroline=False,
+        linecolor=BORDER, tickfont={"color": SUBTEXT},
+        title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 440)
+
+
+def combined_model_influence_table(model: dict | None) -> pd.DataFrame:
+    """Return pitcher-level residual, leverage, and influence diagnostics."""
+    columns = [
+        "Pitcher", "Team", "Actual FB Velo", "Fitted FB Velo",
+        "Residual", "LOO Predicted", "LOO Error", "Leverage",
+        "Studentized Residual", "Cook's D", "Diagnostic Flags",
+    ]
+    if model is None or model["data"].empty:
+        return pd.DataFrame(columns=columns)
+
+    data = model["data"].copy()
+    n = max(1, int(model["n_pitchers"]))
+    p = 3  # intercept + CI + pinch
+    leverage_cut = 2.0 * p / n
+    cook_cut = 4.0 / n
+
+    rows = []
+    for _, row in data.iterrows():
+        flags = []
+        lev = pd.to_numeric(pd.Series([row.get("leverage")]), errors="coerce").iloc[0]
+        stud = pd.to_numeric(pd.Series([row.get("studentized_residual")]), errors="coerce").iloc[0]
+        cook = pd.to_numeric(pd.Series([row.get("cooks_distance")]), errors="coerce").iloc[0]
+        if pd.notna(lev) and lev > leverage_cut:
+            flags.append("High leverage")
+        if pd.notna(stud) and abs(stud) > 2.0:
+            flags.append("|Studentized residual| > 2")
+        if pd.notna(cook) and cook > cook_cut:
+            flags.append("Cook's D > 4/n")
+        rows.append({
+            "Pitcher": row.get("athlete", ""),
+            "Team": row.get("team", ""),
+            "Actual FB Velo": row.get("avg_fb_velo", np.nan),
+            "Fitted FB Velo": row.get("predicted_fb_velo", np.nan),
+            "Residual": row.get("residual_fb_velo", np.nan),
+            "LOO Predicted": row.get("cv_predicted_fb_velo", np.nan),
+            "LOO Error": row.get("cv_error_fb_velo", np.nan),
+            "Leverage": lev,
+            "Studentized Residual": stud,
+            "Cook's D": cook,
+            "Diagnostic Flags": "; ".join(flags) if flags else "—",
+        })
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["Cook's D", "Leverage"], ascending=[False, False], na_position="last"
+    ).reset_index(drop=True)
+
+
+def combined_model_stability_table(model: dict | None) -> pd.DataFrame:
+    """Summarize coefficient stability across leave-one-pitcher-out refits."""
+    columns = [
+        "Predictor", "Full Coefficient", "LOO Min", "LOO Max", "LOO SD",
+        "Same-Sign Refits", "Crosses Zero Across Refits", "Association per +10",
+    ]
+    if model is None:
+        return pd.DataFrame(columns=columns)
+
+    jack = np.asarray(model.get("jackknife_coef"), dtype=float)
+    if jack.ndim != 2 or jack.shape[1] < 3:
+        return pd.DataFrame(columns=columns)
+
+    specs = [
+        ("Concentric impulse", 1, float(model["beta_ci"])),
+        ("Pinch strength", 2, float(model["beta_pinch"])),
+    ]
+    rows = []
+    for label, idx, full_coef in specs:
+        values = jack[:, idx]
+        values = values[np.isfinite(values)]
+        if values.size:
+            same_sign = float(np.mean(np.sign(values) == np.sign(full_coef)) * 100.0)
+            loo_min = float(np.min(values))
+            loo_max = float(np.max(values))
+            loo_sd = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+            crosses_zero = bool(loo_min <= 0.0 <= loo_max)
+        else:
+            same_sign = np.nan
+            loo_min = np.nan
+            loo_max = np.nan
+            loo_sd = np.nan
+            crosses_zero = False
+        rows.append({
+            "Predictor": label,
+            "Full Coefficient": full_coef,
+            "LOO Min": loo_min,
+            "LOO Max": loo_max,
+            "LOO SD": loo_sd,
+            "Same-Sign Refits": same_sign,
+            "Crosses Zero Across Refits": "Yes" if crosses_zero else "No",
+            "Association per +10": full_coef * 10.0,
+        })
+    return pd.DataFrame(rows, columns=columns)
 
 
 # -----------------------------------------------------------------------------
@@ -9117,6 +9676,9 @@ with combined_model_tab:
             "plus variation in both predictors. Each pitcher contributes one row."
         )
     else:
+        train_test_eval = evaluate_combined_train_test_split(
+            combined_model, test_fraction=0.30, random_state=42
+        )
         cols = st.columns(5)
         values = [
             ("Pitchers", str(combined_model["n_pitchers"]), BLUE),
@@ -9129,9 +9691,12 @@ with combined_model_tab:
             ),
             ("RMSE", f"{combined_model['rmse']:.2f} mph", GREEN),
             (
-                "LOO RMSE",
-                f"{combined_model['cv_rmse']:.2f} mph"
-                if pd.notna(combined_model["cv_rmse"]) else "—",
+                "Testing RMSE",
+                (
+                    f"{train_test_eval['test_metrics']['rmse']:.2f} mph"
+                    if train_test_eval is not None
+                    else "—"
+                ),
                 NAVY,
             ),
         ]
@@ -9161,9 +9726,13 @@ with combined_model_tab:
             ("Partial Pinch Association · +10", f"{pinch_association_10:+.2f} mph", TEAL),
             ("Both Predictors +10", f"{both_association_10:+.2f} mph", ACCENT_RED),
             (
-                "LOO CV R²",
-                f"{combined_model['cv_r2']:.2f}"
-                if pd.notna(combined_model["cv_r2"]) else "—",
+                "Testing R²",
+                (
+                    f"{train_test_eval['test_metrics']['r2']:.2f}"
+                    if train_test_eval is not None
+                    and pd.notna(train_test_eval['test_metrics']['r2'])
+                    else "—"
+                ),
                 GREEN,
             ),
             (
@@ -9176,6 +9745,262 @@ with combined_model_tab:
         for column, metric_values in zip(effect_cols, effect_values):
             with column:
                 st.markdown(metric_card(*metric_values), unsafe_allow_html=True)
+
+        with st.container(border=True):
+            st.subheader("Model Testing — Training vs Testing", anchor=False)
+            st.markdown(
+                "**Simple idea:** the model gets to learn from **70% of the pitchers**. "
+                "We then freeze the equation and ask it to predict the remaining **30% of pitchers that it never saw**."
+            )
+
+            if train_test_eval is None:
+                st.info(
+                    "There are not enough eligible pitchers for a useful 70/30 split. "
+                    "The combined model can still be fit, but a separate testing set would be too small."
+                )
+            else:
+                train_metrics = train_test_eval["train_metrics"]
+                test_metrics = train_test_eval["test_metrics"]
+                split_cols = st.columns(4)
+                split_values = [
+                    (
+                        "Training R²",
+                        f"{train_metrics['r2']:.2f}" if pd.notna(train_metrics["r2"]) else "—",
+                        BLUE,
+                    ),
+                    (
+                        "Testing R²",
+                        f"{test_metrics['r2']:.2f}" if pd.notna(test_metrics["r2"]) else "—",
+                        ACCENT_RED,
+                    ),
+                    ("Training RMSE", f"{train_metrics['rmse']:.2f} mph", GREEN),
+                    ("Testing RMSE", f"{test_metrics['rmse']:.2f} mph", NAVY),
+                ]
+                for column, metric_values in zip(split_cols, split_values):
+                    with column:
+                        st.markdown(metric_card(*metric_values), unsafe_allow_html=True)
+
+                st.markdown(
+                    f"**Who is in each group?** {train_test_eval['train_n']} pitchers are used to build the equation "
+                    f"and {train_test_eval['test_n']} pitchers are held back for testing. The split is fixed so the same "
+                    "pitchers stay in the training and testing groups each time the app reruns."
+                )
+
+                explain_left, explain_right = st.columns(2)
+                with explain_left:
+                    st.markdown("**Training R² — how well did the model learn the data it was given?**")
+                    st.caption(
+                        "R² describes how much of the difference in FB velo between the TRAINING pitchers is accounted "
+                        "for by CI and pinch grip. A high training R² can look impressive, but by itself it does not prove "
+                        "the model will work on another pitcher."
+                    )
+                    st.markdown("**Training RMSE — how far off was it on pitchers it already learned from?**")
+                    st.caption(
+                        "RMSE is prediction error in mph. For example, a training RMSE of 0.8 mph means the fitted values "
+                        "are typically about 0.8 mph away from actual FB velo in the data used to build the model."
+                    )
+                with explain_right:
+                    st.markdown("**Testing R² — does the relationship carry over to pitchers the model never saw?**")
+                    st.caption(
+                        "This is the more important R² for judging whether the model generalizes. Positive is better. "
+                        "A value near 0 means CI + pinch are not doing much better than a simple average on the testing pitchers. "
+                        "A negative value means the model is doing worse than that simple average on this held-out group."
+                    )
+                    st.markdown("**Testing RMSE — how wrong are the new-pitcher predictions in mph?**")
+                    st.caption(
+                        "This is usually the easiest number to interpret. If testing RMSE is 1.4 mph, the model's held-out "
+                        "predictions are off by roughly 1.4 mph on average in an RMSE sense. Lower is better."
+                    )
+
+                test_mae = test_metrics["mae"]
+                test_bias = test_metrics["bias"]
+                extra_cols = st.columns(2)
+                with extra_cols[0]:
+                    st.markdown(metric_card("Testing MAE", f"{test_mae:.2f} mph", TEAL), unsafe_allow_html=True)
+                    st.caption(
+                        "MAE is the average absolute miss. It is even more literal than RMSE: a 1.0 mph MAE means the "
+                        "testing predictions missed actual velo by 1.0 mph on average."
+                    )
+                with extra_cols[1]:
+                    st.markdown(metric_card("Testing Bias", f"{test_bias:+.2f} mph", NAVY_MID), unsafe_allow_html=True)
+                    st.caption(
+                        "Bias shows direction. Near 0 is ideal. Positive means actual velo tended to be higher than predicted; "
+                        "negative means the model tended to predict too high."
+                    )
+
+                train_test_gap = test_metrics["rmse"] - train_metrics["rmse"]
+                if test_metrics["rmse"] > train_metrics["rmse"] * 1.5 and train_test_gap >= 0.5:
+                    st.warning(
+                        "The model performs noticeably worse on the testing pitchers than on the training pitchers. "
+                        "That is a sign the model may be overfitting this sample, so individual projections should be treated cautiously."
+                    )
+                elif pd.notna(test_metrics["r2"]) and test_metrics["r2"] <= 0:
+                    st.warning(
+                        "Testing R² is at or below 0. In this particular held-out group, CI + pinch did not outperform "
+                        "a simple mean-velo prediction."
+                    )
+                else:
+                    st.success(
+                        "The testing results are not showing an obvious collapse relative to training. That does not prove "
+                        "causality, but it is a better sign than judging the model only on the pitchers used to fit it."
+                    )
+
+                st.markdown("**Testing pitchers: actual vs predicted FB velo**")
+                st.plotly_chart(
+                    build_combined_train_test_chart(train_test_eval),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=(
+                        f"combined_train_test_chart_{team_filter}_{start_date}_{end_date}_"
+                        f"{min_ci_jumps}_{min_pinch_tests}_{min_velo_records}"
+                    ),
+                )
+                st.caption(
+                    "Each dot is a pitcher the model did not see during training. Dots close to the dashed line were predicted well. "
+                    "The farther a dot is from the line, the larger the prediction error."
+                )
+
+                with st.expander("Show which pitchers are in the training and testing sets", expanded=False):
+                    split_display = pd.concat([
+                        train_test_eval["train"], train_test_eval["test"]
+                    ], ignore_index=True)[[
+                        "athlete", "split", "avg_ci", "avg_pinch_strength", "avg_fb_velo",
+                        "split_predicted_fb_velo", "split_error_fb_velo",
+                    ]].copy()
+                    split_display.columns = [
+                        "Pitcher", "Group", "Average CI", "Average Pinch", "Actual FB Velo",
+                        "Predicted FB Velo", "Actual − Predicted",
+                    ]
+                    st.dataframe(
+                        split_display.sort_values(["Group", "Pitcher"]),
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "Average CI": st.column_config.NumberColumn(format="%.1f N·s"),
+                            "Average Pinch": st.column_config.NumberColumn(format="%.1f"),
+                            "Actual FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                            "Predicted FB Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                            "Actual − Predicted": st.column_config.NumberColumn(format="%+.2f mph"),
+                        },
+                    )
+
+                st.caption(
+                    "Important: this 70/30 split is being used to EVALUATE the relationship. The main combined equation and "
+                    "projection calculator still refit CI + pinch on all eligible pitchers so they can use all available data "
+                    "after we have separately checked how well the relationship generalizes."
+                )
+
+        with st.container(border=True):
+            st.subheader("Model Comparison — Is Pinch Worth Adding?", anchor=False)
+            st.markdown(
+                "**AICc and BIC compare competing models on the exact same pitchers. Lower is better.** "
+                "They reward better fit but penalize unnecessary complexity, so adding pinch only helps if it improves the model "
+                "enough to justify the extra predictor."
+            )
+            st.caption(
+                "AICc is the small-sample corrected version of AIC and is generally more prediction-oriented. "
+                "BIC penalizes extra complexity more strongly. The absolute scores are not meaningful by themselves — "
+                "the differences between models are what matter."
+            )
+
+            ic_table = combined_information_criteria(combined_model)
+            if ic_table.empty:
+                st.info("AICc/BIC comparison could not be calculated for the current eligible pitcher sample.")
+            else:
+                display_ic = ic_table.copy()
+                display_ic["AICc Support"] = display_ic["ΔAICc"].map(
+                    lambda value: _information_criterion_support(value, "AICc")
+                )
+                display_ic["BIC Support"] = display_ic["ΔBIC"].map(
+                    lambda value: _information_criterion_support(value, "BIC")
+                )
+
+                best_aicc_row = ic_table.loc[ic_table["AICc"].idxmin()]
+                best_bic_row = ic_table.loc[ic_table["BIC"].idxmin()]
+                best_aicc_model = str(best_aicc_row["Model"])
+                best_bic_model = str(best_bic_row["Model"])
+
+                score_cols = st.columns(4)
+                score_values = [
+                    ("Best AICc Model", best_aicc_model, BLUE),
+                    ("Best AICc", f"{best_aicc_row['AICc']:.1f}", TEAL),
+                    ("Best BIC Model", best_bic_model, ACCENT_RED),
+                    ("Best BIC", f"{best_bic_row['BIC']:.1f}", NAVY),
+                ]
+                for column, metric_values in zip(score_cols, score_values):
+                    with column:
+                        st.markdown(metric_card(*metric_values), unsafe_allow_html=True)
+
+                st.dataframe(
+                    display_ic[[
+                        "Model", "Predictors", "N", "R²", "AICc", "ΔAICc", "AICc Support",
+                        "BIC", "ΔBIC", "BIC Support",
+                    ]],
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "R²": st.column_config.NumberColumn(format="%.3f"),
+                        "AICc": st.column_config.NumberColumn(format="%.2f"),
+                        "ΔAICc": st.column_config.NumberColumn(format="%.2f"),
+                        "BIC": st.column_config.NumberColumn(format="%.2f"),
+                        "ΔBIC": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+
+                combined_ic = ic_table.loc[ic_table["Model"] == "CI + Pinch"]
+                ci_ic = ic_table.loc[ic_table["Model"] == "CI only"]
+                if not combined_ic.empty and not ci_ic.empty:
+                    combined_row = combined_ic.iloc[0]
+                    ci_row = ci_ic.iloc[0]
+                    aicc_gain = float(ci_row["AICc"] - combined_row["AICc"])
+                    bic_gain = float(ci_row["BIC"] - combined_row["BIC"])
+
+                    st.markdown("**The practical comparison is CI only vs CI + Pinch:**")
+                    st.write(
+                        f"Adding pinch changes AICc by **{aicc_gain:+.2f} points in favor of CI + Pinch** "
+                        f"and BIC by **{bic_gain:+.2f} points in favor of CI + Pinch**. "
+                        "Positive values here mean the combined model has the lower (better) score; negative values mean CI alone is preferred."
+                    )
+
+                    if best_aicc_model == "CI + Pinch" and best_bic_model == "CI + Pinch":
+                        st.success(
+                            "Both AICc and BIC prefer CI + Pinch. In this sample, pinch is adding enough information to justify "
+                            "the extra model complexity by both criteria."
+                        )
+                    elif best_aicc_model == "CI + Pinch" and best_bic_model != "CI + Pinch":
+                        st.info(
+                            "AICc prefers CI + Pinch, but BIC prefers a simpler model. That usually means pinch may add some "
+                            "predictive information, but the improvement is modest enough that the stricter BIC complexity penalty is not convinced."
+                        )
+                    elif best_bic_model == "CI + Pinch" and best_aicc_model != "CI + Pinch":
+                        st.info(
+                            "BIC prefers CI + Pinch while AICc selects another model. Check the score differences closely; "
+                            "when the deltas are small, the models may effectively have similar support."
+                        )
+                    else:
+                        st.warning(
+                            "Neither AICc nor BIC selects CI + Pinch as the best-supported model in this sample. "
+                            "That is a reason to be cautious about assuming pinch adds useful information beyond CI."
+                        )
+
+                explain_aic, explain_bic = st.columns(2)
+                with explain_aic:
+                    st.markdown("**How to read ΔAICc**")
+                    st.caption(
+                        "0 is the best model. About 0–2 means models have similar support; 2–4 is some separation; "
+                        "4–7 is considerably less support; and >10 is very little support for the higher-AICc model."
+                    )
+                with explain_bic:
+                    st.markdown("**How to read ΔBIC**")
+                    st.caption(
+                        "0 is the best model. About 0–2 means similar support; 2–6 is evidence against the higher-BIC model; "
+                        "6–10 is strong evidence; and >10 is very strong evidence."
+                    )
+
+                st.caption(
+                    "These scores compare models fitted to all eligible pitchers under the current filters. They are model-selection "
+                    "criteria, not measures of causality and not a replacement for the separate held-out testing results above."
+                )
 
         with st.container(border=True):
             st.subheader("Combined CI + Pinch Lookup", anchor=False)
