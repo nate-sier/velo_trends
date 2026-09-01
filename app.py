@@ -15,6 +15,7 @@ import html
 import hmac
 import os
 import re
+import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -540,7 +541,7 @@ def _open_org_rankings_book_by_id(sheet_id: str):
             "ORG_RANKINGS_SHEET_ID is not configured. Create a blank Google Sheet in your own Drive, "
             "share it with the app service account as Editor, then add its spreadsheet ID to Streamlit Secrets."
         )
-    return get_gspread_client().open_by_key(sheet_id)
+    return _open_sheet_by_key(get_gspread_client(), sheet_id)
 
 
 def _get_org_rankings_book():
@@ -638,7 +639,7 @@ def load_shared_org_ranking(sheet_id: str) -> tuple[pd.DataFrame, dict[str, str]
         book = _open_org_rankings_book_by_id(sheet_id)
         _, tab_name = _org_rankings_sheet_target()
         worksheet = _org_rankings_worksheet(book, tab_name, for_write=False)
-        records = worksheet.get_all_records()
+        records = _records_from_worksheet(worksheet)
     except Exception as exc:
         raise RuntimeError(f"Could not read the dedicated rankings spreadsheet: {exc}") from exc
 
@@ -994,9 +995,56 @@ def get_gspread_client() -> gspread.Client:
     return gspread.authorize(get_credentials())
 
 
+RETRYABLE_GOOGLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _google_api_call(operation, *, label: str, attempts: int = 5):
+    """Retry transient Google/gspread API failures with exponential backoff."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except gspread.exceptions.APIError as exc:
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            retryable = status_code in RETRYABLE_GOOGLE_STATUS_CODES
+            if not retryable or attempt >= attempts:
+                raise
+            # 0.75, 1.5, 3, 6 seconds. Handles short-lived 429/5xx outages
+            # without hammering Google Sheets again immediately.
+            time.sleep(min(0.75 * (2 ** (attempt - 1)), 6.0))
+
+
+def _open_sheet_by_key(client: gspread.Client, sheet_id: str):
+    return _google_api_call(
+        lambda: client.open_by_key(sheet_id),
+        label=f"spreadsheet {sheet_id}",
+    )
+
+
+def _worksheet_from_book(book, tab_name: str):
+    return _google_api_call(
+        lambda: book.worksheet(tab_name),
+        label=f"worksheet {tab_name}",
+    )
+
+
+def _records_from_worksheet(worksheet) -> list[dict]:
+    return _google_api_call(
+        worksheet.get_all_records,
+        label=f"worksheet data {worksheet.title}",
+    )
+
+
+def read_tab_from_book(book, tab_name: str) -> pd.DataFrame:
+    """Read one tab from an already-open spreadsheet with transient-error retries."""
+    worksheet = _worksheet_from_book(book, tab_name)
+    return pd.DataFrame(_records_from_worksheet(worksheet))
+
+
 def read_tab(client: gspread.Client, sheet_id: str, tab_name: str) -> pd.DataFrame:
-    worksheet = client.open_by_key(sheet_id).worksheet(tab_name)
-    return pd.DataFrame(worksheet.get_all_records())
+    """Backward-compatible sheet reader; prefer read_tab_from_book for repeated tabs."""
+    book = _open_sheet_by_key(client, sheet_id)
+    return read_tab_from_book(book, tab_name)
 
 
 def read_external_sheet(
@@ -1012,9 +1060,22 @@ def read_external_sheet(
     sheet_name = secret_or_default(name_secret, default_name).strip()
     tab_name = secret_or_default(tab_secret, "").strip()
 
-    book = client.open_by_key(sheet_id) if sheet_id else client.open(sheet_name)
-    worksheet = book.worksheet(tab_name) if tab_name else book.sheet1
-    return pd.DataFrame(worksheet.get_all_records())
+    if sheet_id:
+        book = _open_sheet_by_key(client, sheet_id)
+    else:
+        book = _google_api_call(
+            lambda: client.open(sheet_name),
+            label=f"spreadsheet {sheet_name}",
+        )
+
+    if tab_name:
+        worksheet = _worksheet_from_book(book, tab_name)
+    else:
+        worksheet = _google_api_call(
+            lambda: book.sheet1,
+            label=f"first worksheet in {book.title}",
+        )
+    return pd.DataFrame(_records_from_worksheet(worksheet))
 
 
 @st.cache_data(ttl=300, show_spinner="Loading Google Sheet data…")
@@ -1028,11 +1089,16 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
     pinch_tab = secret_or_default("PINCH_TAB", DEFAULT_PINCH_TAB)
 
     client = get_gspread_client()
-    jump_raw = read_tab(client, sheet_id, jump_tab)
-    velo_raw = read_tab(client, sheet_id, velo_tab)
-    bat_raw = read_tab(client, sheet_id, bat_tab)
-    exit_raw = read_tab(client, sheet_id, exit_tab)
-    pinch_raw = read_tab(client, sheet_id, pinch_tab)
+
+    # Open the core workbook once per cache refresh instead of reopening it for
+    # every tab. This removes four unnecessary Google API calls and reduces the
+    # chance that one transient 503 takes down the entire dashboard.
+    core_book = _open_sheet_by_key(client, sheet_id)
+    jump_raw = read_tab_from_book(core_book, jump_tab)
+    velo_raw = read_tab_from_book(core_book, velo_tab)
+    bat_raw = read_tab_from_book(core_book, bat_tab)
+    exit_raw = read_tab_from_book(core_book, exit_tab)
+    pinch_raw = read_tab_from_book(core_book, pinch_tab)
     infield_raw = read_external_sheet(
         client,
         id_secret="INFIELD_SHEET_ID",
