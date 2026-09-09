@@ -1115,14 +1115,19 @@ def load_source_data() -> tuple:
         default_name=DEFAULT_BASERUNNING_SHEET_NAME,
         tab_secret="BASERUNNING_TAB",
     )
-    all_baserunning_raw = read_external_sheet(
-        client,
-        id_secret="BASERUNNING_SHEET_ID",
-        name_secret="BASERUNNING_SHEET_NAME",
-        default_name=DEFAULT_BASERUNNING_SHEET_NAME,
-        tab_secret="ALL_BASERUNNING_TAB",
-        default_tab_name=DEFAULT_ALL_BASERUNNING_TAB,
-    )
+    try:
+        all_baserunning_raw = read_external_sheet(
+            client,
+            id_secret="BASERUNNING_SHEET_ID",
+            name_secret="BASERUNNING_SHEET_NAME",
+            default_name=DEFAULT_BASERUNNING_SHEET_NAME,
+            tab_secret="ALL_BASERUNNING_TAB",
+            default_tab_name=DEFAULT_ALL_BASERUNNING_TAB,
+        )
+    except gspread.exceptions.WorksheetNotFound:
+        # The all-baseball relationship tab is optional during setup. Keep the
+        # rest of the dashboard usable until the SQL sync creates it with --write.
+        all_baserunning_raw = pd.DataFrame()
 
     if jump_raw.empty:
         raise ValueError(f"The '{jump_tab}' tab did not return any rows.")
@@ -1138,11 +1143,6 @@ def load_source_data() -> tuple:
         raise ValueError("The infield defensive spreadsheet did not return any rows.")
     if baserunning_raw.empty:
         raise ValueError("The baserunning spreadsheet did not return any rows.")
-    if all_baserunning_raw.empty:
-        raise ValueError(
-            f"The '{DEFAULT_ALL_BASERUNNING_TAB}' baserunning worksheet did not return any rows. "
-            "Run the updated baserunning SQL sync with --write first."
-        )
 
     # Jump Data. CI and relative peak power are cleaned independently so
     # missing values in one metric do not remove valid observations for the other.
@@ -1637,64 +1637,71 @@ def load_source_data() -> tuple:
     # Sprint Speed × Adv Runs. The sync already restricts this worksheet to
     # players with >100 sprint observations; the app re-applies that rule as a
     # safety check so stale/manual rows cannot leak into the relationships.
-    all_baserunning_raw.columns = all_baserunning_raw.columns.astype(str).str.strip()
-    all_player_id_col = first_existing(
-        all_baserunning_raw.columns.tolist(), ["player_id", "PLAYER_ID", "mlbam_id", "MLBAM ID"]
-    )
-    all_name_col = first_existing(
-        all_baserunning_raw.columns.tolist(), ["name", "Name", "player", "Player", "Athlete", "athlete"]
-    )
-    all_nbsr_col = first_existing(all_baserunning_raw.columns.tolist(), ["nBSR", "NBSR", "nbsr"])
-    all_adv_runs_col = first_existing(
-        all_baserunning_raw.columns.tolist(), ["Adv Runs", "Adv runs", "adv runs", "Adv_Runs", "adv_runs"]
-    )
-    all_sprint_col = first_existing(
-        all_baserunning_raw.columns.tolist(),
-        ["Sprint Speed", "Sprint speed", "sprint speed", "Sprint_Speed", "sprint_speed"],
-    )
-    all_sprint_obs_col = first_existing(
-        all_baserunning_raw.columns.tolist(),
-        ["Sprint Observations", "Sprint Obs", "sprint_speed_n", "Sprint Speed N"],
-    )
-    all_nationals_col = first_existing(
-        all_baserunning_raw.columns.tolist(), ["Nationals", "Is Nationals", "is_nationals"]
-    )
-    if any(col is None for col in [
-        all_player_id_col, all_name_col, all_nbsr_col, all_adv_runs_col,
-        all_sprint_col, all_sprint_obs_col, all_nationals_col,
-    ]):
-        raise ValueError(
-            f"The '{DEFAULT_ALL_BASERUNNING_TAB}' worksheet must contain player_id, name, "
-            "Nationals, Sprint Speed, Sprint Observations, Adv Runs, and nBSR."
+    all_baserunning_columns = [
+        "player_id", "athlete", "nbsr", "adv_runs",
+        "baserunning_sprint_speed", "sprint_obs", "is_nationals",
+    ]
+    if all_baserunning_raw.empty:
+        all_baserunning_defense = pd.DataFrame(columns=all_baserunning_columns)
+    else:
+        all_baserunning_raw.columns = all_baserunning_raw.columns.astype(str).str.strip()
+        all_player_id_col = first_existing(
+            all_baserunning_raw.columns.tolist(), ["player_id", "PLAYER_ID", "mlbam_id", "MLBAM ID"]
         )
+        all_name_col = first_existing(
+            all_baserunning_raw.columns.tolist(), ["name", "Name", "player", "Player", "Athlete", "athlete"]
+        )
+        all_nbsr_col = first_existing(all_baserunning_raw.columns.tolist(), ["nBSR", "NBSR", "nbsr"])
+        all_adv_runs_col = first_existing(
+            all_baserunning_raw.columns.tolist(), ["Adv Runs", "Adv runs", "adv runs", "Adv_Runs", "adv_runs"]
+        )
+        all_sprint_col = first_existing(
+            all_baserunning_raw.columns.tolist(),
+            ["Sprint Speed", "Sprint speed", "sprint speed", "Sprint_Speed", "sprint_speed"],
+        )
+        all_sprint_obs_col = first_existing(
+            all_baserunning_raw.columns.tolist(),
+            ["Sprint Observations", "Sprint Obs", "sprint_speed_n", "Sprint Speed N"],
+        )
+        all_nationals_col = first_existing(
+            all_baserunning_raw.columns.tolist(), ["Nationals", "Is Nationals", "is_nationals"]
+        )
+        if any(col is None for col in [
+            all_player_id_col, all_name_col, all_nbsr_col, all_adv_runs_col,
+            all_sprint_col, all_sprint_obs_col, all_nationals_col,
+        ]):
+            raise ValueError(
+                f"The '{DEFAULT_ALL_BASERUNNING_TAB}' worksheet must contain player_id, name, "
+                "Nationals, Sprint Speed, Sprint Observations, Adv Runs, and nBSR."
+            )
 
-    nationals_text = all_baserunning_raw[all_nationals_col].astype(str).str.strip().str.lower()
-    all_baserunning_defense = pd.DataFrame({
-        "player_id": pd.to_numeric(all_baserunning_raw[all_player_id_col], errors="coerce").astype("Int64"),
-        "athlete": all_baserunning_raw[all_name_col].astype(str).str.strip(),
-        "nbsr": pd.to_numeric(all_baserunning_raw[all_nbsr_col], errors="coerce"),
-        "adv_runs": pd.to_numeric(all_baserunning_raw[all_adv_runs_col], errors="coerce"),
-        "baserunning_sprint_speed": pd.to_numeric(all_baserunning_raw[all_sprint_col], errors="coerce"),
-        "sprint_obs": pd.to_numeric(all_baserunning_raw[all_sprint_obs_col], errors="coerce"),
-        "is_nationals": nationals_text.isin({"yes", "y", "true", "1", "nationals", "washington nationals"}),
-    })
-    all_baserunning_defense = (
-        all_baserunning_defense[
-            (all_baserunning_defense["athlete"] != "")
-            & all_baserunning_defense["player_id"].notna()
-            & all_baserunning_defense["sprint_obs"].gt(100)
-        ]
-        .dropna(subset=["baserunning_sprint_speed"])
-        .groupby("player_id", as_index=False)
-        .agg(
-            athlete=("athlete", "first"),
-            nbsr=("nbsr", "mean"),
-            adv_runs=("adv_runs", "mean"),
-            baserunning_sprint_speed=("baserunning_sprint_speed", "mean"),
-            sprint_obs=("sprint_obs", "max"),
-            is_nationals=("is_nationals", "max"),
+        nationals_text = all_baserunning_raw[all_nationals_col].astype(str).str.strip().str.lower()
+        all_baserunning_defense = pd.DataFrame({
+            "player_id": pd.to_numeric(all_baserunning_raw[all_player_id_col], errors="coerce").astype("Int64"),
+            "athlete": all_baserunning_raw[all_name_col].astype(str).str.strip(),
+            "nbsr": pd.to_numeric(all_baserunning_raw[all_nbsr_col], errors="coerce"),
+            "adv_runs": pd.to_numeric(all_baserunning_raw[all_adv_runs_col], errors="coerce"),
+            "baserunning_sprint_speed": pd.to_numeric(all_baserunning_raw[all_sprint_col], errors="coerce"),
+            "sprint_obs": pd.to_numeric(all_baserunning_raw[all_sprint_obs_col], errors="coerce"),
+            "is_nationals": nationals_text.isin({"yes", "y", "true", "1", "nationals", "washington nationals"}),
+        })
+        all_baserunning_defense = (
+            all_baserunning_defense[
+                (all_baserunning_defense["athlete"] != "")
+                & all_baserunning_defense["player_id"].notna()
+                & all_baserunning_defense["sprint_obs"].gt(100)
+            ]
+            .dropna(subset=["baserunning_sprint_speed"])
+            .groupby("player_id", as_index=False)
+            .agg(
+                athlete=("athlete", "first"),
+                nbsr=("nbsr", "mean"),
+                adv_runs=("adv_runs", "mean"),
+                baserunning_sprint_speed=("baserunning_sprint_speed", "mean"),
+                sprint_obs=("sprint_obs", "max"),
+                is_nationals=("is_nationals", "max"),
+            )
         )
-    )
 
     status = (
         f"Loaded {len(jump):,} CI rows, {len(jump_power):,} relative-power rows, "
@@ -8695,6 +8702,14 @@ except Exception as exc:
     st.error(f"Could not load data. {exc}")
     st.stop()
 
+if all_baserunning_defense.empty:
+    st.warning(
+        f"The '{DEFAULT_ALL_BASERUNNING_TAB}' worksheet has not been populated yet. "
+        "The rest of the dashboard will still work, but Sprint Speed × nBSR and "
+        "Sprint Speed × Adv Runs need the all-baseball sync. Run: "
+        "python3 ~/Downloads/sync_all_baseball_baserunning_metrics.py --write"
+    )
+
 all_dates = pd.concat([
     jump["date"], jump_power["date"], velo["date"], bat["month"],
     pinch["date"], sprint["date"],
@@ -8854,6 +8869,15 @@ if_reaction_power_summary = build_peak_power_rel_outcome_summary(
     team_filter=team_filter,
     min_power_jumps=int(min_power_jumps),
 )
+rel_power_nbsr_summary = build_peak_power_rel_outcome_summary(
+    jump_power=jump_power,
+    outcome_df=baserunning_defense,
+    outcome_col="nbsr",
+    start_date=start_date,
+    end_date=end_date,
+    team_filter=team_filter,
+    min_power_jumps=int(min_power_jumps),
+)
 sprint_nbsr_summary = build_sprint_nbsr_summary(
     outcome_df=all_baserunning_defense,
 )
@@ -8889,6 +8913,7 @@ bat_projection_model = fit_simple_projection_model(
     bat_overview_tab,
     exit_velo_overview_tab,
     if_reaction_power_tab,
+    rel_power_nbsr_tab,
     sprint_nbsr_tab,
     sprint_adv_runs_tab,
     sc_opportunity_tab,
@@ -8904,6 +8929,7 @@ bat_projection_model = fit_simple_projection_model(
     "Bat Speed Overview",
     "P90 Exit Velo Overview",
     "Rel PP × IF Reaction 3ft",
+    "Rel PP × nBSR",
     "Sprint Speed × nBSR",
     "Sprint Speed × Adv Runs",
     "S&C Opportunity",
@@ -11797,6 +11823,21 @@ with if_reaction_power_tab:
         tab_key="if_reaction_3ft_peak_power_rel",
         default_lookup=60.0,
         default_bucket_width=0.05,
+    )
+
+with rel_power_nbsr_tab:
+    st.caption(
+        "Nationals players only. nBSR is the current season-to-date baserunning snapshot; "
+        "Relative Peak Power is each player's mean Peak Power / BM inside the selected date window."
+    )
+    render_selected_peak_power_rel_tab(
+        rel_power_nbsr_summary,
+        outcome_col="nbsr",
+        outcome_label="nBSR",
+        outcome_unit="runs",
+        tab_key="nbsr_peak_power_rel",
+        default_lookup=60.0,
+        default_bucket_width=1.0,
     )
 
 with sprint_nbsr_tab:
