@@ -8069,54 +8069,67 @@ def render_sprint_outcome_tab(
             )
 
 
-def build_sprint_power_nbsr_model_summary(
+def build_sprint_adjusted_rel_power_summary(
     jump_power: pd.DataFrame,
     outcome_df: pd.DataFrame,
+    sprint_df: pd.DataFrame,
+    outcome_col: str,
     start_date,
     end_date,
     team_filter: str,
     min_power_jumps: int,
 ) -> pd.DataFrame:
-    """Build one row/player for nBSR ~ Sprint Speed + mean in-window Relative Peak Power."""
+    """Build Nationals player rows for outcome ~ Sprint Speed + Relative Peak Power."""
     base = build_peak_power_rel_outcome_summary(
         jump_power=jump_power,
         outcome_df=outcome_df,
-        outcome_col="nbsr",
+        outcome_col=outcome_col,
         start_date=start_date,
         end_date=end_date,
         team_filter=team_filter,
         min_power_jumps=min_power_jumps,
     )
     columns = [
-        "athlete", "team", "baserunning_sprint_speed", "avg_peak_power_rel",
-        "nbsr", "power_jumps", "power_test_dates", "first_power_date", "last_power_date",
+        "athlete", "team", "name_key", "baserunning_sprint_speed",
+        "avg_peak_power_rel", outcome_col, "power_jumps", "power_test_dates",
+        "first_power_date", "last_power_date",
     ]
-    if base.empty or "baserunning_sprint_speed" not in outcome_df.columns:
+    if base.empty or sprint_df.empty or "baserunning_sprint_speed" not in sprint_df.columns:
         return pd.DataFrame(columns=columns)
+
     sprint_lookup = (
-        outcome_df[["name_key", "baserunning_sprint_speed"]]
+        sprint_df[["name_key", "baserunning_sprint_speed"]]
         .dropna(subset=["baserunning_sprint_speed"])
-        .drop_duplicates("name_key")
+        .groupby("name_key", as_index=False)
+        .agg(baserunning_sprint_speed=("baserunning_sprint_speed", "mean"))
     )
     summary = base.merge(sprint_lookup, on="name_key", how="inner")
-    summary = summary.dropna(subset=["baserunning_sprint_speed", "avg_peak_power_rel", "nbsr"])
-    return summary[columns].sort_values("nbsr", ascending=False).reset_index(drop=True)
+    summary = summary.dropna(
+        subset=["baserunning_sprint_speed", "avg_peak_power_rel", outcome_col]
+    ).copy()
+    keep = [col for col in columns if col in summary.columns]
+    return summary[keep].sort_values(outcome_col, ascending=False).reset_index(drop=True)
 
 
-def fit_sprint_power_nbsr_model(summary: pd.DataFrame):
-    """Fit nBSR ~ Sprint Speed + Relative Peak Power with NumPy OLS."""
-    required = {"baserunning_sprint_speed", "avg_peak_power_rel", "nbsr"}
+def fit_sprint_adjusted_rel_power_model(summary: pd.DataFrame, outcome_col: str):
+    """Quantify the Rel PP association with an outcome after adjusting for Sprint Speed."""
+    required = {"baserunning_sprint_speed", "avg_peak_power_rel", outcome_col}
     if len(summary) < 4 or not required.issubset(summary.columns):
         return None
-    data = summary[list(required)].apply(pd.to_numeric, errors="coerce").dropna()
+
+    data = summary[["baserunning_sprint_speed", "avg_peak_power_rel", outcome_col]].apply(
+        pd.to_numeric, errors="coerce"
+    ).dropna()
     if len(data) < 4:
         return None
+
     sprint = data["baserunning_sprint_speed"].to_numpy(dtype=float)
     power = data["avg_peak_power_rel"].to_numpy(dtype=float)
-    y = data["nbsr"].to_numpy(dtype=float)
-    if np.isclose(np.std(sprint), 0) or np.isclose(np.std(power), 0) or np.isclose(np.std(y), 0):
+    y = data[outcome_col].to_numpy(dtype=float)
+    if any(np.isclose(np.std(v), 0) for v in (sprint, power, y)):
         return None
 
+    # Full model: outcome ~ sprint + relative peak power.
     X = np.column_stack([np.ones(len(data)), sprint, power])
     beta, *_ = np.linalg.lstsq(X, y, rcond=None)
     pred = X @ beta
@@ -8124,39 +8137,81 @@ def fit_sprint_power_nbsr_model(summary: pd.DataFrame):
     ss_res = float(np.sum((y - pred) ** 2))
     if np.isclose(ss_tot, 0):
         return None
-    r2 = 1.0 - ss_res / ss_tot
+    full_r2 = float(1.0 - ss_res / ss_tot)
     n = len(y)
     p = 2
-    adj_r2 = 1.0 - (1.0 - r2) * (n - 1) / (n - p - 1) if n > p + 1 else np.nan
+    adj_r2 = (
+        float(1.0 - (1.0 - full_r2) * (n - 1) / (n - p - 1))
+        if n > p + 1 else np.nan
+    )
+
+    r_power_outcome = float(np.corrcoef(power, y)[0, 1])
+    r_sprint_outcome = float(np.corrcoef(sprint, y)[0, 1])
+    r_power_sprint = float(np.corrcoef(power, sprint)[0, 1])
+    power_only_r2 = r_power_outcome ** 2
+    sprint_only_r2 = r_sprint_outcome ** 2
+    power_sprint_r2 = r_power_sprint ** 2
+
+    # Frisch-Waugh-Lovell residualization: remove Sprint Speed from both Rel PP
+    # and the outcome, then correlate the residuals. This is the visual/analytic
+    # answer to whether Rel PP retains an association beyond Sprint Speed.
+    Z = np.column_stack([np.ones(n), sprint])
+    beta_power_on_sprint, *_ = np.linalg.lstsq(Z, power, rcond=None)
+    beta_y_on_sprint, *_ = np.linalg.lstsq(Z, y, rcond=None)
+    power_resid = power - Z @ beta_power_on_sprint
+    outcome_resid = y - Z @ beta_y_on_sprint
+    if np.isclose(np.std(power_resid), 0) or np.isclose(np.std(outcome_resid), 0):
+        partial_r = np.nan
+        partial_r2 = np.nan
+    else:
+        partial_r = float(np.corrcoef(power_resid, outcome_resid)[0, 1])
+        partial_r2 = float(partial_r ** 2)
 
     std_y = float(np.std(y, ddof=0))
-    std_beta_sprint = float(beta[1] * np.std(sprint, ddof=0) / std_y)
     std_beta_power = float(beta[2] * np.std(power, ddof=0) / std_y)
-
-    r2_sprint_only = float(np.corrcoef(sprint, y)[0, 1] ** 2)
-    r2_power_only = float(np.corrcoef(power, y)[0, 1] ** 2)
-    inc_r2_sprint = max(0.0, float(r2 - r2_power_only))
-    inc_r2_power = max(0.0, float(r2 - r2_sprint_only))
+    std_beta_sprint = float(beta[1] * np.std(sprint, ddof=0) / std_y)
+    incremental_power_r2 = max(0.0, float(full_r2 - sprint_only_r2))
+    incremental_sprint_r2 = max(0.0, float(full_r2 - power_only_r2))
+    vif_power = float(1.0 / max(1e-12, 1.0 - power_sprint_r2))
 
     return {
         "n": n,
         "intercept": float(beta[0]),
         "sprint_coef": float(beta[1]),
         "power_coef": float(beta[2]),
-        "r2": float(r2),
-        "adj_r2": float(adj_r2),
-        "std_beta_sprint": std_beta_sprint,
+        "full_r2": full_r2,
+        "adj_r2": adj_r2,
+        "raw_power_r": r_power_outcome,
+        "raw_power_r2": power_only_r2,
+        "sprint_outcome_r": r_sprint_outcome,
+        "sprint_only_r2": sprint_only_r2,
+        "power_sprint_r": r_power_sprint,
+        "power_sprint_r2": power_sprint_r2,
+        "incremental_power_r2": incremental_power_r2,
+        "incremental_sprint_r2": incremental_sprint_r2,
+        "partial_r_power": partial_r,
+        "partial_r2_power": partial_r2,
         "std_beta_power": std_beta_power,
-        "incremental_r2_sprint": inc_r2_sprint,
-        "incremental_r2_power": inc_r2_power,
+        "std_beta_sprint": std_beta_sprint,
+        "vif_power": vif_power,
+        "power_resid": power_resid,
+        "outcome_resid": outcome_resid,
+        "row_index": data.index.to_numpy(),
     }
 
 
-def build_sprint_power_nbsr_model_scatter(summary: pd.DataFrame) -> go.Figure:
+def build_sprint_adjusted_residual_scatter(
+    summary: pd.DataFrame,
+    outcome_col: str,
+    outcome_label: str,
+    outcome_unit: str,
+) -> go.Figure:
+    """Plot outcome residual vs Rel PP residual after removing Sprint Speed from both."""
     fig = go.Figure()
-    if summary.empty:
+    model = fit_sprint_adjusted_rel_power_model(summary, outcome_col)
+    if model is None:
         fig.add_annotation(
-            text="No players have nBSR, Sprint Speed, and qualifying Relative Peak Power data.",
+            text="Not enough matched players to fit the sprint-adjusted relationship.",
             showarrow=False, font={"size": 15, "color": SUBTEXT},
             x=0.5, y=0.5, xref="paper", yref="paper",
         )
@@ -8164,101 +8219,203 @@ def build_sprint_power_nbsr_model_scatter(summary: pd.DataFrame) -> go.Figure:
         fig.update_yaxes(visible=False)
         return base_figure_layout(fig, 560)
 
+    plotted = summary.loc[model["row_index"]].copy()
+    plotted["power_resid"] = model["power_resid"]
+    plotted["outcome_resid"] = model["outcome_resid"]
     customdata = np.column_stack([
-        summary["athlete"], summary["team"], summary["avg_peak_power_rel"],
+        plotted["athlete"], plotted["team"], plotted["avg_peak_power_rel"],
+        plotted["baserunning_sprint_speed"], plotted[outcome_col],
     ])
     fig.add_trace(go.Scatter(
-        x=summary["baserunning_sprint_speed"],
-        y=summary["nbsr"],
+        x=plotted["power_resid"],
+        y=plotted["outcome_resid"],
         mode="markers",
-        marker={
-            "size": 14,
-            "color": summary["avg_peak_power_rel"],
-            "colorscale": "Viridis",
-            "showscale": True,
-            "colorbar": {"title": "Rel PP<br>W/kg"},
-            "opacity": 0.88,
-            "line": {"color": "#FFFFFF", "width": 1.5},
-        },
+        marker={"size": 14, "color": BLUE, "opacity": 0.88,
+                "line": {"color": "#FFFFFF", "width": 1.5}},
         customdata=customdata,
         hovertemplate=(
             "<b>%{customdata[0]}</b><br>Team: %{customdata[1]}<br>"
-            "Sprint Speed: %{x:.2f} ft/s<br>Relative Peak Power: %{customdata[2]:.2f} W/kg<br>"
-            "nBSR: %{y:.2f} runs<extra></extra>"
+            "Raw Rel PP: %{customdata[2]:.2f} W/kg<br>"
+            "Raw Sprint Speed: %{customdata[3]:.2f} ft/s<br>"
+            f"Raw {outcome_label}: %{{customdata[4]:.2f}}{(' ' + outcome_unit) if outcome_unit else ''}<br><br>"
+            "Rel PP residual: %{x:+.2f}<br>"
+            f"{outcome_label} residual: %{{y:+.2f}}<extra></extra>"
         ),
     ))
+
+    x = plotted["power_resid"].to_numpy(dtype=float)
+    y = plotted["outcome_resid"].to_numpy(dtype=float)
+    if len(x) >= 2 and not np.isclose(np.std(x), 0):
+        slope, intercept = np.polyfit(x, y, 1)
+        x_line = np.linspace(float(np.min(x)), float(np.max(x)), 100)
+        fig.add_trace(go.Scatter(
+            x=x_line, y=slope * x_line + intercept, mode="lines",
+            line={"color": NAVY_MID, "width": 2.5, "dash": "dash"},
+            hoverinfo="skip",
+        ))
+    fig.add_hline(y=0, line_color=BORDER, line_width=1)
+    fig.add_vline(x=0, line_color=BORDER, line_width=1)
+    fig.add_annotation(
+        text=(
+            f"Partial r = {model['partial_r_power']:+.2f} · "
+            f"Incremental R² = {model['incremental_power_r2']:.3f}"
+        ),
+        x=0.02, y=0.98, xref="paper", yref="paper",
+        xanchor="left", yanchor="top", showarrow=False,
+        font={"color": NAVY, "size": 13}, bgcolor="#FFFFFF",
+        bordercolor=BORDER, borderwidth=1, borderpad=7,
+    )
     fig.update_xaxes(
-        title="Sprint Speed from baserunning sheet (ft/s)", showgrid=True,
-        gridcolor=GRID, zeroline=False, linecolor=BORDER,
+        title="Relative Peak Power residual after Sprint Speed (W/kg)",
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
         tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
     )
     fig.update_yaxes(
-        title="nBSR (runs)", showgrid=True, gridcolor=GRID, zeroline=False,
-        linecolor=BORDER, tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+        title=f"{outcome_label} residual after Sprint Speed{f' ({outcome_unit})' if outcome_unit else ''}",
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
     )
     return base_figure_layout(fig, 560)
 
 
-def render_sprint_power_nbsr_model_tab(summary: pd.DataFrame) -> None:
-    model = fit_sprint_power_nbsr_model(summary)
-    n_players = len(summary)
-    r2_text = f"{model['r2']:.2f}" if model is not None else "—"
-    adj_r2_text = f"{model['adj_r2']:.2f}" if model is not None else "—"
-    mean_nbsr = summary["nbsr"].mean() if n_players else np.nan
-
-    top_cols = st.columns(4)
-    for column, values in zip(top_cols, [
-        ("Players", str(n_players), BLUE),
-        ("Model R²", r2_text, ACCENT_RED),
-        ("Adjusted R²", adj_r2_text, NAVY_MID),
-        ("Mean nBSR", f"{fmt(mean_nbsr)} runs", GREEN),
-    ]):
-        with column:
-            st.markdown(metric_card(*values), unsafe_allow_html=True)
-
-    st.caption(
-        "Multiple regression: nBSR ~ Sprint Speed + Relative Peak Power. Sprint Speed and nBSR "
-        "come from the current baserunning sheet; Relative Peak Power is the player's mean Peak "
-        "Power / BM inside the selected Velo Trends date window."
-    )
-
+def render_one_sprint_adjusted_rel_power_relationship(
+    summary: pd.DataFrame,
+    outcome_col: str,
+    outcome_label: str,
+    outcome_unit: str,
+    tab_key: str,
+) -> None:
+    model = fit_sprint_adjusted_rel_power_model(summary, outcome_col)
     if model is None:
-        st.info("The combined model could not be fit for the current filters and minimum-data rules.")
+        st.info("The adjusted model could not be fit for the current filters and minimum-data rules.")
         return
 
-    with st.container(border=True):
-        st.subheader("Combined Model", anchor=False)
-        st.plotly_chart(
-            build_sprint_power_nbsr_model_scatter(summary),
-            use_container_width=True, config={"displayModeBar": False},
-            key=f"sprint_power_nbsr_model_scatter_{team_filter}_{start_date}_{end_date}",
-        )
-        st.caption("Point color represents Relative Peak Power (W/kg).")
+    cards = st.columns(5)
+    values = [
+        ("Players", str(model["n"]), BLUE),
+        ("Raw Rel PP R²", f"{model['raw_power_r2']:.3f}", TEAL),
+        ("Rel PP + Sprint R²", f"{model['full_r2']:.3f}", NAVY_MID),
+        ("Rel PP Incremental R²", f"{model['incremental_power_r2']:.3f}", ACCENT_RED),
+        ("Partial r", f"{model['partial_r_power']:+.2f}", GREEN),
+    ]
+    for col, vals in zip(cards, values):
+        with col:
+            st.markdown(metric_card(*vals), unsafe_allow_html=True)
 
     with st.container(border=True):
-        st.subheader("Model Contributions", anchor=False)
-        contribution = pd.DataFrame({
-            "Predictor": ["Sprint Speed", "Relative Peak Power"],
-            "Coefficient": [model["sprint_coef"], model["power_coef"]],
-            "Standardized Beta": [model["std_beta_sprint"], model["std_beta_power"]],
-            "Incremental R²": [model["incremental_r2_sprint"], model["incremental_r2_power"]],
-        })
-        st.dataframe(
-            contribution, hide_index=True, use_container_width=True,
-            column_config={
-                "Coefficient": st.column_config.NumberColumn(format="%+.3f"),
-                "Standardized Beta": st.column_config.NumberColumn(format="%+.3f"),
-                "Incremental R²": st.column_config.NumberColumn(format="%.3f"),
-            },
+        st.subheader(f"Sprint-adjusted Rel PP × {outcome_label}", anchor=False)
+        st.plotly_chart(
+            build_sprint_adjusted_residual_scatter(
+                summary, outcome_col, outcome_label, outcome_unit,
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"{tab_key}_residual_scatter_{team_filter}_{start_date}_{end_date}",
         )
         st.caption(
-            "Incremental R² is the additional variance explained by that predictor after the other predictor is already in the model."
+            "Both axes are residuals after removing their linear relationship with Sprint Speed. "
+            "A remaining slope means Relative Peak Power still has a sprint-adjusted association with the outcome."
+        )
+
+    with st.container(border=True):
+        st.subheader("Adjusted Model Details", anchor=False)
+        details = pd.DataFrame({
+            "Metric": [
+                "Rel PP ↔ Sprint Speed R²",
+                f"Sprint Speed → {outcome_label} R²",
+                f"Rel PP → {outcome_label} raw R²",
+                "Full model R²",
+                "Adjusted R²",
+                "Rel PP incremental R² after Sprint Speed",
+                "Rel PP partial r after Sprint Speed",
+                "Rel PP standardized beta",
+                "Sprint Speed standardized beta",
+                "Rel PP VIF from Sprint Speed",
+            ],
+            "Value": [
+                model["power_sprint_r2"], model["sprint_only_r2"], model["raw_power_r2"],
+                model["full_r2"], model["adj_r2"], model["incremental_power_r2"],
+                model["partial_r_power"], model["std_beta_power"],
+                model["std_beta_sprint"], model["vif_power"],
+            ],
+        })
+        st.dataframe(
+            details, hide_index=True, use_container_width=True,
+            column_config={"Value": st.column_config.NumberColumn(format="%.3f")},
         )
         st.code(
-            f"nBSR = {model['intercept']:+.3f} "
+            f"{outcome_label} = {model['intercept']:+.3f} "
             f"{model['sprint_coef']:+.3f} × Sprint Speed "
             f"{model['power_coef']:+.3f} × Relative Peak Power"
         )
+
+
+def render_sprint_adjusted_rel_power_tab(
+    nbsr_summary: pd.DataFrame,
+    adv_runs_summary: pd.DataFrame,
+    if_reaction_summary: pd.DataFrame,
+) -> None:
+    """Nationals-only sensitivity analysis for Rel PP relationships after Sprint Speed."""
+    specs = [
+        ("nBSR", nbsr_summary, "nbsr", "nBSR", "runs", "adjusted_nbsr"),
+        ("Adv Runs", adv_runs_summary, "adv_runs", "Adv Runs", "runs", "adjusted_adv_runs"),
+        ("IF Reaction 3ft", if_reaction_summary, "if_reaction_3ft", "IF Reaction 3ft", "s", "adjusted_if_reaction"),
+    ]
+
+    st.caption(
+        "Nationals only. This asks whether Relative Peak Power has an association with each outcome "
+        "that remains after accounting for the linear relationship between Relative Peak Power and Sprint Speed. "
+        "It is a partial-association/sensitivity analysis, not evidence of causal independence."
+    )
+
+    rows = []
+    for label, summary, outcome_col, _, _, _ in specs:
+        model = fit_sprint_adjusted_rel_power_model(summary, outcome_col)
+        if model is None:
+            rows.append({
+                "Outcome": label, "Players": len(summary), "Rel PP–Sprint R²": np.nan,
+                "Raw Rel PP R²": np.nan, "Sprint-only R²": np.nan, "Full model R²": np.nan,
+                "Incremental Rel PP R²": np.nan, "Partial r": np.nan,
+                "Rel PP Std Beta": np.nan,
+            })
+        else:
+            rows.append({
+                "Outcome": label, "Players": model["n"],
+                "Rel PP–Sprint R²": model["power_sprint_r2"],
+                "Raw Rel PP R²": model["raw_power_r2"],
+                "Sprint-only R²": model["sprint_only_r2"],
+                "Full model R²": model["full_r2"],
+                "Incremental Rel PP R²": model["incremental_power_r2"],
+                "Partial r": model["partial_r_power"],
+                "Rel PP Std Beta": model["std_beta_power"],
+            })
+
+    with st.container(border=True):
+        st.subheader("Independent Signal Summary", anchor=False)
+        st.dataframe(
+            pd.DataFrame(rows), hide_index=True, use_container_width=True,
+            column_config={
+                "Players": st.column_config.NumberColumn(format="%d"),
+                "Rel PP–Sprint R²": st.column_config.NumberColumn(format="%.3f"),
+                "Raw Rel PP R²": st.column_config.NumberColumn(format="%.3f"),
+                "Sprint-only R²": st.column_config.NumberColumn(format="%.3f"),
+                "Full model R²": st.column_config.NumberColumn(format="%.3f"),
+                "Incremental Rel PP R²": st.column_config.NumberColumn(format="%.3f"),
+                "Partial r": st.column_config.NumberColumn(format="%+.3f"),
+                "Rel PP Std Beta": st.column_config.NumberColumn(format="%+.3f"),
+            },
+        )
+        st.caption(
+            "The key columns are Incremental Rel PP R² and Partial r. Incremental R² is how much "
+            "additional outcome variance Rel PP explains after Sprint Speed is already included."
+        )
+
+    sub_tabs = st.tabs([spec[0] for spec in specs])
+    for sub_tab, (_, summary, outcome_col, outcome_label, outcome_unit, tab_key) in zip(sub_tabs, specs):
+        with sub_tab:
+            render_one_sprint_adjusted_rel_power_relationship(
+                summary, outcome_col, outcome_label, outcome_unit, tab_key,
+            )
 
 
 # -----------------------------------------------------------------------------
@@ -8885,6 +9042,36 @@ sprint_adv_runs_summary = build_baserunning_sprint_outcome_summary(
     outcome_df=all_baserunning_defense,
     outcome_col="adv_runs",
 )
+adjusted_rel_power_nbsr_summary = build_sprint_adjusted_rel_power_summary(
+    jump_power=jump_power,
+    outcome_df=baserunning_defense,
+    sprint_df=baserunning_defense,
+    outcome_col="nbsr",
+    start_date=start_date,
+    end_date=end_date,
+    team_filter=team_filter,
+    min_power_jumps=int(min_power_jumps),
+)
+adjusted_rel_power_adv_runs_summary = build_sprint_adjusted_rel_power_summary(
+    jump_power=jump_power,
+    outcome_df=baserunning_defense,
+    sprint_df=baserunning_defense,
+    outcome_col="adv_runs",
+    start_date=start_date,
+    end_date=end_date,
+    team_filter=team_filter,
+    min_power_jumps=int(min_power_jumps),
+)
+adjusted_rel_power_if_reaction_summary = build_sprint_adjusted_rel_power_summary(
+    jump_power=jump_power,
+    outcome_df=infield_defense,
+    sprint_df=baserunning_defense,
+    outcome_col="if_reaction_3ft",
+    start_date=start_date,
+    end_date=end_date,
+    team_filter=team_filter,
+    min_power_jumps=int(min_power_jumps),
+)
 current_ci_bw_summary = build_current_ci_bw_summary(
     jump=jump,
     start_date=start_date,
@@ -8916,6 +9103,7 @@ bat_projection_model = fit_simple_projection_model(
     rel_power_nbsr_tab,
     sprint_nbsr_tab,
     sprint_adv_runs_tab,
+    sprint_adjusted_rel_power_tab,
     sc_opportunity_tab,
 ) = st.tabs([
     "S&C Influenced Performance Rankings",
@@ -8932,6 +9120,7 @@ bat_projection_model = fit_simple_projection_model(
     "Rel PP × nBSR",
     "Sprint Speed × nBSR",
     "Sprint Speed × Adv Runs",
+    "Sprint-Adjusted Rel PP",
     "S&C Opportunity",
 ])
 
@@ -11850,6 +12039,13 @@ with sprint_adv_runs_tab:
         outcome_label="Adv Runs",
         tab_key="sprint_adv_runs",
         default_bucket_width=0.5,
+    )
+
+with sprint_adjusted_rel_power_tab:
+    render_sprint_adjusted_rel_power_tab(
+        adjusted_rel_power_nbsr_summary,
+        adjusted_rel_power_adv_runs_summary,
+        adjusted_rel_power_if_reaction_summary,
     )
 
 
