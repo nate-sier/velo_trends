@@ -38,7 +38,8 @@ DEFAULT_EXIT_TAB = "Nats Hitting"
 DEFAULT_PINCH_TAB = "Pinch Grip"
 DEFAULT_INFIELD_SHEET_NAME = "nats_players_infield_2026"
 DEFAULT_BASERUNNING_SHEET_NAME = "nats_players_baserunning_2026"
-DEFAULT_ALL_BASERUNNING_TAB = "All Baseball >100 Sprint Obs"
+DEFAULT_ALL_BASERUNNING_TAB = "All Baseball Baserunning"
+LEGACY_ALL_BASERUNNING_TAB = "All Baseball >100 Sprint Obs"
 LOCAL_SERVICE_ACCOUNT_FILE = Path.home() / "Desktop" / "service_account.json"
 MIN_LAST_YTD_FB_VELO = 85.0
 POTENTIAL_CI_INCREASE = 10.0
@@ -1125,9 +1126,21 @@ def load_source_data() -> tuple:
             default_tab_name=DEFAULT_ALL_BASERUNNING_TAB,
         )
     except gspread.exceptions.WorksheetNotFound:
-        # The all-baseball relationship tab is optional during setup. Keep the
-        # rest of the dashboard usable until the SQL sync creates it with --write.
-        all_baserunning_raw = pd.DataFrame()
+        # Backward-compatible fallback for the original >100-only worksheet.
+        # The dynamic slider can use thresholds below 100 only after the updated
+        # sync creates the new unfiltered All Baseball Baserunning worksheet.
+        try:
+            all_baserunning_raw = read_external_sheet(
+                client,
+                id_secret="BASERUNNING_SHEET_ID",
+                name_secret="BASERUNNING_SHEET_NAME",
+                default_name=DEFAULT_BASERUNNING_SHEET_NAME,
+                tab_secret="ALL_BASERUNNING_LEGACY_TAB",
+                default_tab_name=LEGACY_ALL_BASERUNNING_TAB,
+            )
+        except gspread.exceptions.WorksheetNotFound:
+            # Keep the rest of the dashboard usable until the SQL sync creates it.
+            all_baserunning_raw = pd.DataFrame()
 
     if jump_raw.empty:
         raise ValueError(f"The '{jump_tab}' tab did not return any rows.")
@@ -1633,10 +1646,10 @@ def load_source_data() -> tuple:
         )
     )
 
-    # All-baseball baserunning snapshot used only by Sprint Speed × nBSR and
-    # Sprint Speed × Adv Runs. The sync already restricts this worksheet to
-    # players with >100 sprint observations; the app re-applies that rule as a
-    # safety check so stale/manual rows cannot leak into the relationships.
+    # All-baseball baserunning snapshot used by Sprint Speed × nBSR and
+    # Sprint Speed × Adv Runs. The updated sync stores all players with a valid
+    # Sprint Speed observation count; each relationship tab applies its own
+    # user-selected observation threshold dynamically.
     all_baserunning_columns = [
         "player_id", "athlete", "nbsr", "adv_runs",
         "baserunning_sprint_speed", "sprint_obs", "is_nationals",
@@ -1689,7 +1702,7 @@ def load_source_data() -> tuple:
             all_baserunning_defense[
                 (all_baserunning_defense["athlete"] != "")
                 & all_baserunning_defense["player_id"].notna()
-                & all_baserunning_defense["sprint_obs"].gt(100)
+                & all_baserunning_defense["sprint_obs"].gt(0)
             ]
             .dropna(subset=["baserunning_sprint_speed"])
             .groupby("player_id", as_index=False)
@@ -1713,7 +1726,7 @@ def load_source_data() -> tuple:
         f"{len(sprint):,} valid sprint-speed rows, {len(bat):,} hitter-month "
         f"bat-speed rows, {len(exit_velo):,} valid P90 exit-velocity rows, "
         f"{len(infield_defense):,} IF Reaction 3ft rows, {len(baserunning_defense):,} Nationals baserunning rows, "
-        f"and {len(all_baserunning_defense):,} all-baseball (>100 sprint obs) rows · "
+        f"and {len(all_baserunning_defense):,} all-baseball baserunning rows · "
         f"{datetime.now().strftime('%I:%M %p').lstrip('0')}"
     )
     return (
@@ -7652,7 +7665,7 @@ def build_sprint_nbsr_summary(outcome_df: pd.DataFrame) -> pd.DataFrame:
     summary = (
         outcome_df[columns]
         .dropna(subset=["baserunning_sprint_speed", "nbsr", "sprint_obs"])
-        .loc[lambda x: pd.to_numeric(x["sprint_obs"], errors="coerce").gt(100)]
+        .loc[lambda x: pd.to_numeric(x["sprint_obs"], errors="coerce").gt(0)]
         .drop_duplicates("player_id")
         .copy()
     )
@@ -7747,12 +7760,58 @@ def build_sprint_nbsr_scatter(summary: pd.DataFrame, show_labels: bool) -> go.Fi
     return base_figure_layout(fig, 560)
 
 
+def sprint_observation_slider(
+    summary: pd.DataFrame,
+    *,
+    key: str,
+    default_threshold: int = 100,
+) -> int:
+    """Render a dynamic strict minimum (> threshold) Sprint Speed observation slider."""
+    obs = pd.to_numeric(summary.get("sprint_obs", pd.Series(dtype=float)), errors="coerce")
+    obs = obs.replace([np.inf, -np.inf], np.nan).dropna()
+    observed_max = int(np.floor(obs.max())) if not obs.empty else default_threshold
+    slider_max = max(default_threshold, observed_max)
+
+    # Keep the control usable across very large observation ranges while still
+    # allowing precise 1-observation changes near any threshold.
+    return int(st.slider(
+        "Sprint Speed observation threshold",
+        min_value=0,
+        max_value=slider_max,
+        value=min(default_threshold, slider_max),
+        step=1,
+        help=(
+            "Players must have strictly more Sprint Speed observations than this value. "
+            "Moving the slider recalculates the player sample, correlation, R², regression, "
+            "bucket summaries, and matched-player table."
+        ),
+        key=key,
+    ))
+
+
+def apply_sprint_observation_threshold(
+    summary: pd.DataFrame, threshold: int
+) -> pd.DataFrame:
+    if summary.empty:
+        return summary.copy()
+    obs = pd.to_numeric(summary["sprint_obs"], errors="coerce")
+    return summary.loc[obs.gt(int(threshold))].copy()
+
+
 def render_sprint_nbsr_tab(summary: pd.DataFrame) -> None:
-    population_filter = st.radio(
-        "Population", ["All Baseball", "Nationals"], horizontal=True,
-        key="sprint_nbsr_population",
-    )
-    view = filter_sprint_relationship_population(summary, population_filter)
+    control_cols = st.columns([1, 2])
+    with control_cols[0]:
+        population_filter = st.radio(
+            "Population", ["All Baseball", "Nationals"], horizontal=True,
+            key="sprint_nbsr_population",
+        )
+    with control_cols[1]:
+        sprint_obs_threshold = sprint_observation_slider(
+            summary, key="sprint_nbsr_min_sprint_obs", default_threshold=100,
+        )
+
+    population_view = filter_sprint_relationship_population(summary, population_filter)
+    view = apply_sprint_observation_threshold(population_view, sprint_obs_threshold)
     stats = sprint_nbsr_stats(view)
     n_players = len(view)
     r_text = f"{stats[0]:+.2f}" if stats is not None else "—"
@@ -7770,8 +7829,8 @@ def render_sprint_nbsr_tab(summary: pd.DataFrame) -> None:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
     st.caption(
-        "All Baseball includes only players with >100 Sprint Speed observations. "
-        "Use the Population filter to restrict the same relationship to current Nationals players. "
+        f"Current eligibility: {population_filter} players with >{sprint_obs_threshold} Sprint Speed observations. "
+        "Move the observation slider to recalculate the relationship immediately. "
         "Sprint Speed and nBSR come from the same season-to-date baserunning snapshot."
     )
 
@@ -7787,7 +7846,7 @@ def render_sprint_nbsr_tab(summary: pd.DataFrame) -> None:
         st.plotly_chart(
             build_sprint_nbsr_scatter(view, show_labels),
             use_container_width=True, config={"displayModeBar": False},
-            key=f"sprint_nbsr_scatter_{population_filter}_{show_labels}",
+            key=f"sprint_nbsr_scatter_{population_filter}_{sprint_obs_threshold}_{show_labels}",
         )
         st.toggle("Show player labels", value=False, key=labels_key)
 
@@ -7809,7 +7868,7 @@ def render_sprint_nbsr_tab(summary: pd.DataFrame) -> None:
                 testing_stat=bucket_stat,
             ),
             use_container_width=True, config={"displayModeBar": False},
-            key=f"sprint_nbsr_bucket_{population_filter}_{bucket_stat}_{bucket_width}",
+            key=f"sprint_nbsr_bucket_{population_filter}_{sprint_obs_threshold}_{bucket_stat}_{bucket_width}",
         )
         c1, c2 = st.columns(2)
         with c1:
@@ -7872,7 +7931,7 @@ def build_baserunning_sprint_outcome_summary(
     summary = (
         outcome_df[columns]
         .dropna(subset=["baserunning_sprint_speed", outcome_col, "sprint_obs"])
-        .loc[lambda x: pd.to_numeric(x["sprint_obs"], errors="coerce").gt(100)]
+        .loc[lambda x: pd.to_numeric(x["sprint_obs"], errors="coerce").gt(0)]
         .drop_duplicates("player_id")
         .copy()
     )
@@ -7968,11 +8027,19 @@ def render_sprint_outcome_tab(
     tab_key: str,
     default_bucket_width: float = 1.0,
 ) -> None:
-    population_filter = st.radio(
-        "Population", ["All Baseball", "Nationals"], horizontal=True,
-        key=f"{tab_key}_population",
-    )
-    view = filter_sprint_relationship_population(summary, population_filter)
+    control_cols = st.columns([1, 2])
+    with control_cols[0]:
+        population_filter = st.radio(
+            "Population", ["All Baseball", "Nationals"], horizontal=True,
+            key=f"{tab_key}_population",
+        )
+    with control_cols[1]:
+        sprint_obs_threshold = sprint_observation_slider(
+            summary, key=f"{tab_key}_min_sprint_obs", default_threshold=100,
+        )
+
+    population_view = filter_sprint_relationship_population(summary, population_filter)
+    view = apply_sprint_observation_threshold(population_view, sprint_obs_threshold)
     stats = sprint_outcome_stats(view, outcome_col)
     n_players = len(view)
     r_text = f"{stats[0]:+.2f}" if stats is not None else "—"
@@ -7990,9 +8057,9 @@ def render_sprint_outcome_tab(
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
     st.caption(
-        f"All Baseball includes only players with >100 Sprint Speed observations. "
-        f"Use the Population filter to restrict Sprint Speed × {outcome_label} to current Nationals players. "
-        f"Both variables come from the same season-to-date baserunning snapshot."
+        f"Current eligibility: {population_filter} players with >{sprint_obs_threshold} Sprint Speed observations. "
+        f"Move the observation slider to recalculate Sprint Speed × {outcome_label} immediately. "
+        "Both variables come from the same season-to-date baserunning snapshot."
     )
 
     labels_key = f"{tab_key}_show_labels"
@@ -8007,7 +8074,7 @@ def render_sprint_outcome_tab(
         st.plotly_chart(
             build_sprint_outcome_scatter(view, outcome_col, outcome_label, show_labels),
             use_container_width=True, config={"displayModeBar": False},
-            key=f"{tab_key}_scatter_{population_filter}_{show_labels}",
+            key=f"{tab_key}_scatter_{population_filter}_{sprint_obs_threshold}_{show_labels}",
         )
         st.toggle("Show player labels", value=False, key=labels_key)
 
@@ -8029,7 +8096,7 @@ def render_sprint_outcome_tab(
                 testing_stat=bucket_stat,
             ),
             use_container_width=True, config={"displayModeBar": False},
-            key=f"{tab_key}_bucket_{population_filter}_{bucket_stat}_{bucket_width}",
+            key=f"{tab_key}_bucket_{population_filter}_{sprint_obs_threshold}_{bucket_stat}_{bucket_width}",
         )
         c1, c2 = st.columns(2)
         with c1:
@@ -8932,10 +8999,19 @@ except Exception as exc:
 if all_baserunning_defense.empty:
     st.warning(
         f"The '{DEFAULT_ALL_BASERUNNING_TAB}' worksheet has not been populated yet. "
-        "The rest of the dashboard will still work, but Sprint Speed × nBSR and "
-        "Sprint Speed × Adv Runs need the all-baseball sync. Run: "
-        "python3 ~/Downloads/sync_all_baseball_baserunning_metrics.py --write"
+        "The rest of the dashboard will still work, but the dynamic Sprint Speed relationship "
+        "tabs need the updated all-baseball sync. Run: "
+        "python3 ~/Downloads/sync_all_baseball_baserunning_dynamic.py --write"
     )
+
+elif not all_baserunning_defense.empty:
+    _source_obs = pd.to_numeric(all_baserunning_defense.get("sprint_obs"), errors="coerce").dropna()
+    if not _source_obs.empty and float(_source_obs.min()) > 100:
+        st.warning(
+            "The loaded all-baseball baserunning source still appears to be the legacy >100-only worksheet. "
+            "Thresholds below 100 cannot add players until you run the updated sync that creates "
+            f"'{DEFAULT_ALL_BASERUNNING_TAB}'."
+        )
 
 all_dates = pd.concat([
     jump["date"], jump_power["date"], velo["date"], bat["month"],
