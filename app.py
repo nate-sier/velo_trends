@@ -38,6 +38,7 @@ DEFAULT_EXIT_TAB = "Nats Hitting"
 DEFAULT_PINCH_TAB = "Pinch Grip"
 DEFAULT_INFIELD_SHEET_NAME = "nats_players_infield_2026"
 DEFAULT_BASERUNNING_SHEET_NAME = "nats_players_baserunning_2026"
+DEFAULT_ALL_BASERUNNING_TAB = "All Baseball >100 Sprint Obs"
 LOCAL_SERVICE_ACCOUNT_FILE = Path.home() / "Desktop" / "service_account.json"
 MIN_LAST_YTD_FB_VELO = 85.0
 POTENTIAL_CI_INCREASE = 10.0
@@ -1054,11 +1055,12 @@ def read_external_sheet(
     name_secret: str,
     default_name: str,
     tab_secret: str,
+    default_tab_name: str = "",
 ) -> pd.DataFrame:
     """Read an external Google spreadsheet by optional ID or, by default, title."""
     sheet_id = secret_or_default(id_secret, "").strip()
     sheet_name = secret_or_default(name_secret, default_name).strip()
-    tab_name = secret_or_default(tab_secret, "").strip()
+    tab_name = secret_or_default(tab_secret, default_tab_name).strip()
 
     if sheet_id:
         book = _open_sheet_by_key(client, sheet_id)
@@ -1079,7 +1081,7 @@ def read_external_sheet(
 
 
 @st.cache_data(ttl=300, show_spinner="Loading Google Sheet data…")
-def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+def load_source_data() -> tuple:
     """Load core performance data plus selected infield and baserunning outcomes."""
     sheet_id = secret_or_default("SHEET_ID", DEFAULT_SHEET_ID)
     jump_tab = secret_or_default("JUMP_TAB", DEFAULT_JUMP_TAB)
@@ -1113,6 +1115,14 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         default_name=DEFAULT_BASERUNNING_SHEET_NAME,
         tab_secret="BASERUNNING_TAB",
     )
+    all_baserunning_raw = read_external_sheet(
+        client,
+        id_secret="BASERUNNING_SHEET_ID",
+        name_secret="BASERUNNING_SHEET_NAME",
+        default_name=DEFAULT_BASERUNNING_SHEET_NAME,
+        tab_secret="ALL_BASERUNNING_TAB",
+        default_tab_name=DEFAULT_ALL_BASERUNNING_TAB,
+    )
 
     if jump_raw.empty:
         raise ValueError(f"The '{jump_tab}' tab did not return any rows.")
@@ -1128,6 +1138,11 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         raise ValueError("The infield defensive spreadsheet did not return any rows.")
     if baserunning_raw.empty:
         raise ValueError("The baserunning spreadsheet did not return any rows.")
+    if all_baserunning_raw.empty:
+        raise ValueError(
+            f"The '{DEFAULT_ALL_BASERUNNING_TAB}' baserunning worksheet did not return any rows. "
+            "Run the updated baserunning SQL sync with --write first."
+        )
 
     # Jump Data. CI and relative peak power are cleaned independently so
     # missing values in one metric do not remove valid observations for the other.
@@ -1618,17 +1633,81 @@ def load_source_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         )
     )
 
+    # All-baseball baserunning snapshot used only by Sprint Speed × nBSR and
+    # Sprint Speed × Adv Runs. The sync already restricts this worksheet to
+    # players with >100 sprint observations; the app re-applies that rule as a
+    # safety check so stale/manual rows cannot leak into the relationships.
+    all_baserunning_raw.columns = all_baserunning_raw.columns.astype(str).str.strip()
+    all_player_id_col = first_existing(
+        all_baserunning_raw.columns.tolist(), ["player_id", "PLAYER_ID", "mlbam_id", "MLBAM ID"]
+    )
+    all_name_col = first_existing(
+        all_baserunning_raw.columns.tolist(), ["name", "Name", "player", "Player", "Athlete", "athlete"]
+    )
+    all_nbsr_col = first_existing(all_baserunning_raw.columns.tolist(), ["nBSR", "NBSR", "nbsr"])
+    all_adv_runs_col = first_existing(
+        all_baserunning_raw.columns.tolist(), ["Adv Runs", "Adv runs", "adv runs", "Adv_Runs", "adv_runs"]
+    )
+    all_sprint_col = first_existing(
+        all_baserunning_raw.columns.tolist(),
+        ["Sprint Speed", "Sprint speed", "sprint speed", "Sprint_Speed", "sprint_speed"],
+    )
+    all_sprint_obs_col = first_existing(
+        all_baserunning_raw.columns.tolist(),
+        ["Sprint Observations", "Sprint Obs", "sprint_speed_n", "Sprint Speed N"],
+    )
+    all_nationals_col = first_existing(
+        all_baserunning_raw.columns.tolist(), ["Nationals", "Is Nationals", "is_nationals"]
+    )
+    if any(col is None for col in [
+        all_player_id_col, all_name_col, all_nbsr_col, all_adv_runs_col,
+        all_sprint_col, all_sprint_obs_col, all_nationals_col,
+    ]):
+        raise ValueError(
+            f"The '{DEFAULT_ALL_BASERUNNING_TAB}' worksheet must contain player_id, name, "
+            "Nationals, Sprint Speed, Sprint Observations, Adv Runs, and nBSR."
+        )
+
+    nationals_text = all_baserunning_raw[all_nationals_col].astype(str).str.strip().str.lower()
+    all_baserunning_defense = pd.DataFrame({
+        "player_id": pd.to_numeric(all_baserunning_raw[all_player_id_col], errors="coerce").astype("Int64"),
+        "athlete": all_baserunning_raw[all_name_col].astype(str).str.strip(),
+        "nbsr": pd.to_numeric(all_baserunning_raw[all_nbsr_col], errors="coerce"),
+        "adv_runs": pd.to_numeric(all_baserunning_raw[all_adv_runs_col], errors="coerce"),
+        "baserunning_sprint_speed": pd.to_numeric(all_baserunning_raw[all_sprint_col], errors="coerce"),
+        "sprint_obs": pd.to_numeric(all_baserunning_raw[all_sprint_obs_col], errors="coerce"),
+        "is_nationals": nationals_text.isin({"yes", "y", "true", "1", "nationals", "washington nationals"}),
+    })
+    all_baserunning_defense = (
+        all_baserunning_defense[
+            (all_baserunning_defense["athlete"] != "")
+            & all_baserunning_defense["player_id"].notna()
+            & all_baserunning_defense["sprint_obs"].gt(100)
+        ]
+        .dropna(subset=["baserunning_sprint_speed"])
+        .groupby("player_id", as_index=False)
+        .agg(
+            athlete=("athlete", "first"),
+            nbsr=("nbsr", "mean"),
+            adv_runs=("adv_runs", "mean"),
+            baserunning_sprint_speed=("baserunning_sprint_speed", "mean"),
+            sprint_obs=("sprint_obs", "max"),
+            is_nationals=("is_nationals", "max"),
+        )
+    )
+
     status = (
         f"Loaded {len(jump):,} CI rows, {len(jump_power):,} relative-power rows, "
         f"{len(velo):,} FB Velo rows, {len(pinch):,} Pinch Grip rows, "
         f"{len(sprint):,} valid sprint-speed rows, {len(bat):,} hitter-month "
         f"bat-speed rows, {len(exit_velo):,} valid P90 exit-velocity rows, "
-        f"{len(infield_defense):,} IF Reaction 3ft rows, and {len(baserunning_defense):,} baserunning rows · "
+        f"{len(infield_defense):,} IF Reaction 3ft rows, {len(baserunning_defense):,} Nationals baserunning rows, "
+        f"and {len(all_baserunning_defense):,} all-baseball (>100 sprint obs) rows · "
         f"{datetime.now().strftime('%I:%M %p').lstrip('0')}"
     )
     return (
         jump, jump_power, velo, bat, pinch, sprint, exit_velo,
-        infield_defense, baserunning_defense, status,
+        infield_defense, baserunning_defense, all_baserunning_defense, status,
     )
 
 
@@ -7549,42 +7628,32 @@ def render_selected_peak_power_rel_tab(
 # -----------------------------------------------------------------------------
 # SPRINT SPEED × nBSR — BOTH FROM BASERUNNING SOURCE
 # -----------------------------------------------------------------------------
-def build_sprint_nbsr_summary(
-    jump: pd.DataFrame,
-    outcome_df: pd.DataFrame,
-    team_filter: str,
-) -> pd.DataFrame:
-    """Match baserunning-sheet Sprint Speed directly to baserunning-sheet nBSR.
-
-    Both performance variables are current season-to-date snapshot values from
-    the same baserunning Google Sheet. Jump Data is used only to attach each
-    player's current team for the dashboard team filter; it is not used to
-    calculate sprint speed for this relationship.
-    """
-    columns = ["athlete", "team", "baserunning_sprint_speed", "nbsr"]
-    required = {"name_key", "athlete", "baserunning_sprint_speed", "nbsr"}
-    if jump.empty or outcome_df.empty or not required.issubset(outcome_df.columns):
+def build_sprint_nbsr_summary(outcome_df: pd.DataFrame) -> pd.DataFrame:
+    """Use the all-baseball baserunning snapshot for Sprint Speed × nBSR."""
+    columns = [
+        "player_id", "athlete", "is_nationals", "sprint_obs",
+        "baserunning_sprint_speed", "nbsr",
+    ]
+    required = set(columns)
+    if outcome_df.empty or not required.issubset(outcome_df.columns):
         return pd.DataFrame(columns=columns)
 
-    team_lookup = (
-        jump.sort_values("date")
-        .groupby("name_key", as_index=False)
-        .tail(1)[["name_key", "team"]]
-        .drop_duplicates("name_key")
-    )
-
     summary = (
-        outcome_df[["name_key", "athlete", "baserunning_sprint_speed", "nbsr"]]
-        .dropna(subset=["baserunning_sprint_speed", "nbsr"])
-        .drop_duplicates("name_key")
-        .merge(team_lookup, on="name_key", how="left")
+        outcome_df[columns]
+        .dropna(subset=["baserunning_sprint_speed", "nbsr", "sprint_obs"])
+        .loc[lambda x: pd.to_numeric(x["sprint_obs"], errors="coerce").gt(100)]
+        .drop_duplicates("player_id")
+        .copy()
     )
-    summary["team"] = summary["team"].fillna("Unassigned")
-    if team_filter != "All Teams":
-        summary = summary[summary["team"] == team_filter].copy()
+    return summary.sort_values("nbsr", ascending=False).reset_index(drop=True)
 
-    return summary[columns].sort_values("nbsr", ascending=False).reset_index(drop=True)
 
+def filter_sprint_relationship_population(
+    summary: pd.DataFrame, population_filter: str
+) -> pd.DataFrame:
+    if population_filter == "Nationals":
+        return summary[summary["is_nationals"].fillna(False)].copy()
+    return summary.copy()
 
 def sprint_nbsr_stats(summary: pd.DataFrame):
     if len(summary) < 2:
@@ -7614,7 +7683,11 @@ def build_sprint_nbsr_scatter(summary: pd.DataFrame, show_labels: bool) -> go.Fi
         fig.update_yaxes(visible=False)
         return base_figure_layout(fig, 560)
 
-    customdata = np.column_stack([summary["athlete"], summary["team"]])
+    customdata = np.column_stack([
+        summary["athlete"],
+        np.where(summary["is_nationals"], "Yes", "No"),
+        summary["sprint_obs"],
+    ])
     fig.add_trace(go.Scatter(
         x=summary["baserunning_sprint_speed"], y=summary["nbsr"],
         mode="markers+text" if show_labels else "markers",
@@ -7625,8 +7698,9 @@ def build_sprint_nbsr_scatter(summary: pd.DataFrame, show_labels: bool) -> go.Fi
         customdata=customdata,
         hovertemplate=(
             "<b>%{customdata[0]}</b><br>"
-            "Team: %{customdata[1]}<br>"
-            "Baserunning Sprint Speed: %{x:.2f} ft/s<br>"
+            "Nationals: %{customdata[1]}<br>"
+            "Sprint observations: %{customdata[2]:.0f}<br>"
+            "Sprint Speed: %{x:.2f} ft/s<br>"
             "nBSR: %{y:.2f}<extra></extra>"
         ),
     ))
@@ -7663,13 +7737,16 @@ def build_sprint_nbsr_scatter(summary: pd.DataFrame, show_labels: bool) -> go.Fi
 
 
 def render_sprint_nbsr_tab(summary: pd.DataFrame) -> None:
-    stats = sprint_nbsr_stats(summary)
-    n_players = len(summary)
+    population_filter = st.radio(
+        "Population", ["All Baseball", "Nationals"], horizontal=True,
+        key="sprint_nbsr_population",
+    )
+    view = filter_sprint_relationship_population(summary, population_filter)
+    stats = sprint_nbsr_stats(view)
+    n_players = len(view)
     r_text = f"{stats[0]:+.2f}" if stats is not None else "—"
     r2_text = f"{stats[1]:.2f}" if stats is not None else "—"
-    mean_sprint = (
-        summary["baserunning_sprint_speed"].mean() if n_players else np.nan
-    )
+    mean_sprint = view["baserunning_sprint_speed"].mean() if n_players else np.nan
 
     top_cols = st.columns(4)
     for column, values in zip(top_cols, [
@@ -7682,9 +7759,9 @@ def render_sprint_nbsr_tab(summary: pd.DataFrame) -> None:
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
     st.caption(
-        "Both Sprint Speed and nBSR come directly from the current baserunning "
-        "Google Sheet snapshot. The Velo Trends date window does not alter these "
-        "two values; Jump Data is used only for the current-team filter."
+        "All Baseball includes only players with >100 Sprint Speed observations. "
+        "Use the Population filter to restrict the same relationship to current Nationals players. "
+        "Sprint Speed and nBSR come from the same season-to-date baserunning snapshot."
     )
 
     labels_key = "sprint_nbsr_show_labels"
@@ -7697,9 +7774,9 @@ def render_sprint_nbsr_tab(summary: pd.DataFrame) -> None:
     with st.container(border=True):
         st.subheader("Sprint Speed × nBSR", anchor=False)
         st.plotly_chart(
-            build_sprint_nbsr_scatter(summary, show_labels),
+            build_sprint_nbsr_scatter(view, show_labels),
             use_container_width=True, config={"displayModeBar": False},
-            key=f"sprint_nbsr_scatter_{team_filter}_{show_labels}",
+            key=f"sprint_nbsr_scatter_{population_filter}_{show_labels}",
         )
         st.toggle("Show player labels", value=False, key=labels_key)
 
@@ -7707,7 +7784,7 @@ def render_sprint_nbsr_tab(summary: pd.DataFrame) -> None:
         st.subheader(f"{bucket_stat} Sprint Speed by nBSR Bucket", anchor=False)
         st.plotly_chart(
             build_output_bucket_chart(
-                df=summary,
+                df=view,
                 output_col="nbsr",
                 testing_col="baserunning_sprint_speed",
                 bucket_width=bucket_width,
@@ -7721,7 +7798,7 @@ def render_sprint_nbsr_tab(summary: pd.DataFrame) -> None:
                 testing_stat=bucket_stat,
             ),
             use_container_width=True, config={"displayModeBar": False},
-            key=f"sprint_nbsr_bucket_{team_filter}_{bucket_stat}_{bucket_width}",
+            key=f"sprint_nbsr_bucket_{population_filter}_{bucket_stat}_{bucket_width}",
         )
         c1, c2 = st.columns(2)
         with c1:
@@ -7737,18 +7814,21 @@ def render_sprint_nbsr_tab(summary: pd.DataFrame) -> None:
 
     with st.container(border=True):
         st.subheader("Matched Players", anchor=False)
-        if summary.empty:
-            st.info("No matched players are available for the selected team filter.")
+        if view.empty:
+            st.info("No players are available for the selected population.")
         else:
-            display = summary[[
-                "athlete", "team", "baserunning_sprint_speed", "nbsr",
+            display = view[[
+                "athlete", "is_nationals", "sprint_obs",
+                "baserunning_sprint_speed", "nbsr",
             ]].copy()
-            display.columns = ["Player", "Team", "Sprint Speed", "nBSR"]
+            display["is_nationals"] = np.where(display["is_nationals"], "Yes", "No")
+            display.columns = ["Player", "Nationals", "Sprint Obs", "Sprint Speed", "nBSR"]
             display = display.sort_values("nBSR", ascending=False)
             st.dataframe(
                 display, hide_index=True, use_container_width=True,
                 height=min(680, 44 + 36 * (len(display) + 1)),
                 column_config={
+                    "Sprint Obs": st.column_config.NumberColumn(format="%d"),
                     "Sprint Speed": st.column_config.NumberColumn(format="%.2f ft/s"),
                     "nBSR": st.column_config.NumberColumn(format="%.2f"),
                 },
@@ -7766,34 +7846,26 @@ def render_sprint_nbsr_tab(summary: pd.DataFrame) -> None:
 # ADDITIONAL BASERUNNING RELATIONSHIPS
 # -----------------------------------------------------------------------------
 def build_baserunning_sprint_outcome_summary(
-    jump: pd.DataFrame,
     outcome_df: pd.DataFrame,
     outcome_col: str,
-    team_filter: str,
 ) -> pd.DataFrame:
-    """Match baserunning-sheet Sprint Speed to another baserunning-sheet outcome."""
-    columns = ["athlete", "team", "baserunning_sprint_speed", outcome_col]
-    required = {"name_key", "athlete", "baserunning_sprint_speed", outcome_col}
-    if jump.empty or outcome_df.empty or not required.issubset(outcome_df.columns):
+    """Use the all-baseball baserunning snapshot for Sprint Speed × outcome."""
+    columns = [
+        "player_id", "athlete", "is_nationals", "sprint_obs",
+        "baserunning_sprint_speed", outcome_col,
+    ]
+    required = set(columns)
+    if outcome_df.empty or not required.issubset(outcome_df.columns):
         return pd.DataFrame(columns=columns)
 
-    team_lookup = (
-        jump.sort_values("date")
-        .groupby("name_key", as_index=False)
-        .tail(1)[["name_key", "team"]]
-        .drop_duplicates("name_key")
-    )
     summary = (
-        outcome_df[["name_key", "athlete", "baserunning_sprint_speed", outcome_col]]
-        .dropna(subset=["baserunning_sprint_speed", outcome_col])
-        .drop_duplicates("name_key")
-        .merge(team_lookup, on="name_key", how="left")
+        outcome_df[columns]
+        .dropna(subset=["baserunning_sprint_speed", outcome_col, "sprint_obs"])
+        .loc[lambda x: pd.to_numeric(x["sprint_obs"], errors="coerce").gt(100)]
+        .drop_duplicates("player_id")
+        .copy()
     )
-    summary["team"] = summary["team"].fillna("Unassigned")
-    if team_filter != "All Teams":
-        summary = summary[summary["team"] == team_filter].copy()
-    return summary[columns].sort_values(outcome_col, ascending=False).reset_index(drop=True)
-
+    return summary.sort_values(outcome_col, ascending=False).reset_index(drop=True)
 
 def sprint_outcome_stats(summary: pd.DataFrame, outcome_col: str):
     if len(summary) < 2:
@@ -7826,7 +7898,11 @@ def build_sprint_outcome_scatter(
         fig.update_yaxes(visible=False)
         return base_figure_layout(fig, 560)
 
-    customdata = np.column_stack([summary["athlete"], summary["team"]])
+    customdata = np.column_stack([
+        summary["athlete"],
+        np.where(summary["is_nationals"], "Yes", "No"),
+        summary["sprint_obs"],
+    ])
     fig.add_trace(go.Scatter(
         x=summary["baserunning_sprint_speed"], y=summary[outcome_col],
         mode="markers+text" if show_labels else "markers",
@@ -7836,7 +7912,8 @@ def build_sprint_outcome_scatter(
                 "line": {"color": "#FFFFFF", "width": 2}},
         customdata=customdata,
         hovertemplate=(
-            "<b>%{customdata[0]}</b><br>Team: %{customdata[1]}<br>"
+            "<b>%{customdata[0]}</b><br>Nationals: %{customdata[1]}<br>"
+            "Sprint observations: %{customdata[2]:.0f}<br>"
             "Sprint Speed: %{x:.2f} ft/s<br>"
             f"{outcome_label}: %{{y:.2f}} runs<extra></extra>"
         ),
@@ -7880,11 +7957,16 @@ def render_sprint_outcome_tab(
     tab_key: str,
     default_bucket_width: float = 1.0,
 ) -> None:
-    stats = sprint_outcome_stats(summary, outcome_col)
-    n_players = len(summary)
+    population_filter = st.radio(
+        "Population", ["All Baseball", "Nationals"], horizontal=True,
+        key=f"{tab_key}_population",
+    )
+    view = filter_sprint_relationship_population(summary, population_filter)
+    stats = sprint_outcome_stats(view, outcome_col)
+    n_players = len(view)
     r_text = f"{stats[0]:+.2f}" if stats is not None else "—"
     r2_text = f"{stats[1]:.2f}" if stats is not None else "—"
-    mean_sprint = summary["baserunning_sprint_speed"].mean() if n_players else np.nan
+    mean_sprint = view["baserunning_sprint_speed"].mean() if n_players else np.nan
 
     top_cols = st.columns(4)
     for column, values in zip(top_cols, [
@@ -7897,8 +7979,9 @@ def render_sprint_outcome_tab(
             st.markdown(metric_card(*values), unsafe_allow_html=True)
 
     st.caption(
-        f"Both Sprint Speed and {outcome_label} come directly from the current "
-        "baserunning Google Sheet snapshot. Jump Data is used only for the current-team filter."
+        f"All Baseball includes only players with >100 Sprint Speed observations. "
+        f"Use the Population filter to restrict Sprint Speed × {outcome_label} to current Nationals players. "
+        f"Both variables come from the same season-to-date baserunning snapshot."
     )
 
     labels_key = f"{tab_key}_show_labels"
@@ -7911,9 +7994,9 @@ def render_sprint_outcome_tab(
     with st.container(border=True):
         st.subheader(f"Sprint Speed × {outcome_label}", anchor=False)
         st.plotly_chart(
-            build_sprint_outcome_scatter(summary, outcome_col, outcome_label, show_labels),
+            build_sprint_outcome_scatter(view, outcome_col, outcome_label, show_labels),
             use_container_width=True, config={"displayModeBar": False},
-            key=f"{tab_key}_scatter_{team_filter}_{show_labels}",
+            key=f"{tab_key}_scatter_{population_filter}_{show_labels}",
         )
         st.toggle("Show player labels", value=False, key=labels_key)
 
@@ -7921,7 +8004,7 @@ def render_sprint_outcome_tab(
         st.subheader(f"{bucket_stat} Sprint Speed by {outcome_label} Bucket", anchor=False)
         st.plotly_chart(
             build_output_bucket_chart(
-                df=summary,
+                df=view,
                 output_col=outcome_col,
                 testing_col="baserunning_sprint_speed",
                 bucket_width=bucket_width,
@@ -7935,7 +8018,7 @@ def render_sprint_outcome_tab(
                 testing_stat=bucket_stat,
             ),
             use_container_width=True, config={"displayModeBar": False},
-            key=f"{tab_key}_bucket_{team_filter}_{bucket_stat}_{bucket_width}",
+            key=f"{tab_key}_bucket_{population_filter}_{bucket_stat}_{bucket_width}",
         )
         c1, c2 = st.columns(2)
         with c1:
@@ -7952,18 +8035,21 @@ def render_sprint_outcome_tab(
 
     with st.container(border=True):
         st.subheader("Matched Players", anchor=False)
-        if summary.empty:
-            st.info("No matched players are available for the selected team filter.")
+        if view.empty:
+            st.info("No players are available for the selected population.")
         else:
-            display = summary[[
-                "athlete", "team", "baserunning_sprint_speed", outcome_col,
+            display = view[[
+                "athlete", "is_nationals", "sprint_obs",
+                "baserunning_sprint_speed", outcome_col,
             ]].copy()
-            display.columns = ["Player", "Team", "Sprint Speed", outcome_label]
+            display["is_nationals"] = np.where(display["is_nationals"], "Yes", "No")
+            display.columns = ["Player", "Nationals", "Sprint Obs", "Sprint Speed", outcome_label]
             display = display.sort_values(outcome_label, ascending=False)
             st.dataframe(
                 display, hide_index=True, use_container_width=True,
                 height=min(680, 44 + 36 * (len(display) + 1)),
                 column_config={
+                    "Sprint Obs": st.column_config.NumberColumn(format="%d"),
                     "Sprint Speed": st.column_config.NumberColumn(format="%.2f ft/s"),
                     outcome_label: st.column_config.NumberColumn(format="%.2f runs"),
                 },
@@ -8603,7 +8689,7 @@ if app_view == "S&C Influenced Performance Rankings":
 try:
     (
         jump, jump_power, velo, bat, pinch, sprint, exit_velo,
-        infield_defense, baserunning_defense, status,
+        infield_defense, baserunning_defense, all_baserunning_defense, status,
     ) = load_source_data()
 except Exception as exc:
     st.error(f"Could not load data. {exc}")
@@ -8769,15 +8855,11 @@ if_reaction_power_summary = build_peak_power_rel_outcome_summary(
     min_power_jumps=int(min_power_jumps),
 )
 sprint_nbsr_summary = build_sprint_nbsr_summary(
-    jump=jump,
-    outcome_df=baserunning_defense,
-    team_filter=team_filter,
+    outcome_df=all_baserunning_defense,
 )
 sprint_adv_runs_summary = build_baserunning_sprint_outcome_summary(
-    jump=jump,
-    outcome_df=baserunning_defense,
+    outcome_df=all_baserunning_defense,
     outcome_col="adv_runs",
-    team_filter=team_filter,
 )
 current_ci_bw_summary = build_current_ci_bw_summary(
     jump=jump,
