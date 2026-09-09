@@ -1702,6 +1702,10 @@ def load_source_data() -> tuple:
                 is_nationals=("is_nationals", "max"),
             )
         )
+        # Keep the same stable name key used by the jump/defensive tables so
+        # the sprint-adjusted analyses can start from this exact >100-observation
+        # population and then intersect it with players who have Rel PP.
+        all_baserunning_defense["name_key"] = all_baserunning_defense["athlete"].map(canonical_name)
 
     status = (
         f"Loaded {len(jump):,} CI rows, {len(jump_power):,} relative-power rows, "
@@ -8079,31 +8083,79 @@ def build_sprint_adjusted_rel_power_summary(
     team_filter: str,
     min_power_jumps: int,
 ) -> pd.DataFrame:
-    """Build Nationals player rows for outcome ~ Sprint Speed + Relative Peak Power."""
+    """
+    Build the Nationals-only complete-case sample for
+    outcome ~ Sprint Speed + Relative Peak Power.
+
+    Eligibility deliberately starts from the exact same baserunning population
+    as the Nationals view of the Sprint Speed relationship tabs:
+      * current Nationals flag == True
+      * Sprint Speed observations > 100
+      * non-missing baserunning Sprint Speed
+
+    Relative Peak Power and the requested outcome are intersected only after that
+    eligibility filter is applied. This keeps the adjusted analysis anchored to
+    the same sprint-eligible Nationals population instead of a broader roster.
+    """
+    columns = [
+        "athlete", "team", "name_key", "sprint_obs",
+        "baserunning_sprint_speed", "avg_peak_power_rel", outcome_col,
+        "power_jumps", "power_test_dates", "first_power_date", "last_power_date",
+    ]
+    if jump_power.empty or outcome_df.empty or sprint_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    eligible = sprint_df.copy()
+    if "name_key" not in eligible.columns and "athlete" in eligible.columns:
+        eligible["name_key"] = eligible["athlete"].map(canonical_name)
+
+    required_sprint = {
+        "name_key", "baserunning_sprint_speed", "sprint_obs", "is_nationals"
+    }
+    if not required_sprint.issubset(eligible.columns):
+        return pd.DataFrame(columns=columns)
+
+    eligible["sprint_obs"] = pd.to_numeric(eligible["sprint_obs"], errors="coerce")
+    eligible["baserunning_sprint_speed"] = pd.to_numeric(
+        eligible["baserunning_sprint_speed"], errors="coerce"
+    )
+    eligible = eligible[
+        eligible["is_nationals"].fillna(False)
+        & eligible["sprint_obs"].gt(100)
+        & eligible["baserunning_sprint_speed"].notna()
+        & eligible["name_key"].astype(str).ne("")
+    ].copy()
+    if eligible.empty:
+        return pd.DataFrame(columns=columns)
+
+    eligible = (
+        eligible.groupby("name_key", as_index=False)
+        .agg(
+            baserunning_sprint_speed=("baserunning_sprint_speed", "mean"),
+            sprint_obs=("sprint_obs", "max"),
+        )
+    )
+
+    # Build Rel PP + outcome rows, then restrict them to the eligible Nationals
+    # sprint cohort above. For nBSR/Adv Runs the caller supplies the same
+    # all-baseball baserunning snapshot as outcome_df, so both Sprint Speed and
+    # the outcome come from the exact same season-to-date source.
     base = build_peak_power_rel_outcome_summary(
         jump_power=jump_power,
         outcome_df=outcome_df,
         outcome_col=outcome_col,
         start_date=start_date,
         end_date=end_date,
-        team_filter=team_filter,
+        # These sensitivity models deliberately ignore the dashboard's team
+        # filter so their starting cohort matches the Nationals population in
+        # the Sprint Speed tabs. Team is still retained as descriptive metadata.
+        team_filter="All Teams",
         min_power_jumps=min_power_jumps,
     )
-    columns = [
-        "athlete", "team", "name_key", "baserunning_sprint_speed",
-        "avg_peak_power_rel", outcome_col, "power_jumps", "power_test_dates",
-        "first_power_date", "last_power_date",
-    ]
-    if base.empty or sprint_df.empty or "baserunning_sprint_speed" not in sprint_df.columns:
+    if base.empty:
         return pd.DataFrame(columns=columns)
 
-    sprint_lookup = (
-        sprint_df[["name_key", "baserunning_sprint_speed"]]
-        .dropna(subset=["baserunning_sprint_speed"])
-        .groupby("name_key", as_index=False)
-        .agg(baserunning_sprint_speed=("baserunning_sprint_speed", "mean"))
-    )
-    summary = base.merge(sprint_lookup, on="name_key", how="inner")
+    summary = base.merge(eligible, on="name_key", how="inner")
     summary = summary.dropna(
         subset=["baserunning_sprint_speed", "avg_peak_power_rel", outcome_col]
     ).copy()
@@ -8354,6 +8406,7 @@ def render_sprint_adjusted_rel_power_tab(
     nbsr_summary: pd.DataFrame,
     adv_runs_summary: pd.DataFrame,
     if_reaction_summary: pd.DataFrame,
+    eligible_sprint_nationals: int | None = None,
 ) -> None:
     """Nationals-only sensitivity analysis for Rel PP relationships after Sprint Speed."""
     specs = [
@@ -8363,9 +8416,11 @@ def render_sprint_adjusted_rel_power_tab(
     ]
 
     st.caption(
-        "Nationals only. This asks whether Relative Peak Power has an association with each outcome "
-        "that remains after accounting for the linear relationship between Relative Peak Power and Sprint Speed. "
-        "It is a partial-association/sensitivity analysis, not evidence of causal independence."
+        "Nationals only. Eligibility starts from the same >100 Sprint Speed-observation population used "
+        "by the Nationals view of the Sprint Speed relationship tabs, then keeps only players with usable "
+        "Relative Peak Power and outcome data. Every Sprint-only and Sprint + Rel PP comparison below is fit "
+        "on that same complete-case sample. This is a partial-association/sensitivity analysis, not evidence "
+        "of causal independence."
     )
 
     rows = []
@@ -8373,14 +8428,23 @@ def render_sprint_adjusted_rel_power_tab(
         model = fit_sprint_adjusted_rel_power_model(summary, outcome_col)
         if model is None:
             rows.append({
-                "Outcome": label, "Players": len(summary), "Rel PP–Sprint R²": np.nan,
-                "Raw Rel PP R²": np.nan, "Sprint-only R²": np.nan, "Full model R²": np.nan,
+                "Outcome": label,
+                "Eligible >100 Sprint Nationals": eligible_sprint_nationals,
+                "Complete Cases": len(summary),
+                "Sprint→Outcome r": np.nan, "Rel PP→Outcome r": np.nan, "Rel PP–Sprint r": np.nan,
+                "Rel PP–Sprint R²": np.nan, "Raw Rel PP R²": np.nan,
+                "Sprint-only R²": np.nan, "Full model R²": np.nan,
                 "Incremental Rel PP R²": np.nan, "Partial r": np.nan,
                 "Rel PP Std Beta": np.nan,
             })
         else:
             rows.append({
-                "Outcome": label, "Players": model["n"],
+                "Outcome": label,
+                "Eligible >100 Sprint Nationals": eligible_sprint_nationals,
+                "Complete Cases": model["n"],
+                "Sprint→Outcome r": model["sprint_outcome_r"],
+                "Rel PP→Outcome r": model["raw_power_r"],
+                "Rel PP–Sprint r": model["power_sprint_r"],
                 "Rel PP–Sprint R²": model["power_sprint_r2"],
                 "Raw Rel PP R²": model["raw_power_r2"],
                 "Sprint-only R²": model["sprint_only_r2"],
@@ -8395,7 +8459,11 @@ def render_sprint_adjusted_rel_power_tab(
         st.dataframe(
             pd.DataFrame(rows), hide_index=True, use_container_width=True,
             column_config={
-                "Players": st.column_config.NumberColumn(format="%d"),
+                "Eligible >100 Sprint Nationals": st.column_config.NumberColumn(format="%d"),
+                "Complete Cases": st.column_config.NumberColumn(format="%d"),
+                "Sprint→Outcome r": st.column_config.NumberColumn(format="%+.3f"),
+                "Rel PP→Outcome r": st.column_config.NumberColumn(format="%+.3f"),
+                "Rel PP–Sprint r": st.column_config.NumberColumn(format="%+.3f"),
                 "Rel PP–Sprint R²": st.column_config.NumberColumn(format="%.3f"),
                 "Raw Rel PP R²": st.column_config.NumberColumn(format="%.3f"),
                 "Sprint-only R²": st.column_config.NumberColumn(format="%.3f"),
@@ -8406,8 +8474,10 @@ def render_sprint_adjusted_rel_power_tab(
             },
         )
         st.caption(
-            "The key columns are Incremental Rel PP R² and Partial r. Incremental R² is how much "
-            "additional outcome variance Rel PP explains after Sprint Speed is already included."
+            "Eligible >100 Sprint Nationals is the starting sprint cohort before requiring Rel PP/outcome data. "
+            "Complete Cases is the exact set used for every correlation and model in that row. The key columns "
+            "are Incremental Rel PP R² and Partial r; incremental R² is how much additional outcome variance "
+            "Rel PP explains after Sprint Speed is already included."
         )
 
     sub_tabs = st.tabs([spec[0] for spec in specs])
@@ -9042,10 +9112,21 @@ sprint_adv_runs_summary = build_baserunning_sprint_outcome_summary(
     outcome_df=all_baserunning_defense,
     outcome_col="adv_runs",
 )
+sprint_adjusted_eligible_nationals = int(
+    (
+        all_baserunning_defense.get("is_nationals", pd.Series(dtype=bool)).fillna(False)
+        & pd.to_numeric(
+            all_baserunning_defense.get("sprint_obs", pd.Series(dtype=float)), errors="coerce"
+        ).gt(100)
+        & pd.to_numeric(
+            all_baserunning_defense.get("baserunning_sprint_speed", pd.Series(dtype=float)), errors="coerce"
+        ).notna()
+    ).sum()
+) if not all_baserunning_defense.empty else 0
 adjusted_rel_power_nbsr_summary = build_sprint_adjusted_rel_power_summary(
     jump_power=jump_power,
-    outcome_df=baserunning_defense,
-    sprint_df=baserunning_defense,
+    outcome_df=all_baserunning_defense,
+    sprint_df=all_baserunning_defense,
     outcome_col="nbsr",
     start_date=start_date,
     end_date=end_date,
@@ -9054,8 +9135,8 @@ adjusted_rel_power_nbsr_summary = build_sprint_adjusted_rel_power_summary(
 )
 adjusted_rel_power_adv_runs_summary = build_sprint_adjusted_rel_power_summary(
     jump_power=jump_power,
-    outcome_df=baserunning_defense,
-    sprint_df=baserunning_defense,
+    outcome_df=all_baserunning_defense,
+    sprint_df=all_baserunning_defense,
     outcome_col="adv_runs",
     start_date=start_date,
     end_date=end_date,
@@ -9065,7 +9146,7 @@ adjusted_rel_power_adv_runs_summary = build_sprint_adjusted_rel_power_summary(
 adjusted_rel_power_if_reaction_summary = build_sprint_adjusted_rel_power_summary(
     jump_power=jump_power,
     outcome_df=infield_defense,
-    sprint_df=baserunning_defense,
+    sprint_df=all_baserunning_defense,
     outcome_col="if_reaction_3ft",
     start_date=start_date,
     end_date=end_date,
@@ -12046,6 +12127,7 @@ with sprint_adjusted_rel_power_tab:
         adjusted_rel_power_nbsr_summary,
         adjusted_rel_power_adv_runs_summary,
         adjusted_rel_power_if_reaction_summary,
+        eligible_sprint_nationals=sprint_adjusted_eligible_nationals,
     )
 
 
