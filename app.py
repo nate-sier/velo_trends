@@ -5,6 +5,7 @@ Performance × CI — Streamlit deployment-ready dashboard.
 """
 from __future__ import annotations
 
+# CI100 Bat Speed models matched to standalone latest-qualifying-month methodology.
 # Selected defensive relationships build v7.
 # Relative Peak Power × Sprint Speed now uses the baserunning-sheet Sprint Speed source.
 # Selected baserunning/defensive tabs use current baserunning-sheet Sprint Speed where applicable.
@@ -9120,18 +9121,29 @@ def build_ci100_hitting_model_panel(
     end_date,
     team_filter: str,
     min_ci_jumps: int,
+    bat_monthly_pairs: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Build one cross-sectional row per hitter for the dedicated CI100 models.
+    """Build the dedicated CI100 hitter-model panel.
 
-    Total CI and CI100 come from the same SQL-synced ForceDecks sessions. Bat speed
-    is the mean of the unique monthly PP_Sprint values in the selected window. P90
-    exit velocity is the current Nats Hitting snapshot already used by the app.
+    Bat Speed deliberately matches the standalone Bat Speed overview methodology:
+    one row per hitter from that hitter's latest qualifying month, using the exact
+    monthly average CI and monthly_avg_bat_speed already used by that overview.
+    CI100 is then aggregated only from ForceDecks tests in that same hitter-month.
+
+    P90 Exit Velo keeps the existing selected-window CI100 cross-sectional summary.
     """
     columns = [
+        # Selected-window CI100 summary used by P90 Exit Velo.
         "name_key", "athlete", "team", "avg_ci", "avg_ci100",
         "avg_ci100_ratio", "avg_ci100_ratio_pct", "ci100_tests",
         "ci100_test_dates", "first_ci100_date", "last_ci100_date",
-        "avg_bat_speed", "bat_speed_months", "p90_exit_velo",
+        # Bat-speed overview-matched fields.
+        "bat_month", "avg_bat_speed", "bat_speed_months", "bat_avg_ci",
+        "bat_avg_ci100", "bat_ci100_total_ci", "bat_avg_ci100_ratio",
+        "bat_avg_ci100_ratio_pct", "bat_ci100_tests", "bat_ci100_test_dates",
+        "bat_first_ci100_date", "bat_last_ci100_date",
+        # Current hitting snapshot.
+        "p90_exit_velo",
     ]
     if ci100 is None or ci100.empty:
         return pd.DataFrame(columns=columns)
@@ -9169,7 +9181,9 @@ def build_ci100_hitting_model_panel(
             np.nan,
         ),
     )
+    by_test["month"] = by_test["date"].dt.to_period("M").dt.to_timestamp()
 
+    # Existing selected-window physical summary. Keep this for P90 Exit Velo.
     physical = (
         by_test.groupby("name_key", as_index=False)
         .agg(
@@ -9183,9 +9197,6 @@ def build_ci100_hitting_model_panel(
             last_ci100_date=("date", "max"),
         )
     )
-    # Cross-sectional CI100:Total-CI ratio = hitter mean CI100 / hitter mean total CI.
-    # This directly answers how much of the athlete's average concentric impulse is
-    # represented in the first 100 ms, rather than averaging session-level ratios.
     physical["avg_ci100_ratio"] = np.where(
         physical["avg_ci"].notna() & ~np.isclose(physical["avg_ci"], 0.0),
         physical["avg_ci100"] / physical["avg_ci"],
@@ -9208,22 +9219,85 @@ def build_ci100_hitting_model_panel(
     if team_filter != "All Teams":
         physical = physical[physical["team"] == team_filter].copy()
 
-    # Mean of unique monthly bat-speed summaries in the selected date window.
-    start_month = start.to_period("M").start_time
-    end_month = end.to_period("M").start_time
-    bat_window = bat[
-        (bat["month"] >= start_month)
-        & (bat["month"] <= end_month)
-    ].copy()
-    bat_summary = (
-        bat_window.groupby("name_key", as_index=False)
-        .agg(
-            avg_bat_speed=("monthly_avg_bat_speed", "mean"),
-            bat_speed_months=("month", "nunique"),
+    # ------------------------------------------------------------------
+    # BAT SPEED: use the exact standalone-overview observation per hitter.
+    # ------------------------------------------------------------------
+    if bat_monthly_pairs is None:
+        bat_monthly_pairs = build_bat_monthly_pairs(
+            jump=jump,
+            bat=bat,
+            start_date=start,
+            end_date=end,
+            team_filter=team_filter,
+            min_ci_jumps=int(min_ci_jumps),
         )
-    ) if not bat_window.empty else pd.DataFrame(
-        columns=["name_key", "avg_bat_speed", "bat_speed_months"]
+
+    # CI100 summarized within each hitter-month so it can be attached to the
+    # exact month selected by build_bat_monthly_pairs().
+    ci100_monthly = (
+        by_test.groupby(["name_key", "month"], as_index=False)
+        .agg(
+            bat_ci100_total_ci=("ci", "mean"),
+            bat_avg_ci100=("ci100", "mean"),
+            bat_ci100_tests=("ci100", "count"),
+            bat_ci100_test_dates=("date", "nunique"),
+            bat_first_ci100_date=("date", "min"),
+            bat_last_ci100_date=("date", "max"),
+        )
     )
+    ci100_monthly = ci100_monthly[
+        ci100_monthly["bat_ci100_test_dates"] >= max(1, int(min_ci_jumps))
+    ].copy()
+    ci100_monthly["bat_avg_ci100_ratio"] = np.where(
+        ci100_monthly["bat_ci100_total_ci"].notna()
+        & ~np.isclose(ci100_monthly["bat_ci100_total_ci"], 0.0),
+        ci100_monthly["bat_avg_ci100"] / ci100_monthly["bat_ci100_total_ci"],
+        np.nan,
+    )
+    ci100_monthly["bat_avg_ci100_ratio_pct"] = (
+        ci100_monthly["bat_avg_ci100_ratio"] * 100.0
+    )
+
+    if bat_monthly_pairs is not None and not bat_monthly_pairs.empty:
+        bat_model = bat_monthly_pairs[[
+            "name_key", "athlete", "team", "month", "monthly_avg_bat_speed", "avg_ci"
+        ]].copy()
+        bat_model = bat_model.rename(columns={
+            "athlete": "bat_athlete",
+            "team": "bat_team",
+            "month": "bat_month",
+            "monthly_avg_bat_speed": "avg_bat_speed",
+            "avg_ci": "bat_avg_ci",
+        })
+        bat_model["bat_speed_months"] = 1
+        bat_model = bat_model.merge(
+            ci100_monthly,
+            left_on=["name_key", "bat_month"],
+            right_on=["name_key", "month"],
+            how="left",
+        ).drop(columns=["month"], errors="ignore")
+        # For the Bat Speed models, define the ratio against the exact monthly
+        # total-CI value used by the standalone Bat Speed overview.
+        bat_model["bat_avg_ci100_ratio"] = np.where(
+            bat_model["bat_avg_ci"].notna() & ~np.isclose(bat_model["bat_avg_ci"], 0.0),
+            bat_model["bat_avg_ci100"] / bat_model["bat_avg_ci"],
+            np.nan,
+        )
+        bat_model["bat_avg_ci100_ratio_pct"] = bat_model["bat_avg_ci100_ratio"] * 100.0
+    else:
+        bat_model = pd.DataFrame(columns=[
+            "name_key", "bat_athlete", "bat_team", "bat_month", "avg_bat_speed",
+            "bat_avg_ci", "bat_speed_months", "bat_ci100_total_ci", "bat_avg_ci100",
+            "bat_avg_ci100_ratio", "bat_avg_ci100_ratio_pct", "bat_ci100_tests",
+            "bat_ci100_test_dates", "bat_first_ci100_date", "bat_last_ci100_date",
+        ])
+
+    # Outer merge keeps every hitter from the Bat Speed overview available for
+    # the reference CI-only model, even if that hitter lacks CI100 in that month.
+    panel = physical.merge(bat_model, on="name_key", how="outer")
+    panel["athlete"] = panel.get("athlete").combine_first(panel.get("bat_athlete"))
+    panel["team"] = panel.get("team").combine_first(panel.get("bat_team"))
+    panel = panel.drop(columns=["bat_athlete", "bat_team"], errors="ignore")
 
     exit_summary = (
         exit_velo[["name_key", "p90_exit_velo"]]
@@ -9232,9 +9306,11 @@ def build_ci100_hitting_model_panel(
     ) if exit_velo is not None and not exit_velo.empty else pd.DataFrame(
         columns=["name_key", "p90_exit_velo"]
     )
-
-    panel = physical.merge(bat_summary, on="name_key", how="left")
     panel = panel.merge(exit_summary, on="name_key", how="left")
+
+    for col in columns:
+        if col not in panel.columns:
+            panel[col] = np.nan
     return panel[columns].sort_values(["team", "athlete"], kind="stable").reset_index(drop=True)
 
 
@@ -9341,32 +9417,69 @@ def _incremental_model_signal(full_model: dict | None, reduced_model: dict | Non
     return delta_r2, float(partial_r)
 
 
+def _ci100_predictor_columns(outcome_col: str) -> tuple[str, str, str, str]:
+    """Return total-CI, CI100, ratio, and ratio-% columns for an outcome."""
+    if outcome_col == "avg_bat_speed":
+        return (
+            "bat_avg_ci",
+            "bat_avg_ci100",
+            "bat_avg_ci100_ratio",
+            "bat_avg_ci100_ratio_pct",
+        )
+    return "avg_ci", "avg_ci100", "avg_ci100_ratio", "avg_ci100_ratio_pct"
+
+
 def ci100_hitting_model_rows(
     panel: pd.DataFrame,
     outcome_col: str,
     outcome_label: str,
 ) -> tuple[pd.DataFrame, dict[str, dict | None]]:
-    """Fit baseline, CI+CI100, ratio-only, and CI+ratio models on one complete-case sample."""
+    """Fit CI100 models, with Bat Speed anchored to the overview's exact cohort.
+
+    For Bat Speed, the displayed CI-only model uses every hitter in the standalone
+    Bat Speed overview. Incremental CI100 statistics still use a matched complete-
+    case CI-only model internally, so nested-model comparisons remain valid.
+    """
+    ci_col, ci100_col, ratio_col, _ = _ci100_predictor_columns(outcome_col)
+
     complete = panel.dropna(
-        subset=[outcome_col, "avg_ci", "avg_ci100", "avg_ci100_ratio"]
+        subset=[outcome_col, ci_col, ci100_col, ratio_col]
     ).copy().reset_index(drop=True)
+
+    matched_ci_only = fit_hitting_cross_sectional_model(
+        complete, outcome_col, [ci_col]
+    )
+    reference_ci_only = (
+        fit_hitting_cross_sectional_model(panel, outcome_col, [ci_col])
+        if outcome_col == "avg_bat_speed"
+        else matched_ci_only
+    )
+
     models = {
-        "CI only": fit_hitting_cross_sectional_model(complete, outcome_col, ["avg_ci"]),
-        "CI + CI100": fit_hitting_cross_sectional_model(complete, outcome_col, ["avg_ci", "avg_ci100"]),
-        "CI100 / CI ratio only": fit_hitting_cross_sectional_model(complete, outcome_col, ["avg_ci100_ratio"]),
-        "CI + CI100 / CI ratio": fit_hitting_cross_sectional_model(complete, outcome_col, ["avg_ci", "avg_ci100_ratio"]),
+        "CI only": reference_ci_only,
+        "CI + CI100": fit_hitting_cross_sectional_model(
+            complete, outcome_col, [ci_col, ci100_col]
+        ),
+        "CI100 / CI ratio only": fit_hitting_cross_sectional_model(
+            complete, outcome_col, [ratio_col]
+        ),
+        "CI + CI100 / CI ratio": fit_hitting_cross_sectional_model(
+            complete, outcome_col, [ci_col, ratio_col]
+        ),
+        # Internal matched baseline used only for valid incremental-R² calculations.
+        "_CI only matched": matched_ci_only,
     }
 
     delta_ci100, partial_ci100 = _incremental_model_signal(
-        models["CI + CI100"], models["CI only"], -1
+        models["CI + CI100"], matched_ci_only, -1
     )
     delta_ratio, partial_ratio = _incremental_model_signal(
-        models["CI + CI100 / CI ratio"], models["CI only"], -1
+        models["CI + CI100 / CI ratio"], matched_ci_only, -1
     )
 
     rows = []
     for model_name, model in models.items():
-        if model is None:
+        if model_name.startswith("_") or model is None:
             continue
         row = {
             "Outcome": outcome_label,
@@ -9383,11 +9496,11 @@ def ci100_hitting_model_rows(
             "Ratio Std Beta": np.nan,
         }
         for predictor, beta in zip(model["predictors"], model["standardized_betas"]):
-            if predictor == "avg_ci":
+            if predictor == ci_col:
                 row["CI Std Beta"] = beta
-            elif predictor == "avg_ci100":
+            elif predictor == ci100_col:
                 row["CI100 Std Beta"] = beta
-            elif predictor == "avg_ci100_ratio":
+            elif predictor == ratio_col:
                 row["Ratio Std Beta"] = beta
         if model_name == "CI + CI100":
             row["Incremental R² beyond CI"] = delta_ci100
@@ -9471,7 +9584,8 @@ def build_ci100_ratio_scatter(
     unit: str,
     show_names: bool,
 ) -> go.Figure:
-    data = panel.dropna(subset=["avg_ci100_ratio_pct", outcome_col]).copy()
+    ci_col, ci100_col, _, ratio_pct_col = _ci100_predictor_columns(outcome_col)
+    data = panel.dropna(subset=[ratio_pct_col, outcome_col, ci_col, ci100_col]).copy()
     fig = go.Figure()
     if len(data) < 3:
         fig.add_annotation(
@@ -9483,15 +9597,15 @@ def build_ci100_ratio_scatter(
         fig.update_yaxes(visible=False)
         return base_figure_layout(fig, 390)
 
-    x = data["avg_ci100_ratio_pct"].to_numpy(dtype=float)
+    x = data[ratio_pct_col].to_numpy(dtype=float)
     y = data[outcome_col].to_numpy(dtype=float)
     slope, intercept = np.polyfit(x, y, 1)
     x_line = np.linspace(float(np.min(x)), float(np.max(x)), 100)
     custom = np.column_stack([
         data["athlete"].astype(str),
         data["team"].fillna("Unassigned").astype(str),
-        data["avg_ci"].round(2),
-        data["avg_ci100"].round(2),
+        data[ci_col].round(2),
+        data[ci100_col].round(2),
     ])
     fig.add_trace(go.Scatter(
         x=x, y=y,
@@ -9503,8 +9617,8 @@ def build_ci100_ratio_scatter(
         customdata=custom,
         hovertemplate=(
             "<b>%{customdata[0]}</b><br>Team: %{customdata[1]}<br>"
-            "Mean total CI: %{customdata[2]:.2f} N·s<br>"
-            "Mean CI100: %{customdata[3]:.2f} N·s<br>"
+            "Total CI: %{customdata[2]:.2f} N·s<br>"
+            "CI100: %{customdata[3]:.2f} N·s<br>"
             "CI100 / total CI: %{x:.2f}%<br>"
             f"{outcome_label}: %{{y:.2f}} {unit}<extra></extra>"
         ),
@@ -9519,7 +9633,7 @@ def build_ci100_ratio_scatter(
         showlegend=False,
     ))
     fig.update_xaxes(
-        title="Mean CI100 / Total CI (%)",
+        title="CI100 / Total CI (%)",
         showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
     )
     fig.update_yaxes(
@@ -9534,10 +9648,10 @@ def render_ci100_hitting_models_tab(
     ci100_available: bool,
 ) -> None:
     st.caption(
-        "Cross-sectional hitter models. Total CI and CI @ 100 ms come from the same "
-        "ForceDecks sessions in the dedicated CI100 Google Sheets workbook. Bat speed is the "
-        "mean of the available PP_Sprint monthly averages in the selected window; P90 EV "
-        "uses the current Nats Hitting snapshot. Associations are descriptive, not causal."
+        "Bat Speed now exactly follows the standalone Bat Speed overview: each hitter's latest "
+        "qualifying month supplies that month's Jump Data average CI and PP_Sprint monthly bat speed; "
+        "CI100 is added only from ForceDecks tests in that same month. P90 EV keeps the selected-window "
+        "CI100 summary and current Nats Hitting snapshot. Associations are descriptive, not causal."
     )
 
     if not ci100_available:
@@ -9567,12 +9681,13 @@ def render_ci100_hitting_models_tab(
             ci_ci100 = models.get("CI + CI100")
             ratio_only = models.get("CI100 / CI ratio only")
             ci_ratio = models.get("CI + CI100 / CI ratio")
-            delta_ci100, partial_ci100 = _incremental_model_signal(ci_ci100, ci_only, -1)
-            delta_ratio, partial_ratio = _incremental_model_signal(ci_ratio, ci_only, -1)
+            matched_ci_only = models.get("_CI only matched", ci_only)
+            delta_ci100, partial_ci100 = _incremental_model_signal(ci_ci100, matched_ci_only, -1)
+            delta_ratio, partial_ratio = _incremental_model_signal(ci_ratio, matched_ci_only, -1)
 
             top = st.columns(4)
             top_values = [
-                ("Hitters", str(int(ci_ci100["n"])) if ci_ci100 else "—", BLUE),
+                ("Hitters", str(int(ci_only["n"])) if ci_only else "—", BLUE),
                 ("CI-only R²", f"{ci_only['r2']:.3f}" if ci_only else "—", NAVY_MID),
                 ("CI + CI100 R²", f"{ci_ci100['r2']:.3f}" if ci_ci100 else "—", ACCENT_RED),
                 ("CI100 Incremental R²", f"{delta_ci100:+.3f}" if pd.notna(delta_ci100) else "—", TEAL),
@@ -9612,8 +9727,10 @@ def render_ci100_hitting_models_tab(
                     },
                 )
                 st.caption(
-                    "Incremental R² compares the two-predictor model with the CI-only model on the same complete-case sample. "
-                    "The CI100/CI ratio is calculated as each hitter's mean CI100 divided by mean total CI over the selected window."
+                    "For Bat Speed, the displayed CI-only row/card uses the exact standalone Bat Speed overview cohort. "
+                    "Incremental R² still compares against a hidden matched CI-only model using the same CI100 complete cases, "
+                    "so the nested-model comparison remains valid. CI100 for Bat Speed is summarized within that hitter's exact "
+                    "overview month; P90 EV continues to use selected-window means."
                 )
 
             show_names = st.checkbox(
@@ -9654,21 +9771,35 @@ def render_ci100_hitting_models_tab(
 
             with st.container(border=True):
                 st.subheader("Hitter Results", anchor=False)
-                display_cols = [
-                    "athlete", "team", "avg_ci", "avg_ci100", "avg_ci100_ratio_pct",
-                    "ci100_test_dates", "first_ci100_date", "last_ci100_date", outcome_col,
-                ]
                 if outcome_col == "avg_bat_speed":
-                    display_cols.insert(-1, "bat_speed_months")
+                    display_cols = [
+                        "athlete", "team", "bat_month", "bat_avg_ci", "bat_avg_ci100",
+                        "bat_avg_ci100_ratio_pct", "bat_ci100_test_dates",
+                        "bat_first_ci100_date", "bat_last_ci100_date", "avg_bat_speed",
+                    ]
+                    rename = {
+                        "athlete": "Hitter", "team": "Team", "bat_month": "Month",
+                        "bat_avg_ci": "Monthly Average CI", "bat_avg_ci100": "Monthly Average CI100",
+                        "bat_avg_ci100_ratio_pct": "CI100 / Total CI (%)",
+                        "bat_ci100_test_dates": "ForceDecks Test Dates",
+                        "bat_first_ci100_date": "First Test", "bat_last_ci100_date": "Last Test",
+                        "avg_bat_speed": "Monthly Avg Bat Speed",
+                    }
+                else:
+                    display_cols = [
+                        "athlete", "team", "avg_ci", "avg_ci100", "avg_ci100_ratio_pct",
+                        "ci100_test_dates", "first_ci100_date", "last_ci100_date", outcome_col,
+                    ]
+                    rename = {
+                        "athlete": "Hitter", "team": "Team", "avg_ci": "Average Total CI",
+                        "avg_ci100": "Average CI100", "avg_ci100_ratio_pct": "CI100 / Total CI (%)",
+                        "ci100_test_dates": "ForceDecks Test Dates", "first_ci100_date": "First Test",
+                        "last_ci100_date": "Last Test", "p90_exit_velo": "P90 Exit Velo",
+                    }
                 display = panel[display_cols].dropna(subset=[outcome_col]).copy()
-                rename = {
-                    "athlete": "Hitter", "team": "Team", "avg_ci": "Average Total CI",
-                    "avg_ci100": "Average CI100", "avg_ci100_ratio_pct": "CI100 / Total CI (%)",
-                    "ci100_test_dates": "ForceDecks Test Dates", "first_ci100_date": "First Test",
-                    "last_ci100_date": "Last Test", "avg_bat_speed": "Average Bat Speed",
-                    "bat_speed_months": "Bat-Speed Months", "p90_exit_velo": "P90 Exit Velo",
-                }
                 display = display.rename(columns=rename)
+                if "Month" in display.columns:
+                    display["Month"] = pd.to_datetime(display["Month"], errors="coerce").dt.strftime("%b %Y")
                 for date_col in ["First Test", "Last Test"]:
                     if date_col in display.columns:
                         display[date_col] = display[date_col].map(fmt_date)
@@ -9680,8 +9811,10 @@ def render_ci100_hitting_models_tab(
                     column_config={
                         "Average Total CI": st.column_config.NumberColumn(format="%.2f N·s"),
                         "Average CI100": st.column_config.NumberColumn(format="%.2f N·s"),
+                        "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                        "Monthly Average CI100": st.column_config.NumberColumn(format="%.2f N·s"),
                         "CI100 / Total CI (%)": st.column_config.NumberColumn(format="%.2f%%"),
-                        "Average Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
+                        "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
                         "P90 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"),
                     },
                 )
@@ -9894,6 +10027,7 @@ ci100_hitting_panel = build_ci100_hitting_model_panel(
     end_date=end_date,
     team_filter=team_filter,
     min_ci_jumps=int(min_ci_jumps),
+    bat_monthly_pairs=bat_monthly_pairs,
 )
 if_reaction_power_summary = build_peak_power_rel_outcome_summary(
     jump_power=jump_power,
