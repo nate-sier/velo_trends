@@ -1,3 +1,4 @@
+# Calculator simplified to show only model-estimated bat speed.
 # Added CI + CI100 -> Bat Speed calculator to season hitting models.
 # Standalone P90 EV overview converted to 2026 regular-season cross-sectional analysis.
 # Standalone Bat Speed overview converted to 2026 regular-season cross-sectional analysis.
@@ -10649,49 +10650,14 @@ def render_ci100_hitting_models_tab(
                         + combined_coef[2] * float(calc_ci100)
                     )
 
-                    calc_ratio_pct = (
-                        100.0 * float(calc_ci100) / float(calc_ci)
-                        if float(calc_ci) > 0 else np.nan
-                    )
-
-                    ci_only_pred = np.nan
-                    if ci_only is not None:
-                        ci_only_coef = np.asarray(ci_only["coef"], dtype=float)
-                        ci_only_pred = float(
-                            ci_only_coef[0] + ci_only_coef[1] * float(calc_ci)
-                        )
-
-                    combined_vs_ci_only = (
-                        predicted_bat_speed - ci_only_pred
-                        if pd.notna(ci_only_pred) else np.nan
-                    )
-
-                    calc_cards = st.columns(3)
-                    calc_values = [
-                        (
+                    st.markdown(
+                        metric_card(
                             "Model-Estimated Bat Speed",
                             f"{predicted_bat_speed:.2f} mph",
                             TEAL,
                         ),
-                        (
-                            "CI100 / Total CI",
-                            f"{calc_ratio_pct:.1f}%"
-                            if pd.notna(calc_ratio_pct) else "—",
-                            BLUE,
-                        ),
-                        (
-                            "Combined Model vs CI-Only Estimate",
-                            f"{combined_vs_ci_only:+.2f} mph"
-                            if pd.notna(combined_vs_ci_only) else "—",
-                            NAVY_MID,
-                        ),
-                    ]
-                    for calc_col, calc_value in zip(calc_cards, calc_values):
-                        with calc_col:
-                            st.markdown(
-                                metric_card(*calc_value),
-                                unsafe_allow_html=True,
-                            )
+                        unsafe_allow_html=True,
+                    )
 
                     ci_min = float(calc_data["avg_ci"].min())
                     ci_max = float(calc_data["avg_ci"].max())
