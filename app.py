@@ -5,7 +5,7 @@ Performance × CI — Streamlit deployment-ready dashboard.
 """
 from __future__ import annotations
 
-# CI100 Bat Speed models matched to standalone latest-qualifying-month methodology.
+# CI100 hitting models use 2026 regular-season outcomes and full-season ForceDecks summaries.
 # Selected defensive relationships build v7.
 # Relative Peak Power × Sprint Speed now uses the baserunning-sheet Sprint Speed source.
 # Selected baserunning/defensive tabs use current baserunning-sheet Sprint Speed where applicable.
@@ -39,6 +39,7 @@ DEFAULT_EXIT_TAB = "Nats Hitting"
 DEFAULT_PINCH_TAB = "Pinch Grip"
 DEFAULT_CI100_SHEET_NAME = "CI100 ForceDecks"
 DEFAULT_CI100_TAB = "CI100"
+DEFAULT_HITTING_SEASON_TAB = "Hitting Season"
 DEFAULT_INFIELD_SHEET_NAME = "nats_players_infield_2026"
 DEFAULT_BASERUNNING_SHEET_NAME = "nats_players_baserunning_2026"
 DEFAULT_ALL_BASERUNNING_TAB = "All Baseball Baserunning"
@@ -1120,6 +1121,19 @@ def load_source_data() -> tuple:
         # CI100 is optional for the rest of the dashboard. It lives in a separate
         # workbook so the already-large core performance workbook is never modified.
         ci100_raw = pd.DataFrame()
+    try:
+        hitting_season_raw = read_external_sheet(
+            client,
+            id_secret="CI100_SHEET_ID",
+            name_secret="CI100_SHEET_NAME",
+            default_name=ci100_sheet_name,
+            tab_secret="HITTING_SEASON_TAB",
+            default_tab_name=DEFAULT_HITTING_SEASON_TAB,
+        )
+    except (gspread.exceptions.SpreadsheetNotFound, gspread.exceptions.WorksheetNotFound):
+        # The rest of the dashboard remains usable if the season hitting sync
+        # has not been written yet. Only the season CI100 hitting tab is disabled.
+        hitting_season_raw = pd.DataFrame()
     infield_raw = read_external_sheet(
         client,
         id_secret="INFIELD_SHEET_ID",
@@ -1408,6 +1422,119 @@ def load_source_data() -> tuple:
             ]
             .dropna(subset=["date", "ci", "ci100"])
             .sort_values(["athlete", "date"], kind="stable")
+            .reset_index(drop=True)
+        )
+
+    # 2026 regular-season hitting outcomes written to the CI100 workbook.
+    # One row represents one hitter-season. MLBAM ID is the merge key so the
+    # cross-sectional models do not depend on fuzzy name matching.
+    hitting_season_columns = [
+        "player_id", "athlete", "season", "game_type",
+        "avg_bat_speed", "bat_speed_observations",
+        "first_bat_speed_date", "last_bat_speed_date",
+        "p90_exit_velo", "tracked_bip", "p90_updated_at", "name_key",
+    ]
+    if hitting_season_raw.empty:
+        hitting_season = pd.DataFrame(columns=hitting_season_columns)
+    else:
+        hitting_season_raw.columns = hitting_season_raw.columns.astype(str).str.strip()
+        hs_id_col = first_existing(
+            hitting_season_raw.columns.tolist(),
+            ["MLBAM ID", "MLBAM_ID", "mlbam_id", "player_id", "Player ID"],
+        )
+        hs_name_col = first_existing(
+            hitting_season_raw.columns.tolist(),
+            ["Athlete", "athlete", "Name", "name", "Player", "player"],
+        )
+        hs_season_col = first_existing(
+            hitting_season_raw.columns.tolist(), ["Season", "season", "Year", "year"]
+        )
+        hs_game_type_col = first_existing(
+            hitting_season_raw.columns.tolist(), ["Game Type", "game_type", "gameType"]
+        )
+        hs_bat_col = first_existing(
+            hitting_season_raw.columns.tolist(),
+            ["Season Avg Bat Speed", "season_avg_bat_speed", "Avg Bat Speed"],
+        )
+        hs_bat_obs_col = first_existing(
+            hitting_season_raw.columns.tolist(),
+            ["Bat Speed Observations", "bat_speed_observations", "Bat Speed Obs"],
+        )
+        hs_first_bat_col = first_existing(
+            hitting_season_raw.columns.tolist(),
+            ["First Bat Speed Date", "first_bat_speed_date"],
+        )
+        hs_last_bat_col = first_existing(
+            hitting_season_raw.columns.tolist(),
+            ["Last Bat Speed Date", "last_bat_speed_date"],
+        )
+        hs_p90_col = first_existing(
+            hitting_season_raw.columns.tolist(),
+            ["P90 Exit Velo", "p90_exit_velo", "P90 EV"],
+        )
+        hs_bip_col = first_existing(
+            hitting_season_raw.columns.tolist(), ["Tracked BIP", "tracked_bip"]
+        )
+        hs_p90_updated_col = first_existing(
+            hitting_season_raw.columns.tolist(), ["P90 Updated At", "p90_updated_at"]
+        )
+
+        missing_hs = [
+            label for label, col in {
+                "MLBAM ID": hs_id_col,
+                "Athlete": hs_name_col,
+                "Season": hs_season_col,
+                "Season Avg Bat Speed": hs_bat_col,
+                "P90 Exit Velo": hs_p90_col,
+            }.items() if col is None
+        ]
+        if missing_hs:
+            raise ValueError(
+                f"The '{DEFAULT_HITTING_SEASON_TAB}' tab is missing required column(s): "
+                + ", ".join(missing_hs)
+                + ". Re-run sync_ci100_hitting_regular_season_v4.py --write."
+            )
+
+        hitting_season = pd.DataFrame({
+            "player_id": pd.to_numeric(hitting_season_raw[hs_id_col], errors="coerce").astype("Int64"),
+            "athlete": hitting_season_raw[hs_name_col].astype(str).str.strip(),
+            "season": pd.to_numeric(hitting_season_raw[hs_season_col], errors="coerce").astype("Int64"),
+            "game_type": (
+                hitting_season_raw[hs_game_type_col].astype(str).str.strip()
+                if hs_game_type_col else "Regular Season"
+            ),
+            "avg_bat_speed": pd.to_numeric(hitting_season_raw[hs_bat_col], errors="coerce"),
+            "bat_speed_observations": (
+                pd.to_numeric(hitting_season_raw[hs_bat_obs_col], errors="coerce")
+                if hs_bat_obs_col else np.nan
+            ),
+            "first_bat_speed_date": (
+                parse_sheet_dates(hitting_season_raw[hs_first_bat_col])
+                if hs_first_bat_col else pd.NaT
+            ),
+            "last_bat_speed_date": (
+                parse_sheet_dates(hitting_season_raw[hs_last_bat_col])
+                if hs_last_bat_col else pd.NaT
+            ),
+            "p90_exit_velo": pd.to_numeric(hitting_season_raw[hs_p90_col], errors="coerce"),
+            "tracked_bip": (
+                pd.to_numeric(hitting_season_raw[hs_bip_col], errors="coerce")
+                if hs_bip_col else np.nan
+            ),
+            "p90_updated_at": (
+                parse_sheet_dates(hitting_season_raw[hs_p90_updated_col])
+                if hs_p90_updated_col else pd.NaT
+            ),
+        })
+        hitting_season["name_key"] = hitting_season["athlete"].map(canonical_name)
+        hitting_season = (
+            hitting_season[
+                hitting_season["player_id"].notna()
+                & hitting_season["season"].notna()
+                & (hitting_season["athlete"] != "")
+            ]
+            .sort_values(["season", "athlete"], kind="stable")
+            .drop_duplicates(["player_id", "season"], keep="last")
             .reset_index(drop=True)
         )
 
@@ -1862,13 +1989,13 @@ def load_source_data() -> tuple:
         f"{len(velo):,} FB Velo rows, {len(pinch):,} Pinch Grip rows, "
         f"{len(sprint):,} valid sprint-speed rows, {len(bat):,} hitter-month "
         f"bat-speed rows, {len(exit_velo):,} valid P90 exit-velocity rows, "
-        f"{len(ci100):,} CI100 session rows, "
+        f"{len(ci100):,} CI100 session rows, {len(hitting_season):,} season hitting rows, "
         f"{len(infield_defense):,} IF Reaction 3ft rows, {len(baserunning_defense):,} Nationals baserunning rows, "
         f"and {len(all_baserunning_defense):,} all-baseball baserunning rows · "
         f"{datetime.now().strftime('%I:%M %p').lstrip('0')}"
     )
     return (
-        jump, jump_power, velo, bat, pinch, sprint, exit_velo, ci100,
+        jump, jump_power, velo, bat, pinch, sprint, exit_velo, ci100, hitting_season,
         infield_defense, baserunning_defense, all_baserunning_defense, status,
     )
 
@@ -9110,87 +9237,79 @@ def _projection_player_options(df: pd.DataFrame) -> list[str]:
     )
 
 # -----------------------------------------------------------------------------
-# HITTING MODELS — TOTAL CI + CI100 / CI100:CI RATIO
+# HITTING MODELS — 2026 SEASON CROSS-SECTIONAL TOTAL CI + CI100
 # -----------------------------------------------------------------------------
 def build_ci100_hitting_model_panel(
     ci100: pd.DataFrame,
     jump: pd.DataFrame,
-    bat: pd.DataFrame,
-    exit_velo: pd.DataFrame,
-    start_date,
-    end_date,
+    hitting_season: pd.DataFrame,
     team_filter: str,
-    min_ci_jumps: int,
-    bat_monthly_pairs: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Build the dedicated CI100 hitter-model panel.
+    """Build one row per hitter for the 2026 regular-season cross-section.
 
-    Bat Speed deliberately matches the standalone Bat Speed overview methodology:
-    one row per hitter from that hitter's latest qualifying month, using the exact
-    monthly average CI and monthly_avg_bat_speed already used by that overview.
-    CI100 is then aggregated only from ForceDecks tests in that same hitter-month.
-
-    P90 Exit Velo keeps the existing selected-window CI100 cross-sectional summary.
+    Predictors are full-season-to-date ForceDecks means from the dedicated CI100
+    source. Total CI and CI100 come from the exact same ForceDecks test rows.
+    Outcomes come from the Hitting Season tab: regular-season swing-level mean bat
+    speed and regular-season P90 exit velocity. The global date slider is
+    intentionally ignored here so predictor and outcome windows stay season-aligned.
     """
     columns = [
-        # Selected-window CI100 summary used by P90 Exit Velo.
-        "name_key", "athlete", "team", "avg_ci", "avg_ci100",
-        "avg_ci100_ratio", "avg_ci100_ratio_pct", "ci100_tests",
-        "ci100_test_dates", "first_ci100_date", "last_ci100_date",
-        # Bat-speed overview-matched fields.
-        "bat_month", "avg_bat_speed", "bat_speed_months", "bat_avg_ci",
-        "bat_avg_ci100", "bat_ci100_total_ci", "bat_avg_ci100_ratio",
-        "bat_avg_ci100_ratio_pct", "bat_ci100_tests", "bat_ci100_test_dates",
-        "bat_first_ci100_date", "bat_last_ci100_date",
-        # Current hitting snapshot.
-        "p90_exit_velo",
+        "player_id", "name_key", "athlete", "team", "season", "game_type",
+        "avg_ci", "avg_ci100", "avg_ci100_ratio", "avg_ci100_ratio_pct",
+        "ci100_tests", "ci100_test_dates", "first_ci100_date", "last_ci100_date",
+        "avg_bat_speed", "bat_speed_observations",
+        "first_bat_speed_date", "last_bat_speed_date",
+        "p90_exit_velo", "tracked_bip", "p90_updated_at",
     ]
-    if ci100 is None or ci100.empty:
+    if ci100 is None or ci100.empty or hitting_season is None or hitting_season.empty:
         return pd.DataFrame(columns=columns)
 
-    start = pd.Timestamp(start_date).normalize()
-    end = pd.Timestamp(end_date).normalize()
+    season_values = pd.to_numeric(hitting_season["season"], errors="coerce").dropna()
+    if season_values.empty:
+        return pd.DataFrame(columns=columns)
+    season = int(season_values.max())
+
+    outcomes = hitting_season[
+        pd.to_numeric(hitting_season["season"], errors="coerce").eq(season)
+    ].copy()
+    if "game_type" in outcomes.columns:
+        regular_mask = outcomes["game_type"].astype(str).str.strip().str.lower().isin(
+            {"regular season", "r"}
+        )
+        if regular_mask.any():
+            outcomes = outcomes[regular_mask].copy()
+
     work = ci100[
-        (ci100["date"] >= start)
-        & (ci100["date"] <= end)
+        ci100["date"].dt.year.eq(season)
+        & ci100["player_id"].notna()
         & ci100["ci"].notna()
         & ci100["ci100"].notna()
     ].copy()
     if work.empty:
         return pd.DataFrame(columns=columns)
 
-    # If a sync contains duplicate rows for the same test, collapse them first.
-    test_group_cols = ["name_key", "date"]
+    work["player_id"] = pd.to_numeric(work["player_id"], errors="coerce").astype("Int64")
+
+    # Collapse duplicate synced rows so each ForceDecks test contributes once.
+    test_group_cols = ["player_id", "date"]
     if "test_id" in work.columns and work["test_id"].astype(str).str.len().gt(0).any():
         test_group_cols.append("test_id")
 
     by_test = (
-        work.groupby(test_group_cols, as_index=False)
+        work.groupby(test_group_cols, as_index=False, dropna=False)
         .agg(
             athlete=("athlete", "first"),
             ci=("ci", "mean"),
             ci100=("ci100", "mean"),
-            ci100_ratio=("ci100_ratio", "mean"),
         )
     )
-    by_test["ci100_ratio"] = by_test["ci100_ratio"].where(
-        by_test["ci100_ratio"].notna(),
-        np.where(
-            by_test["ci"].notna() & ~np.isclose(by_test["ci"], 0.0),
-            by_test["ci100"] / by_test["ci"],
-            np.nan,
-        ),
-    )
-    by_test["month"] = by_test["date"].dt.to_period("M").dt.to_timestamp()
 
-    # Existing selected-window physical summary. Keep this for P90 Exit Velo.
     physical = (
-        by_test.groupby("name_key", as_index=False)
+        by_test.groupby("player_id", as_index=False)
         .agg(
             athlete=("athlete", "first"),
             avg_ci=("ci", "mean"),
             avg_ci100=("ci100", "mean"),
-            avg_ci100_ratio=("ci100_ratio", "mean"),
             ci100_tests=("ci100", "count"),
             ci100_test_dates=("date", "nunique"),
             first_ci100_date=("date", "min"),
@@ -9203,116 +9322,43 @@ def build_ci100_hitting_model_panel(
         np.nan,
     )
     physical["avg_ci100_ratio_pct"] = physical["avg_ci100_ratio"] * 100.0
-    physical = physical[
-        physical["ci100_test_dates"] >= max(1, int(min_ci_jumps))
-    ].copy()
 
-    # Current team assignment comes from the established Jump Data source.
-    jump_to_end = jump[jump["date"] <= end].copy()
+    # Current/most-recent 2026 team assignment from Jump Data is used only as a
+    # display/team-filter attribute; it is not part of the model.
+    jump_season = jump[jump["date"].dt.year.eq(season)].copy()
     team_lookup = (
-        jump_to_end.sort_values("date", kind="stable")
+        jump_season.sort_values("date", kind="stable")
         .groupby("name_key", as_index=False)
         .tail(1)[["name_key", "team"]]
         .drop_duplicates("name_key")
-    )
+    ) if not jump_season.empty else pd.DataFrame(columns=["name_key", "team"])
+
+    physical["name_key"] = physical["athlete"].map(canonical_name)
     physical = physical.merge(team_lookup, on="name_key", how="left")
+
+    outcome_cols = [
+        "player_id", "season", "game_type", "avg_bat_speed",
+        "bat_speed_observations", "first_bat_speed_date", "last_bat_speed_date",
+        "p90_exit_velo", "tracked_bip", "p90_updated_at",
+    ]
+    outcomes = outcomes[outcome_cols].copy()
+    outcomes["player_id"] = pd.to_numeric(outcomes["player_id"], errors="coerce").astype("Int64")
+
+    panel = physical.merge(outcomes, on="player_id", how="inner")
+    panel["season"] = season
+
     if team_filter != "All Teams":
-        physical = physical[physical["team"] == team_filter].copy()
-
-    # ------------------------------------------------------------------
-    # BAT SPEED: use the exact standalone-overview observation per hitter.
-    # ------------------------------------------------------------------
-    if bat_monthly_pairs is None:
-        bat_monthly_pairs = build_bat_monthly_pairs(
-            jump=jump,
-            bat=bat,
-            start_date=start,
-            end_date=end,
-            team_filter=team_filter,
-            min_ci_jumps=int(min_ci_jumps),
-        )
-
-    # CI100 summarized within each hitter-month so it can be attached to the
-    # exact month selected by build_bat_monthly_pairs().
-    ci100_monthly = (
-        by_test.groupby(["name_key", "month"], as_index=False)
-        .agg(
-            bat_ci100_total_ci=("ci", "mean"),
-            bat_avg_ci100=("ci100", "mean"),
-            bat_ci100_tests=("ci100", "count"),
-            bat_ci100_test_dates=("date", "nunique"),
-            bat_first_ci100_date=("date", "min"),
-            bat_last_ci100_date=("date", "max"),
-        )
-    )
-    ci100_monthly = ci100_monthly[
-        ci100_monthly["bat_ci100_test_dates"] >= max(1, int(min_ci_jumps))
-    ].copy()
-    ci100_monthly["bat_avg_ci100_ratio"] = np.where(
-        ci100_monthly["bat_ci100_total_ci"].notna()
-        & ~np.isclose(ci100_monthly["bat_ci100_total_ci"], 0.0),
-        ci100_monthly["bat_avg_ci100"] / ci100_monthly["bat_ci100_total_ci"],
-        np.nan,
-    )
-    ci100_monthly["bat_avg_ci100_ratio_pct"] = (
-        ci100_monthly["bat_avg_ci100_ratio"] * 100.0
-    )
-
-    if bat_monthly_pairs is not None and not bat_monthly_pairs.empty:
-        bat_model = bat_monthly_pairs[[
-            "name_key", "athlete", "team", "month", "monthly_avg_bat_speed", "avg_ci"
-        ]].copy()
-        bat_model = bat_model.rename(columns={
-            "athlete": "bat_athlete",
-            "team": "bat_team",
-            "month": "bat_month",
-            "monthly_avg_bat_speed": "avg_bat_speed",
-            "avg_ci": "bat_avg_ci",
-        })
-        bat_model["bat_speed_months"] = 1
-        bat_model = bat_model.merge(
-            ci100_monthly,
-            left_on=["name_key", "bat_month"],
-            right_on=["name_key", "month"],
-            how="left",
-        ).drop(columns=["month"], errors="ignore")
-        # For the Bat Speed models, define the ratio against the exact monthly
-        # total-CI value used by the standalone Bat Speed overview.
-        bat_model["bat_avg_ci100_ratio"] = np.where(
-            bat_model["bat_avg_ci"].notna() & ~np.isclose(bat_model["bat_avg_ci"], 0.0),
-            bat_model["bat_avg_ci100"] / bat_model["bat_avg_ci"],
-            np.nan,
-        )
-        bat_model["bat_avg_ci100_ratio_pct"] = bat_model["bat_avg_ci100_ratio"] * 100.0
-    else:
-        bat_model = pd.DataFrame(columns=[
-            "name_key", "bat_athlete", "bat_team", "bat_month", "avg_bat_speed",
-            "bat_avg_ci", "bat_speed_months", "bat_ci100_total_ci", "bat_avg_ci100",
-            "bat_avg_ci100_ratio", "bat_avg_ci100_ratio_pct", "bat_ci100_tests",
-            "bat_ci100_test_dates", "bat_first_ci100_date", "bat_last_ci100_date",
-        ])
-
-    # Outer merge keeps every hitter from the Bat Speed overview available for
-    # the reference CI-only model, even if that hitter lacks CI100 in that month.
-    panel = physical.merge(bat_model, on="name_key", how="outer")
-    panel["athlete"] = panel.get("athlete").combine_first(panel.get("bat_athlete"))
-    panel["team"] = panel.get("team").combine_first(panel.get("bat_team"))
-    panel = panel.drop(columns=["bat_athlete", "bat_team"], errors="ignore")
-
-    exit_summary = (
-        exit_velo[["name_key", "p90_exit_velo"]]
-        .dropna(subset=["p90_exit_velo"])
-        .drop_duplicates("name_key", keep="last")
-    ) if exit_velo is not None and not exit_velo.empty else pd.DataFrame(
-        columns=["name_key", "p90_exit_velo"]
-    )
-    panel = panel.merge(exit_summary, on="name_key", how="left")
+        panel = panel[panel["team"] == team_filter].copy()
 
     for col in columns:
         if col not in panel.columns:
             panel[col] = np.nan
-    return panel[columns].sort_values(["team", "athlete"], kind="stable").reset_index(drop=True)
 
+    return (
+        panel[columns]
+        .sort_values(["team", "athlete"], kind="stable")
+        .reset_index(drop=True)
+    )
 
 def fit_hitting_cross_sectional_model(
     frame: pd.DataFrame,
@@ -9418,14 +9464,7 @@ def _incremental_model_signal(full_model: dict | None, reduced_model: dict | Non
 
 
 def _ci100_predictor_columns(outcome_col: str) -> tuple[str, str, str, str]:
-    """Return total-CI, CI100, ratio, and ratio-% columns for an outcome."""
-    if outcome_col == "avg_bat_speed":
-        return (
-            "bat_avg_ci",
-            "bat_avg_ci100",
-            "bat_avg_ci100_ratio",
-            "bat_avg_ci100_ratio_pct",
-        )
+    """Season models use the same ForceDecks predictors for both outcomes."""
     return "avg_ci", "avg_ci100", "avg_ci100_ratio", "avg_ci100_ratio_pct"
 
 
@@ -9434,11 +9473,9 @@ def ci100_hitting_model_rows(
     outcome_col: str,
     outcome_label: str,
 ) -> tuple[pd.DataFrame, dict[str, dict | None]]:
-    """Fit CI100 models, with Bat Speed anchored to the overview's exact cohort.
+    """Fit season cross-sectional CI100 models on one hitter-level row each.
 
-    For Bat Speed, the displayed CI-only model uses every hitter in the standalone
-    Bat Speed overview. Incremental CI100 statistics still use a matched complete-
-    case CI-only model internally, so nested-model comparisons remain valid.
+    All incremental comparisons use the exact same complete-case sample.
     """
     ci_col, ci100_col, ratio_col, _ = _ci100_predictor_columns(outcome_col)
 
@@ -9449,11 +9486,7 @@ def ci100_hitting_model_rows(
     matched_ci_only = fit_hitting_cross_sectional_model(
         complete, outcome_col, [ci_col]
     )
-    reference_ci_only = (
-        fit_hitting_cross_sectional_model(panel, outcome_col, [ci_col])
-        if outcome_col == "avg_bat_speed"
-        else matched_ci_only
-    )
+    reference_ci_only = matched_ci_only
 
     models = {
         "CI only": reference_ci_only,
@@ -9646,12 +9679,14 @@ def build_ci100_ratio_scatter(
 def render_ci100_hitting_models_tab(
     panel: pd.DataFrame,
     ci100_available: bool,
+    hitting_season_available: bool,
+    team_filter: str,
 ) -> None:
     st.caption(
-        "Bat Speed now exactly follows the standalone Bat Speed overview: each hitter's latest "
-        "qualifying month supplies that month's Jump Data average CI and PP_Sprint monthly bat speed; "
-        "CI100 is added only from ForceDecks tests in that same month. P90 EV keeps the selected-window "
-        "CI100 summary and current Nats Hitting snapshot. Associations are descriptive, not causal."
+        "2026 regular-season cross-sectional analysis. Each hitter contributes one row: "
+        "full-season-to-date mean Total CI and CI100 from the same ForceDecks tests, matched by "
+        "MLBAM ID to regular-season mean bat speed and regular-season P90 exit velocity. "
+        "The global dashboard date slider does not alter this tab. Associations are descriptive, not causal."
     )
 
     if not ci100_available:
@@ -9660,9 +9695,59 @@ def render_ci100_hitting_models_tab(
             "`python3 ~/Downloads/sync_ci100_to_separate_workbook.py --write`, then refresh the app."
         )
         return
-    if panel is None or panel.empty:
-        st.info("No CI100 hitters match the current dashboard filters.")
+    if not hitting_season_available:
+        st.warning(
+            "The 'Hitting Season' tab is missing or empty. Run "
+            "`python3 ~/Downloads/sync_ci100_hitting_regular_season_v4.py --write`, then refresh the app."
+        )
         return
+    if panel is None or panel.empty:
+        st.info("No season CI100 hitters match the current team filter.")
+        return
+
+    filter_cols = st.columns(3)
+    with filter_cols[0]:
+        min_fd_dates = st.number_input(
+            "Minimum ForceDecks test dates",
+            min_value=1,
+            value=1,
+            step=1,
+            key="ci100_season_min_fd_dates",
+        )
+    with filter_cols[1]:
+        min_bat_obs = st.number_input(
+            "Minimum bat-speed observations",
+            min_value=1,
+            value=1,
+            step=1,
+            key="ci100_season_min_bat_obs",
+        )
+    with filter_cols[2]:
+        min_tracked_bip = st.number_input(
+            "Minimum tracked BIP",
+            min_value=1,
+            value=1,
+            step=1,
+            key="ci100_season_min_bip",
+        )
+
+    base_panel = panel[
+        pd.to_numeric(panel["ci100_test_dates"], errors="coerce").ge(int(min_fd_dates))
+    ].copy()
+
+    if base_panel.empty:
+        st.info("No hitters meet the current ForceDecks test-date minimum.")
+        return
+
+    season_text = "2026"
+    season_values = pd.to_numeric(base_panel.get("season"), errors="coerce").dropna()
+    if not season_values.empty:
+        season_text = str(int(season_values.max()))
+
+    st.caption(
+        f"Season: {season_text} · Current team filter: {team_filter} · "
+        "Observation filters are applied only in this analysis; they do not remove rows from the Google Sheet."
+    )
 
     outcome_specs = [
         ("Bat Speed", "avg_bat_speed", "Bat Speed", "mph"),
@@ -9672,9 +9757,23 @@ def render_ci100_hitting_models_tab(
 
     for sub_tab, (tab_name, outcome_col, outcome_label, unit) in zip(sub_tabs, outcome_specs):
         with sub_tab:
-            model_table, models = ci100_hitting_model_rows(panel, outcome_col, outcome_label)
+            outcome_panel = base_panel.copy()
+            if outcome_col == "avg_bat_speed":
+                outcome_panel = outcome_panel[
+                    pd.to_numeric(outcome_panel["bat_speed_observations"], errors="coerce")
+                    .ge(int(min_bat_obs))
+                ].copy()
+            else:
+                outcome_panel = outcome_panel[
+                    pd.to_numeric(outcome_panel["tracked_bip"], errors="coerce")
+                    .ge(int(min_tracked_bip))
+                ].copy()
+
+            model_table, models = ci100_hitting_model_rows(
+                outcome_panel, outcome_col, outcome_label
+            )
             if model_table.empty:
-                st.info(f"Not enough complete cases for {outcome_label}.")
+                st.info(f"Not enough complete cases for {outcome_label} with the current observation filters.")
                 continue
 
             ci_only = models.get("CI only")
@@ -9727,102 +9826,110 @@ def render_ci100_hitting_models_tab(
                     },
                 )
                 st.caption(
-                    "For Bat Speed, the displayed CI-only row/card uses the exact standalone Bat Speed overview cohort. "
-                    "Incremental R² still compares against a hidden matched CI-only model using the same CI100 complete cases, "
-                    "so the nested-model comparison remains valid. CI100 for Bat Speed is summarized within that hitter's exact "
-                    "overview month; P90 EV continues to use selected-window means."
+                    "CI-only, CI + CI100, ratio-only, and CI + ratio models are all fit on the same "
+                    "complete-case hitter sample within this outcome/filter combination. Incremental R² and "
+                    "partial r therefore compare properly nested models."
                 )
 
             show_names = st.checkbox(
                 "Show hitter names on CI100 model charts",
                 value=False,
-                key=f"ci100_show_names_{outcome_col}",
+                key=f"ci100_season_show_names_{outcome_col}",
             )
             chart_left, chart_right = st.columns(2)
             with chart_left:
                 st.plotly_chart(
                     build_ci100_observed_predicted_chart(
-                        ci_ci100, outcome_label, unit, "Total CI + CI100", show_names
+                        ci_ci100, outcome_label, unit, "Season Total CI + CI100", show_names
                     ),
                     use_container_width=True,
                     config={"displayModeBar": False},
-                    key=f"ci100_pred_{outcome_col}_{show_names}",
+                    key=f"ci100_season_pred_{outcome_col}_{show_names}",
                 )
             with chart_right:
                 st.plotly_chart(
                     build_ci100_observed_predicted_chart(
-                        ci_ratio, outcome_label, unit, "Total CI + CI100/CI Ratio", show_names
+                        ci_ratio, outcome_label, unit, "Season Total CI + CI100/CI Ratio", show_names
                     ),
                     use_container_width=True,
                     config={"displayModeBar": False},
-                    key=f"ci100_ratio_pred_{outcome_col}_{show_names}",
+                    key=f"ci100_season_ratio_pred_{outcome_col}_{show_names}",
                 )
 
             with st.container(border=True):
-                st.subheader("CI100 / Total CI Ratio", anchor=False)
+                st.subheader("Season CI100 / Total CI Ratio", anchor=False)
                 st.plotly_chart(
                     build_ci100_ratio_scatter(
-                        panel, outcome_col, outcome_label, unit, show_names
+                        outcome_panel, outcome_col, outcome_label, unit, show_names
                     ),
                     use_container_width=True,
                     config={"displayModeBar": False},
-                    key=f"ci100_ratio_scatter_{outcome_col}_{show_names}",
+                    key=f"ci100_season_ratio_scatter_{outcome_col}_{show_names}",
                 )
 
             with st.container(border=True):
                 st.subheader("Hitter Results", anchor=False)
+                display_cols = [
+                    "athlete", "team", "avg_ci", "avg_ci100", "avg_ci100_ratio_pct",
+                    "ci100_test_dates", "first_ci100_date", "last_ci100_date", outcome_col,
+                ]
+                rename = {
+                    "athlete": "Hitter",
+                    "team": "Team",
+                    "avg_ci": "Season Average Total CI",
+                    "avg_ci100": "Season Average CI100",
+                    "avg_ci100_ratio_pct": "CI100 / Total CI (%)",
+                    "ci100_test_dates": "ForceDecks Test Dates",
+                    "first_ci100_date": "First ForceDecks Test",
+                    "last_ci100_date": "Last ForceDecks Test",
+                    "avg_bat_speed": "Season Avg Bat Speed",
+                    "p90_exit_velo": "Regular-Season P90 Exit Velo",
+                }
                 if outcome_col == "avg_bat_speed":
-                    display_cols = [
-                        "athlete", "team", "bat_month", "bat_avg_ci", "bat_avg_ci100",
-                        "bat_avg_ci100_ratio_pct", "bat_ci100_test_dates",
-                        "bat_first_ci100_date", "bat_last_ci100_date", "avg_bat_speed",
+                    display_cols += [
+                        "bat_speed_observations", "first_bat_speed_date", "last_bat_speed_date"
                     ]
-                    rename = {
-                        "athlete": "Hitter", "team": "Team", "bat_month": "Month",
-                        "bat_avg_ci": "Monthly Average CI", "bat_avg_ci100": "Monthly Average CI100",
-                        "bat_avg_ci100_ratio_pct": "CI100 / Total CI (%)",
-                        "bat_ci100_test_dates": "ForceDecks Test Dates",
-                        "bat_first_ci100_date": "First Test", "bat_last_ci100_date": "Last Test",
-                        "avg_bat_speed": "Monthly Avg Bat Speed",
-                    }
+                    rename.update({
+                        "bat_speed_observations": "Bat Speed Observations",
+                        "first_bat_speed_date": "First Bat Speed Date",
+                        "last_bat_speed_date": "Last Bat Speed Date",
+                    })
                 else:
-                    display_cols = [
-                        "athlete", "team", "avg_ci", "avg_ci100", "avg_ci100_ratio_pct",
-                        "ci100_test_dates", "first_ci100_date", "last_ci100_date", outcome_col,
-                    ]
-                    rename = {
-                        "athlete": "Hitter", "team": "Team", "avg_ci": "Average Total CI",
-                        "avg_ci100": "Average CI100", "avg_ci100_ratio_pct": "CI100 / Total CI (%)",
-                        "ci100_test_dates": "ForceDecks Test Dates", "first_ci100_date": "First Test",
-                        "last_ci100_date": "Last Test", "p90_exit_velo": "P90 Exit Velo",
-                    }
-                display = panel[display_cols].dropna(subset=[outcome_col]).copy()
+                    display_cols += ["tracked_bip", "p90_updated_at"]
+                    rename.update({
+                        "tracked_bip": "Tracked BIP",
+                        "p90_updated_at": "P90 Updated At",
+                    })
+
+                display = outcome_panel[display_cols].dropna(subset=[outcome_col]).copy()
                 display = display.rename(columns=rename)
-                if "Month" in display.columns:
-                    display["Month"] = pd.to_datetime(display["Month"], errors="coerce").dt.strftime("%b %Y")
-                for date_col in ["First Test", "Last Test"]:
+                for date_col in [
+                    "First ForceDecks Test", "Last ForceDecks Test",
+                    "First Bat Speed Date", "Last Bat Speed Date", "P90 Updated At",
+                ]:
                     if date_col in display.columns:
                         display[date_col] = display[date_col].map(fmt_date)
+
                 st.dataframe(
                     display,
                     hide_index=True,
                     use_container_width=True,
                     height=min(660, 44 + 36 * (len(display) + 1)),
                     column_config={
-                        "Average Total CI": st.column_config.NumberColumn(format="%.2f N·s"),
-                        "Average CI100": st.column_config.NumberColumn(format="%.2f N·s"),
-                        "Monthly Average CI": st.column_config.NumberColumn(format="%.2f N·s"),
-                        "Monthly Average CI100": st.column_config.NumberColumn(format="%.2f N·s"),
+                        "Season Average Total CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                        "Season Average CI100": st.column_config.NumberColumn(format="%.2f N·s"),
                         "CI100 / Total CI (%)": st.column_config.NumberColumn(format="%.2f%%"),
-                        "Monthly Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
-                        "P90 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                        "Season Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
+                        "Regular-Season P90 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                        "Bat Speed Observations": st.column_config.NumberColumn(format="%d"),
+                        "Tracked BIP": st.column_config.NumberColumn(format="%d"),
                     },
                 )
                 csv_download_button(
                     display,
-                    f"Download {outcome_label} CI100 model CSV",
-                    f"ci100_{outcome_col}_model_results.csv",
-                    f"download_ci100_{outcome_col}_model_results",
+                    f"Download {outcome_label} season CI100 model CSV",
+                    f"ci100_{outcome_col}_season_model_results.csv",
+                    f"download_ci100_{outcome_col}_season_model_results",
                 )
 
 
@@ -9844,7 +9951,7 @@ if app_view == "S&C Influenced Performance Rankings":
 
 try:
     (
-        jump, jump_power, velo, bat, pinch, sprint, exit_velo, ci100,
+        jump, jump_power, velo, bat, pinch, sprint, exit_velo, ci100, hitting_season,
         infield_defense, baserunning_defense, all_baserunning_defense, status,
     ) = load_source_data()
 except Exception as exc:
@@ -10021,13 +10128,8 @@ exit_velo_summary = build_exit_velo_summary(
 ci100_hitting_panel = build_ci100_hitting_model_panel(
     ci100=ci100,
     jump=jump,
-    bat=bat,
-    exit_velo=exit_velo,
-    start_date=start_date,
-    end_date=end_date,
+    hitting_season=hitting_season,
     team_filter=team_filter,
-    min_ci_jumps=int(min_ci_jumps),
-    bat_monthly_pairs=bat_monthly_pairs,
 )
 if_reaction_power_summary = build_peak_power_rel_outcome_summary(
     jump_power=jump_power,
@@ -10140,7 +10242,7 @@ bat_projection_model = fit_simple_projection_model(
     "Sprint Speed Overview",
     "Bat Speed Overview",
     "P90 Exit Velo Overview",
-    "CI + CI100 Hitting Models",
+    "CI + CI100 Season Hitting Models",
     "Rel PP × IF Reaction 3ft",
     "Rel PP × nBSR",
     "Sprint Speed × nBSR",
@@ -13032,6 +13134,8 @@ with ci100_hitting_models_tab:
     render_ci100_hitting_models_tab(
         ci100_hitting_panel,
         ci100_available=(ci100 is not None and not ci100.empty),
+        hitting_season_available=(hitting_season is not None and not hitting_season.empty),
+        team_filter=team_filter,
     )
 
 
