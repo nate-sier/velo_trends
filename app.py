@@ -1,3 +1,4 @@
+# Added CI + CI100 -> Bat Speed calculator to season hitting models.
 # Standalone P90 EV overview converted to 2026 regular-season cross-sectional analysis.
 # Standalone Bat Speed overview converted to 2026 regular-season cross-sectional analysis.
 """
@@ -10607,6 +10608,119 @@ def render_ci100_hitting_models_tab(
             for col, values in zip(bottom, bottom_values):
                 with col:
                     st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+            if outcome_col == "avg_bat_speed" and ci_ci100 is not None:
+                with st.container(border=True):
+                    st.subheader("CI + CI100 Bat Speed Calculator", anchor=False)
+                    st.caption(
+                        "Uses the fitted 2026 cross-sectional CI + CI100 model. "
+                        "Enter season-average Total CI and CI100 to estimate regular-season average bat speed. "
+                        "This is a model estimate, not a causal prediction of what will happen if a player changes CI."
+                    )
+
+                    calc_data = ci_ci100["data"].copy()
+                    calc_ci_default = float(calc_data["avg_ci"].median())
+                    calc_ci100_default = float(calc_data["avg_ci100"].median())
+
+                    calc_left, calc_right = st.columns(2)
+                    with calc_left:
+                        calc_ci = st.number_input(
+                            "Season Average Total CI (N·s)",
+                            min_value=0.0,
+                            value=round(calc_ci_default, 1),
+                            step=1.0,
+                            format="%.1f",
+                            key="ci100_bat_calc_total_ci",
+                        )
+                    with calc_right:
+                        calc_ci100 = st.number_input(
+                            "Season Average CI100 (N·s)",
+                            min_value=0.0,
+                            value=round(calc_ci100_default, 1),
+                            step=0.5,
+                            format="%.1f",
+                            key="ci100_bat_calc_ci100",
+                        )
+
+                    combined_coef = np.asarray(ci_ci100["coef"], dtype=float)
+                    predicted_bat_speed = float(
+                        combined_coef[0]
+                        + combined_coef[1] * float(calc_ci)
+                        + combined_coef[2] * float(calc_ci100)
+                    )
+
+                    calc_ratio_pct = (
+                        100.0 * float(calc_ci100) / float(calc_ci)
+                        if float(calc_ci) > 0 else np.nan
+                    )
+
+                    ci_only_pred = np.nan
+                    if ci_only is not None:
+                        ci_only_coef = np.asarray(ci_only["coef"], dtype=float)
+                        ci_only_pred = float(
+                            ci_only_coef[0] + ci_only_coef[1] * float(calc_ci)
+                        )
+
+                    combined_vs_ci_only = (
+                        predicted_bat_speed - ci_only_pred
+                        if pd.notna(ci_only_pred) else np.nan
+                    )
+
+                    calc_cards = st.columns(3)
+                    calc_values = [
+                        (
+                            "Model-Estimated Bat Speed",
+                            f"{predicted_bat_speed:.2f} mph",
+                            TEAL,
+                        ),
+                        (
+                            "CI100 / Total CI",
+                            f"{calc_ratio_pct:.1f}%"
+                            if pd.notna(calc_ratio_pct) else "—",
+                            BLUE,
+                        ),
+                        (
+                            "Combined Model vs CI-Only Estimate",
+                            f"{combined_vs_ci_only:+.2f} mph"
+                            if pd.notna(combined_vs_ci_only) else "—",
+                            NAVY_MID,
+                        ),
+                    ]
+                    for calc_col, calc_value in zip(calc_cards, calc_values):
+                        with calc_col:
+                            st.markdown(
+                                metric_card(*calc_value),
+                                unsafe_allow_html=True,
+                            )
+
+                    ci_min = float(calc_data["avg_ci"].min())
+                    ci_max = float(calc_data["avg_ci"].max())
+                    ci100_min = float(calc_data["avg_ci100"].min())
+                    ci100_max = float(calc_data["avg_ci100"].max())
+
+                    extrapolation_notes = []
+                    if not (ci_min <= float(calc_ci) <= ci_max):
+                        extrapolation_notes.append(
+                            f"Total CI is outside the model sample range "
+                            f"({ci_min:.1f}–{ci_max:.1f} N·s)"
+                        )
+                    if not (ci100_min <= float(calc_ci100) <= ci100_max):
+                        extrapolation_notes.append(
+                            f"CI100 is outside the model sample range "
+                            f"({ci100_min:.1f}–{ci100_max:.1f} N·s)"
+                        )
+
+                    if extrapolation_notes:
+                        st.warning(
+                            "Extrapolation: " + "; ".join(extrapolation_notes) + "."
+                        )
+
+                    st.caption(
+                        "Model equation: Bat Speed = "
+                        f"{combined_coef[0]:.3f} "
+                        f"{combined_coef[1]:+.4f} × Total CI "
+                        f"{combined_coef[2]:+.4f} × CI100"
+                    )
 
             with st.container(border=True):
                 st.subheader("Model Comparison", anchor=False)
