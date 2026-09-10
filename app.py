@@ -1,3 +1,4 @@
+# Standalone P90 EV overview converted to 2026 regular-season cross-sectional analysis.
 # Standalone Bat Speed overview converted to 2026 regular-season cross-sectional analysis.
 """
 Performance × CI — Streamlit deployment-ready dashboard.
@@ -9777,6 +9778,390 @@ def build_season_bat_ci_band_member_chart(
     )
 
 
+
+def build_season_p90_pairs(
+    panel: pd.DataFrame,
+    min_fd_dates: int = 1,
+    min_tracked_bip: int = 1,
+) -> pd.DataFrame:
+    """Standalone regular-season P90 EV × season Total CI cross-section."""
+    columns = [
+        "player_id", "name_key", "athlete", "team", "season",
+        "avg_ci", "p90_exit_velo", "tracked_bip", "p90_updated_at",
+        "ci100_test_dates", "first_ci100_date", "last_ci100_date",
+        "observation",
+    ]
+    if panel is None or panel.empty:
+        return pd.DataFrame(columns=columns)
+
+    work = panel.copy()
+    work = work[
+        pd.to_numeric(work["ci100_test_dates"], errors="coerce")
+        .ge(max(1, int(min_fd_dates)))
+        & pd.to_numeric(work["tracked_bip"], errors="coerce")
+        .ge(max(1, int(min_tracked_bip)))
+    ].copy()
+
+    work = work.dropna(subset=["avg_ci", "p90_exit_velo"]).copy()
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+
+    work["observation"] = work["athlete"]
+    for col in columns:
+        if col not in work.columns:
+            work[col] = np.nan
+
+    return (
+        work[columns]
+        .sort_values(["athlete"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+def build_season_p90_scatter(
+    summary: pd.DataFrame,
+    show_labels: bool,
+    ci_lookup: float | None,
+) -> go.Figure:
+    fig = go.Figure()
+    if summary is None or summary.empty:
+        fig.add_annotation(
+            text="No matched hitters meet the season observation rules.",
+            showarrow=False,
+            font={"size": 15, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 560)
+
+    customdata = np.column_stack([
+        summary["athlete"],
+        summary["team"].fillna("Unassigned"),
+        summary["season"],
+        summary["tracked_bip"],
+        summary["p90_updated_at"].map(fmt_date),
+        summary["ci100_test_dates"],
+        summary["first_ci100_date"].map(fmt_date),
+        summary["last_ci100_date"].map(fmt_date),
+    ])
+
+    fig.add_trace(go.Scatter(
+        x=summary["avg_ci"],
+        y=summary["p90_exit_velo"],
+        mode="markers+text" if show_labels else "markers",
+        text=summary["athlete"] if show_labels else None,
+        textposition="top center",
+        textfont={"size": 9, "color": NAVY},
+        marker={
+            "size": 13,
+            "color": BLUE,
+            "opacity": 0.86,
+            "line": {"color": "#FFFFFF", "width": 2},
+        },
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Team: %{customdata[1]}<br>"
+            "Season: %{customdata[2]}<br>"
+            "Regular-season P90 EV: %{y:.2f} mph<br>"
+            "Season avg Total CI: %{x:.2f} N·s<br><br>"
+            "Tracked BIP: %{customdata[3]}<br>"
+            "P90 updated: %{customdata[4]}<br>"
+            "ForceDecks test dates: %{customdata[5]} · "
+            "%{customdata[6]}–%{customdata[7]}"
+            "<extra></extra>"
+        ),
+    ))
+
+    stats = exit_velo_correlation_stats(summary)
+    if stats is not None:
+        r, r2, slope, intercept = stats
+        x_range = np.linspace(
+            summary["avg_ci"].min(), summary["avg_ci"].max(), 100
+        )
+        fig.add_trace(go.Scatter(
+            x=x_range,
+            y=slope * x_range + intercept,
+            mode="lines",
+            line={"color": NAVY_MID, "width": 2.5, "dash": "dash"},
+            hoverinfo="skip",
+            showlegend=False,
+        ))
+        fig.add_annotation(
+            text=f"r = {r:+.2f} · R² = {r2:.2f} · n = {len(summary)}",
+            x=0.02, y=0.98, xref="paper", yref="paper",
+            xanchor="left", yanchor="top",
+            showarrow=False,
+            font={"color": NAVY, "size": 13},
+            bgcolor="#FFFFFF", bordercolor=BORDER,
+            borderwidth=1, borderpad=7,
+        )
+
+        if ci_lookup is not None and np.isfinite(ci_lookup):
+            predicted = slope * float(ci_lookup) + intercept
+            fig.add_vline(
+                x=float(ci_lookup),
+                line_color=TEAL,
+                line_width=1.5,
+                line_dash="dot",
+            )
+            fig.add_hline(
+                y=predicted,
+                line_color=TEAL,
+                line_width=1.5,
+                line_dash="dot",
+            )
+            fig.add_trace(go.Scatter(
+                x=[float(ci_lookup)],
+                y=[predicted],
+                mode="markers",
+                marker={
+                    "size": 15,
+                    "color": TEAL,
+                    "symbol": "diamond",
+                    "line": {"color": "#FFFFFF", "width": 2},
+                },
+                hovertemplate=(
+                    "<b>CI lookup</b><br>"
+                    "Season avg Total CI: %{x:.1f} N·s<br>"
+                    "Estimated regular-season P90 EV: %{y:.2f} mph"
+                    "<extra></extra>"
+                ),
+                showlegend=False,
+            ))
+
+    fig.update_xaxes(
+        title="Season average Total CI (N·s)",
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Regular-season P90 exit velocity (mph)",
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 560)
+
+
+def build_season_p90_band_chart(
+    summary: pd.DataFrame,
+    band_width: int,
+    exit_stat: str = "Mean",
+) -> go.Figure:
+    stat = "Median" if str(exit_stat).strip().lower() == "median" else "Mean"
+    velo_col = f"{stat} P90 Exit Velo"
+    bands = exit_velo_ci_band_summary(summary, band_width, stat)
+
+    fig = go.Figure()
+    if bands.empty:
+        fig.add_annotation(
+            text="No matched hitters are available for season CI bands.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 380)
+
+    fig.add_trace(go.Bar(
+        x=bands["CI band"],
+        y=bands[velo_col],
+        marker={"color": BLUE, "line": {"color": NAVY_MID, "width": 0.8}},
+        text=[f"{value:.1f}" for value in bands[velo_col]],
+        textposition="outside",
+        cliponaxis=False,
+        customdata=np.column_stack([bands["Hitters"], bands["Average CI"]]),
+        hovertemplate=(
+            f"<b>%{{x}}</b><br>{stat} regular-season P90 EV: "
+            "%{y:.2f} mph<br>Hitters: %{customdata[0]}<br>"
+            "Mean season CI within band: %{customdata[1]:.2f} N·s"
+            "<extra></extra>"
+        ),
+    ))
+
+    y_min = max(0, float(bands[velo_col].min()) - 2.0)
+    y_max = float(bands[velo_col].max()) + 1.5
+
+    fig.update_xaxes(
+        title="Season average Total CI band",
+        showgrid=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title=f"{stat} regular-season P90 exit velocity (mph)",
+        range=[y_min, y_max],
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 380)
+
+
+def season_p90_ci_band_members(
+    summary: pd.DataFrame,
+    band_width: int,
+    ci_band: str,
+    exit_stat: str = "Mean",
+) -> tuple[pd.DataFrame, float, str]:
+    stat = "Median" if str(exit_stat).strip().lower() == "median" else "Mean"
+    width = max(1, int(band_width))
+    cols = [
+        "athlete", "team", "season", "avg_ci", "p90_exit_velo",
+        "tracked_bip", "ci100_test_dates",
+    ]
+
+    if summary is None or summary.empty or any(c not in summary.columns for c in cols):
+        return (
+            pd.DataFrame(columns=cols + ["CI band", "Status", "Difference"]),
+            np.nan,
+            stat,
+        )
+
+    detail = summary[cols].dropna(
+        subset=["avg_ci", "p90_exit_velo"]
+    ).copy()
+    detail["band_start"] = hitting_ci_bucket_start(detail["avg_ci"], width)
+    detail["CI band"] = detail["band_start"].map(
+        lambda lower: hitting_ci_bucket_label(lower, width)
+    )
+    detail = detail[detail["CI band"] == ci_band].copy()
+
+    if detail.empty:
+        return detail, np.nan, stat
+
+    reference = (
+        float(detail["p90_exit_velo"].median())
+        if stat == "Median"
+        else float(detail["p90_exit_velo"].mean())
+    )
+    detail["Difference"] = detail["p90_exit_velo"] - reference
+    detail["Status"] = np.where(
+        np.isclose(detail["Difference"], 0, atol=1e-10),
+        f"At {stat.lower()}",
+        np.where(
+            detail["Difference"] > 0,
+            f"Above {stat.lower()}",
+            f"Below {stat.lower()}",
+        ),
+    )
+    detail["Display"] = detail.apply(
+        lambda row: f"{row['athlete']} · {row['avg_ci']:.1f} CI",
+        axis=1,
+    )
+
+    return (
+        detail.sort_values("p90_exit_velo", ascending=False).reset_index(drop=True),
+        reference,
+        stat,
+    )
+
+
+def build_season_p90_ci_band_member_chart(
+    summary: pd.DataFrame,
+    band_width: int,
+    ci_band: str,
+    exit_stat: str = "Mean",
+) -> go.Figure:
+    detail, reference, stat = season_p90_ci_band_members(
+        summary, band_width, ci_band, exit_stat
+    )
+
+    fig = go.Figure()
+    if detail.empty:
+        fig.add_annotation(
+            text="No hitters are available in this season CI band.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 340)
+
+    status_style = [
+        (f"Above {stat.lower()}", GREEN),
+        (f"At {stat.lower()}", TEAL),
+        (f"Below {stat.lower()}", ACCENT_RED),
+    ]
+    category_order = detail["Display"].tolist()
+
+    for status, color in status_style:
+        sub = detail[detail["Status"] == status].copy()
+        if sub.empty:
+            continue
+
+        customdata = np.column_stack([
+            sub["athlete"],
+            sub["team"].fillna("Unassigned"),
+            sub["season"],
+            sub["avg_ci"],
+            sub["Difference"],
+            sub["Status"],
+            sub["tracked_bip"],
+            sub["ci100_test_dates"],
+        ])
+
+        fig.add_trace(go.Bar(
+            x=sub["p90_exit_velo"],
+            y=sub["Display"],
+            orientation="h",
+            name=status.title(),
+            marker={"color": color, "line": {"color": "#FFFFFF", "width": 1}},
+            text=[f"{value:.2f}" for value in sub["p90_exit_velo"]],
+            textposition="outside",
+            cliponaxis=False,
+            customdata=customdata,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Team: %{customdata[1]}<br>"
+                "Season: %{customdata[2]}<br>"
+                "Season avg Total CI: %{customdata[3]:.2f} N·s<br>"
+                "Regular-season P90 EV: %{x:.2f} mph<br>"
+                f"{stat} difference: %{{customdata[4]:+.2f}} mph<br>"
+                "Tracked BIP: %{customdata[6]}<br>"
+                "ForceDecks test dates: %{customdata[7]}<br>"
+                "Flag: %{customdata[5]}<extra></extra>"
+            ),
+        ))
+
+    fig.add_vline(
+        x=reference,
+        line_color=NAVY_MID,
+        line_width=2,
+        line_dash="dash",
+        annotation_text=f"{stat} {reference:.2f}",
+        annotation_font_color=NAVY_MID,
+        annotation_position="top right",
+    )
+    fig.update_xaxes(
+        title="Regular-season P90 exit velocity (mph)",
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Hitter · Season average Total CI",
+        categoryorder="array",
+        categoryarray=category_order,
+        autorange="reversed",
+        showgrid=False,
+        linecolor=BORDER,
+        tickfont={"color": TEXT, "size": 12},
+        title_font={"color": SUBTEXT},
+        automargin=True,
+    )
+    fig = base_figure_layout(fig, max(340, len(detail) * 42 + 125))
+    fig.update_layout(
+        showlegend=True,
+        legend={
+            "orientation": "h", "x": 0, "y": 1.14,
+            "font": {"color": SUBTEXT},
+        },
+        margin={"l": 210, "r": 70, "t": 50, "b": 58},
+    )
+    return fig
+
+
 def fit_hitting_cross_sectional_model(
     frame: pd.DataFrame,
     outcome_col: str,
@@ -10658,7 +11043,7 @@ bat_projection_model = fit_simple_projection_model(
     "BW + CI Projections",
     "Sprint Speed Overview",
     "Season Bat Speed Overview",
-    "P90 Exit Velo Overview",
+    "Season P90 Exit Velo Overview",
     "CI + CI100 Season Hitting Models",
     "Rel PP × IF Reaction 3ft",
     "Rel PP × nBSR",
@@ -13299,302 +13684,382 @@ with bat_overview_tab:
                 )
 
 with exit_velo_overview_tab:
-    exit_stats = exit_velo_correlation_stats(exit_velo_summary)
-    n_exit_hitters = len(exit_velo_summary)
-    mean_exit_velo = (
-        exit_velo_summary["p90_exit_velo"].mean()
-        if n_exit_hitters else np.nan
-    )
-    mean_yearly_ci = (
-        exit_velo_summary["avg_ci"].mean()
-        if n_exit_hitters else np.nan
-    )
-    exit_r_text = (
-        f"{exit_stats[0]:+.2f}" if exit_stats is not None else "—"
-    )
-    exit_r2_text = (
-        f"{exit_stats[1]:.2f}" if exit_stats is not None else "—"
-    )
-    potential_exit_increase = (
-        exit_stats[2] * POTENTIAL_CI_INCREASE
-        if exit_stats is not None else np.nan
-    )
-    potential_exit_text = (
-        f"{potential_exit_increase:+.2f} mph"
-        if pd.notna(potential_exit_increase) else "—"
+    st.caption(
+        "2026 regular-season cross-sectional analysis. Each hitter contributes one row: "
+        "season-to-date mean Total CI from the same ForceDecks tests used by the CI100 models, "
+        "matched by MLBAM ID to regular-season P90 exit velocity from the Hitting Season tab. "
+        "The global dashboard date slider does not alter this tab."
     )
 
-    top_cols = st.columns(3)
-    for column, values in zip(top_cols, [
-        ("Hitters", str(n_exit_hitters), BLUE),
-        ("Correlation", exit_r_text, ACCENT_RED),
-        ("R²", exit_r2_text, NAVY_MID),
-    ]):
-        with column:
-            st.markdown(metric_card(*values), unsafe_allow_html=True)
+    if hitting_season is None or hitting_season.empty:
+        st.warning(
+            "The 'Hitting Season' tab is missing or empty. Run "
+            "`python3 ~/Downloads/sync_ci100_hitting_regular_season_v4.py --write`, then refresh the app."
+        )
+    elif ci100_hitting_panel is None or ci100_hitting_panel.empty:
+        st.info("No season CI × P90 Exit Velo hitters match the current team filter.")
+    else:
+        filter_cols = st.columns(2)
+        with filter_cols[0]:
+            p90_season_min_fd_dates = st.number_input(
+                "Minimum ForceDecks test dates",
+                min_value=1,
+                value=1,
+                step=1,
+                key="p90_season_min_fd_dates",
+            )
+        with filter_cols[1]:
+            p90_season_min_bip = st.number_input(
+                "Minimum tracked BIP",
+                min_value=1,
+                value=1,
+                step=1,
+                key="p90_season_min_bip",
+            )
 
-    bottom_cols = st.columns(3)
-    for column, values in zip(bottom_cols, [
-        (
-            "P90 Exit Velo",
-            f"{fmt(mean_exit_velo)} mph",
-            TEAL,
-        ),
-        (
-            "Year-to-Date Average CI",
-            f"{fmt(mean_yearly_ci)} N·s",
-            GREEN,
-        ),
-        (
-            f"Potential Exit Velo Increase · +{POTENTIAL_CI_INCREASE:.0f} N·s CI",
-            potential_exit_text,
-            NAVY_MID,
-        ),
-    ]):
-        with column:
-            st.markdown(metric_card(*values), unsafe_allow_html=True)
-
-    estimated_exit_velo = (
-        exit_stats[2] * float(exit_ci_lookup) + exit_stats[3]
-        if exit_stats is not None else np.nan
-    )
-    with st.container(border=True):
-        st.subheader("Year-to-Date CI Lookup", anchor=False)
-        lookup_left, lookup_right = st.columns(2)
-        with lookup_left:
-            st.markdown(
-                "<div class='metric-label'>Year-to-Date Average CI</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"<div class='lookup-value' style='color:#0A1F44;'>"
-                f"{fmt(exit_ci_lookup, 1)} N·s</div>",
-                unsafe_allow_html=True,
-            )
-        with lookup_right:
-            st.markdown(
-                "<div class='metric-label'>Estimated P90 Exit Velo</div>",
-                unsafe_allow_html=True,
-            )
-            lookup_value = (
-                f"{fmt(estimated_exit_velo)} mph"
-                if pd.notna(estimated_exit_velo) else "—"
-            )
-            st.markdown(
-                f"<div class='lookup-value' style='color:#0D7E8A;'>"
-                f"{lookup_value}</div>",
-                unsafe_allow_html=True,
-            )
-        st.number_input(
-            "CI lookup", min_value=0.0, step=1.0, value=280.0,
-            format="%.1f", key="exit_ci_lookup",
+        p90_season_pairs = build_season_p90_pairs(
+            ci100_hitting_panel,
+            min_fd_dates=int(p90_season_min_fd_dates),
+            min_tracked_bip=int(p90_season_min_bip),
         )
 
-    with st.container(border=True):
-        st.subheader(
-            f"{exit_ci_band_stat} P90 Exit Velo by CI Band",
-            anchor=False,
+        exit_stats = exit_velo_correlation_stats(p90_season_pairs)
+        n_exit_hitters = len(p90_season_pairs)
+        mean_exit_velo = (
+            p90_season_pairs["p90_exit_velo"].mean()
+            if n_exit_hitters else np.nan
         )
-        st.plotly_chart(
-            build_exit_velo_band_chart(
-                exit_velo_summary,
-                int(exit_ci_band_width),
-                exit_ci_band_stat,
+        mean_season_ci = (
+            p90_season_pairs["avg_ci"].mean()
+            if n_exit_hitters else np.nan
+        )
+        exit_r_text = (
+            f"{exit_stats[0]:+.2f}" if exit_stats is not None else "—"
+        )
+        exit_r2_text = (
+            f"{exit_stats[1]:.2f}" if exit_stats is not None else "—"
+        )
+        potential_exit_increase = (
+            exit_stats[2] * POTENTIAL_CI_INCREASE
+            if exit_stats is not None else np.nan
+        )
+        potential_exit_text = (
+            f"{potential_exit_increase:+.2f} mph"
+            if pd.notna(potential_exit_increase) else "—"
+        )
+
+        season_values = pd.to_numeric(
+            p90_season_pairs.get("season"), errors="coerce"
+        ).dropna()
+        season_text = (
+            str(int(season_values.max()))
+            if not season_values.empty else "2026"
+        )
+        st.caption(
+            f"Season: {season_text} · Current team filter: {team_filter} · "
+            "Observation minimums apply only to this tab."
+        )
+
+        top_cols = st.columns(3)
+        for column, values in zip(top_cols, [
+            ("Hitters", str(n_exit_hitters), BLUE),
+            ("Correlation", exit_r_text, ACCENT_RED),
+            ("R²", exit_r2_text, NAVY_MID),
+        ]):
+            with column:
+                st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+        bottom_cols = st.columns(3)
+        for column, values in zip(bottom_cols, [
+            (
+                "Regular-Season P90 Exit Velo",
+                f"{fmt(mean_exit_velo)} mph",
+                TEAL,
             ),
-            use_container_width=True,
-            config={"displayModeBar": False},
-            key=(
-                f"exit_ci_band_{exit_ci_band_width}_{exit_ci_band_stat}_"
-                f"{team_filter}_{start_date}_{end_date}"
+            (
+                "Season Average Total CI",
+                f"{fmt(mean_season_ci)} N·s",
+                GREEN,
             ),
-        )
-        exit_band_control_1, exit_band_control_2 = st.columns(2)
-        with exit_band_control_1:
-            st.selectbox(
-                "CI band width", [5, 10, 15, 20], index=1,
-                format_func=lambda x: f"{x} N·s", key="exit_ci_band_width",
-            )
-        with exit_band_control_2:
-            st.radio(
-                "P90 exit velo statistic", ["Mean", "Median"], horizontal=True,
-                key="exit_ci_band_stat",
-            )
-
-
-    with st.container(border=True):
-        st.subheader("Average CI by P90 Exit Velo Bucket", anchor=False)
-        st.plotly_chart(
-            build_output_bucket_chart(
-                df=exit_velo_summary,
-                output_col="p90_exit_velo",
-                testing_col="avg_ci",
-                bucket_width=EXIT_VELO_OUTPUT_BUCKET_WIDTH,
-                output_bucket_label="P90 exit velo bucket",
-                testing_metric_label="CI",
-                output_axis_title="P90 exit velo bucket",
-                testing_axis_title="Average CI (N·s)",
-                output_unit="mph",
-                empty_text="No matched hitters are available for P90 exit-velo buckets.",
-                color=TEAL,
+            (
+                f"Estimated P90 EV Difference · +{POTENTIAL_CI_INCREASE:.0f} N·s CI",
+                potential_exit_text,
+                NAVY_MID,
             ),
-            use_container_width=True,
-            config={"displayModeBar": False},
-            key=f"exit_output_bucket_{team_filter}_{start_date}_{end_date}",
+        ]):
+            with column:
+                st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+        estimated_exit_velo = (
+            exit_stats[2] * float(exit_ci_lookup) + exit_stats[3]
+            if exit_stats is not None else np.nan
         )
-
-
-    exit_output_bands = output_bucket_summary(
-        exit_velo_summary,
-        "p90_exit_velo",
-        "avg_ci",
-        EXIT_VELO_OUTPUT_BUCKET_WIDTH,
-        "P90 exit velo bucket",
-        "CI",
-        "mph",
-        "N·s",
-    )
-    if not exit_output_bands.empty:
-        exit_output_options = exit_output_bands["P90 exit velo bucket"].tolist()
-        exit_output_key = "exit_output_bucket_detail_selector"
-        if st.session_state.get(exit_output_key) not in exit_output_options:
-            st.session_state[exit_output_key] = exit_output_options[0]
-        with st.container(border=True):
-            st.subheader("P90 Exit Velo Bucket Hitters", anchor=False)
-            selected_exit_output_bucket = st.selectbox(
-                "P90 exit velo bucket",
-                exit_output_options,
-                key=exit_output_key,
-            )
-            st.plotly_chart(
-                build_output_bucket_member_chart(
-                    df=exit_velo_summary,
-                    output_col="p90_exit_velo",
-                    testing_col="avg_ci",
-                    bucket_width=EXIT_VELO_OUTPUT_BUCKET_WIDTH,
-                    selected_bucket=selected_exit_output_bucket,
-                    output_bucket_label="P90 exit velo bucket",
-                    output_unit="mph",
-                    testing_axis_title="Year-to-date average CI",
-                    testing_unit="N·s",
-                    entity_label="Hitter",
-                    output_value_label="P90 exit velo",
-                ),
-                use_container_width=True,
-                config={"displayModeBar": False},
-                key=f"exit_output_detail_{selected_exit_output_bucket}_{team_filter}_{start_date}_{end_date}",
-            )
-
-    exit_band_overview = exit_velo_ci_band_summary(
-        exit_velo_summary,
-        int(exit_ci_band_width),
-        exit_ci_band_stat,
-    )
-    if not exit_band_overview.empty:
-        exit_band_options = exit_band_overview["CI band"].tolist()
-        exit_band_detail_key = "exit_ci_band_detail_selector"
-        if st.session_state.get(exit_band_detail_key) not in exit_band_options:
-            st.session_state[exit_band_detail_key] = exit_band_options[0]
 
         with st.container(border=True):
-            st.subheader("CI Band Hitters", anchor=False)
-            selected_exit_ci_band = st.selectbox(
-                "Exit-velocity CI band",
-                exit_band_options,
-                key=exit_band_detail_key,
+            st.subheader("Season CI Lookup", anchor=False)
+            lookup_left, lookup_right = st.columns(2)
+            with lookup_left:
+                st.markdown(
+                    "<div class='metric-label'>Season Average Total CI</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f"<div class='lookup-value' style='color:#0A1F44;'>"
+                    f"{fmt(exit_ci_lookup, 1)} N·s</div>",
+                    unsafe_allow_html=True,
+                )
+            with lookup_right:
+                st.markdown(
+                    "<div class='metric-label'>Estimated Regular-Season P90 Exit Velo</div>",
+                    unsafe_allow_html=True,
+                )
+                lookup_value = (
+                    f"{fmt(estimated_exit_velo)} mph"
+                    if pd.notna(estimated_exit_velo) else "—"
+                )
+                st.markdown(
+                    f"<div class='lookup-value' style='color:#0D7E8A;'>"
+                    f"{lookup_value}</div>",
+                    unsafe_allow_html=True,
+                )
+
+            st.number_input(
+                "CI lookup",
+                min_value=0.0,
+                step=1.0,
+                value=280.0,
+                format="%.1f",
+                key="exit_ci_lookup",
+            )
+
+        with st.container(border=True):
+            st.subheader(
+                f"{exit_ci_band_stat} Regular-Season P90 Exit Velo by Season CI Band",
+                anchor=False,
             )
             st.plotly_chart(
-                build_exit_velo_ci_band_member_chart(
-                    exit_velo_summary,
+                build_season_p90_band_chart(
+                    p90_season_pairs,
                     int(exit_ci_band_width),
-                    selected_exit_ci_band,
                     exit_ci_band_stat,
                 ),
                 use_container_width=True,
                 config={"displayModeBar": False},
                 key=(
-                    f"exit_ci_band_detail_{selected_exit_ci_band}_"
-                    f"{exit_ci_band_width}_{exit_ci_band_stat}_{team_filter}_"
-                    f"{start_date}_{end_date}"
+                    f"season_p90_ci_band_{exit_ci_band_width}_{exit_ci_band_stat}_"
+                    f"{team_filter}_{p90_season_min_fd_dates}_{p90_season_min_bip}"
                 ),
             )
 
-    with st.container(border=True):
-        st.subheader(
-            "Year-to-Date Average CI vs P90 Exit Velo",
-            anchor=False,
-        )
-        st.plotly_chart(
-            build_exit_velo_scatter(
-                exit_velo_summary,
-                exit_show_labels,
-                float(exit_ci_lookup),
-            ),
-            use_container_width=True,
-            config={"displayModeBar": False},
-            key=(
-                f"exit_scatter_{team_filter}_{start_date}_{end_date}_"
-                f"{exit_show_labels}_{exit_ci_lookup}"
-            ),
-        )
-        st.checkbox("Show names", key="exit_show_labels")
+            exit_band_control_1, exit_band_control_2 = st.columns(2)
+            with exit_band_control_1:
+                st.selectbox(
+                    "CI band width",
+                    [5, 10, 15, 20],
+                    index=1,
+                    format_func=lambda x: f"{x} N·s",
+                    key="exit_ci_band_width",
+                )
+            with exit_band_control_2:
+                st.radio(
+                    "P90 exit velo statistic",
+                    ["Mean", "Median"],
+                    horizontal=True,
+                    key="exit_ci_band_stat",
+                )
 
-    with st.container(border=True):
-        st.subheader("Hitter Results", anchor=False)
-        if exit_velo_summary.empty:
-            st.info("No matching hitters.")
-        else:
-            exit_display = exit_velo_summary[[
-                "athlete",
-                "team",
-                "year",
-                "p90_exit_velo",
-                "exit_velo_as_of",
-                "exit_velo_records",
-                "avg_ci",
-                "ci_jumps",
-                "ci_test_dates",
-                "first_ci_date",
-                "last_ci_date",
-            ]].copy()
-            exit_display.columns = [
-                "Hitter",
-                "Team",
-                "Year",
-                "P90 Exit Velo",
-                "CI Through",
-                "Exit Velo Records",
-                "Year-to-Date Average CI",
-                "CI Jumps",
-                "CI Test Dates",
-                "First CI",
-                "Last CI",
-            ]
-            for date_col in ["CI Through", "First CI", "Last CI"]:
-                exit_display[date_col] = exit_display[date_col].map(fmt_date)
-            exit_display["P90 Exit Velo"] = (
-                exit_display["P90 Exit Velo"].round(2)
-            )
-            exit_display["Year-to-Date Average CI"] = (
-                exit_display["Year-to-Date Average CI"].round(2)
-            )
-            st.dataframe(
-                exit_display,
-                hide_index=True,
+        with st.container(border=True):
+            st.subheader("Season Average CI by P90 Exit Velo Bucket", anchor=False)
+            st.plotly_chart(
+                build_output_bucket_chart(
+                    df=p90_season_pairs,
+                    output_col="p90_exit_velo",
+                    testing_col="avg_ci",
+                    bucket_width=EXIT_VELO_OUTPUT_BUCKET_WIDTH,
+                    output_bucket_label="P90 exit velo bucket",
+                    testing_metric_label="Season CI",
+                    output_axis_title="Regular-season P90 exit velo bucket",
+                    testing_axis_title="Season average Total CI (N·s)",
+                    output_unit="mph",
+                    empty_text="No matched hitters are available for season P90 exit-velo buckets.",
+                    color=TEAL,
+                ),
                 use_container_width=True,
-                height=min(660, 44 + 36 * (len(exit_display) + 1)),
-                column_config={
-                    "P90 Exit Velo":
-                        st.column_config.NumberColumn(format="%.2f mph"),
-                    "Year-to-Date Average CI":
-                        st.column_config.NumberColumn(format="%.2f N·s"),
-                },
+                config={"displayModeBar": False},
+                key=(
+                    f"season_p90_output_bucket_{team_filter}_"
+                    f"{p90_season_min_fd_dates}_{p90_season_min_bip}"
+                ),
             )
-            csv_download_button(
-                exit_display,
-                "Download P90 exit-velo results CSV",
-                "p90_exit_velo_results.csv",
-                "download_p90_exit_velo_results",
+
+        exit_output_bands = output_bucket_summary(
+            p90_season_pairs,
+            "p90_exit_velo",
+            "avg_ci",
+            EXIT_VELO_OUTPUT_BUCKET_WIDTH,
+            "P90 exit velo bucket",
+            "Season CI",
+            "mph",
+            "N·s",
+        )
+
+        if not exit_output_bands.empty:
+            exit_output_options = exit_output_bands[
+                "P90 exit velo bucket"
+            ].tolist()
+            exit_output_key = "season_p90_output_bucket_detail_selector"
+
+            if st.session_state.get(exit_output_key) not in exit_output_options:
+                st.session_state[exit_output_key] = exit_output_options[0]
+
+            with st.container(border=True):
+                st.subheader("P90 Exit Velo Bucket Hitters", anchor=False)
+                selected_exit_output_bucket = st.selectbox(
+                    "P90 exit velo bucket",
+                    exit_output_options,
+                    key=exit_output_key,
+                )
+                st.plotly_chart(
+                    build_output_bucket_member_chart(
+                        df=p90_season_pairs,
+                        output_col="p90_exit_velo",
+                        testing_col="avg_ci",
+                        bucket_width=EXIT_VELO_OUTPUT_BUCKET_WIDTH,
+                        selected_bucket=selected_exit_output_bucket,
+                        output_bucket_label="P90 exit velo bucket",
+                        output_unit="mph",
+                        testing_axis_title="Season average Total CI",
+                        testing_unit="N·s",
+                        entity_label="Hitter",
+                        output_value_label="Regular-season P90 exit velo",
+                    ),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=(
+                        f"season_p90_output_detail_{selected_exit_output_bucket}_"
+                        f"{team_filter}_{p90_season_min_fd_dates}_{p90_season_min_bip}"
+                    ),
+                )
+
+        exit_band_overview = exit_velo_ci_band_summary(
+            p90_season_pairs,
+            int(exit_ci_band_width),
+            exit_ci_band_stat,
+        )
+
+        if not exit_band_overview.empty:
+            exit_band_options = exit_band_overview["CI band"].tolist()
+            exit_band_detail_key = "season_p90_ci_band_detail_selector"
+
+            if st.session_state.get(exit_band_detail_key) not in exit_band_options:
+                st.session_state[exit_band_detail_key] = exit_band_options[0]
+
+            with st.container(border=True):
+                st.subheader("CI Band Hitters", anchor=False)
+                selected_exit_ci_band = st.selectbox(
+                    "Hitter CI band",
+                    exit_band_options,
+                    key=exit_band_detail_key,
+                )
+                st.plotly_chart(
+                    build_season_p90_ci_band_member_chart(
+                        p90_season_pairs,
+                        int(exit_ci_band_width),
+                        selected_exit_ci_band,
+                        exit_ci_band_stat,
+                    ),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=(
+                        f"season_p90_ci_band_detail_{selected_exit_ci_band}_"
+                        f"{exit_ci_band_width}_{exit_ci_band_stat}_{team_filter}_"
+                        f"{p90_season_min_fd_dates}_{p90_season_min_bip}"
+                    ),
+                )
+
+        with st.container(border=True):
+            st.subheader(
+                "Season Average Total CI vs Regular-Season P90 Exit Velo",
+                anchor=False,
             )
+            st.plotly_chart(
+                build_season_p90_scatter(
+                    p90_season_pairs,
+                    exit_show_labels,
+                    float(exit_ci_lookup),
+                ),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=(
+                    f"season_p90_scatter_{team_filter}_{exit_show_labels}_{exit_ci_lookup}_"
+                    f"{p90_season_min_fd_dates}_{p90_season_min_bip}"
+                ),
+            )
+            st.checkbox("Show names", key="exit_show_labels")
+
+        with st.container(border=True):
+            st.subheader("Hitter Results", anchor=False)
+
+            if p90_season_pairs.empty:
+                st.info("No matching hitters.")
+            else:
+                exit_display = p90_season_pairs[[
+                    "athlete",
+                    "team",
+                    "season",
+                    "p90_exit_velo",
+                    "tracked_bip",
+                    "p90_updated_at",
+                    "avg_ci",
+                    "ci100_test_dates",
+                    "first_ci100_date",
+                    "last_ci100_date",
+                ]].copy()
+
+                exit_display.columns = [
+                    "Hitter",
+                    "Team",
+                    "Season",
+                    "Regular-Season P90 Exit Velo",
+                    "Tracked BIP",
+                    "P90 Updated At",
+                    "Season Average Total CI",
+                    "ForceDecks Test Dates",
+                    "First ForceDecks Test",
+                    "Last ForceDecks Test",
+                ]
+
+                for date_col in [
+                    "P90 Updated At",
+                    "First ForceDecks Test",
+                    "Last ForceDecks Test",
+                ]:
+                    exit_display[date_col] = exit_display[date_col].map(fmt_date)
+
+                st.dataframe(
+                    exit_display,
+                    hide_index=True,
+                    use_container_width=True,
+                    height=min(660, 44 + 36 * (len(exit_display) + 1)),
+                    column_config={
+                        "Season": st.column_config.NumberColumn(format="%d"),
+                        "Regular-Season P90 Exit Velo":
+                            st.column_config.NumberColumn(format="%.2f mph"),
+                        "Tracked BIP":
+                            st.column_config.NumberColumn(format="%d"),
+                        "Season Average Total CI":
+                            st.column_config.NumberColumn(format="%.2f N·s"),
+                        "ForceDecks Test Dates":
+                            st.column_config.NumberColumn(format="%d"),
+                    },
+                )
+
+                csv_download_button(
+                    exit_display,
+                    "Download season P90 exit-velo results CSV",
+                    "season_p90_exit_velo_results.csv",
+                    "download_season_p90_exit_velo_results",
+                )
 
 
 
