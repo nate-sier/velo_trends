@@ -1,3 +1,4 @@
+# Added matching CI + CI100 calculator for regular-season P90 exit velocity.
 # Calculator simplified to show only model-estimated bat speed.
 # Added CI + CI100 -> Bat Speed calculator to season hitting models.
 # Standalone P90 EV overview converted to 2026 regular-season cross-sectional analysis.
@@ -10610,13 +10611,41 @@ def render_ci100_hitting_models_tab(
                 with col:
                     st.markdown(metric_card(*values), unsafe_allow_html=True)
 
-            if outcome_col == "avg_bat_speed" and ci_ci100 is not None:
+            if outcome_col in {"avg_bat_speed", "p90_exit_velo"} and ci_ci100 is not None:
+                is_bat_speed = outcome_col == "avg_bat_speed"
+                calc_title = (
+                    "CI + CI100 Bat Speed Calculator"
+                    if is_bat_speed
+                    else "CI + CI100 P90 Exit Velo Calculator"
+                )
+                calc_output_label = (
+                    "Model-Estimated Bat Speed"
+                    if is_bat_speed
+                    else "Model-Estimated P90 Exit Velo"
+                )
+                calc_equation_label = (
+                    "Bat Speed"
+                    if is_bat_speed
+                    else "P90 Exit Velo"
+                )
+                calc_key_prefix = (
+                    "ci100_bat_calc"
+                    if is_bat_speed
+                    else "ci100_p90_calc"
+                )
+
                 with st.container(border=True):
-                    st.subheader("CI + CI100 Bat Speed Calculator", anchor=False)
+                    st.subheader(calc_title, anchor=False)
                     st.caption(
                         "Uses the fitted 2026 cross-sectional CI + CI100 model. "
-                        "Enter season-average Total CI and CI100 to estimate regular-season average bat speed. "
-                        "This is a model estimate, not a causal prediction of what will happen if a player changes CI."
+                        "Enter season-average Total CI and CI100 to estimate "
+                        + (
+                            "regular-season average bat speed. "
+                            if is_bat_speed
+                            else "regular-season P90 exit velocity. "
+                        )
+                        + "This is a model estimate, not a causal prediction of what will happen "
+                        "if a player changes CI."
                     )
 
                     calc_data = ci_ci100["data"].copy()
@@ -10631,7 +10660,7 @@ def render_ci100_hitting_models_tab(
                             value=round(calc_ci_default, 1),
                             step=1.0,
                             format="%.1f",
-                            key="ci100_bat_calc_total_ci",
+                            key=f"{calc_key_prefix}_total_ci",
                         )
                     with calc_right:
                         calc_ci100 = st.number_input(
@@ -10640,11 +10669,11 @@ def render_ci100_hitting_models_tab(
                             value=round(calc_ci100_default, 1),
                             step=0.5,
                             format="%.1f",
-                            key="ci100_bat_calc_ci100",
+                            key=f"{calc_key_prefix}_ci100",
                         )
 
                     combined_coef = np.asarray(ci_ci100["coef"], dtype=float)
-                    predicted_bat_speed = float(
+                    predicted_output = float(
                         combined_coef[0]
                         + combined_coef[1] * float(calc_ci)
                         + combined_coef[2] * float(calc_ci100)
@@ -10652,8 +10681,8 @@ def render_ci100_hitting_models_tab(
 
                     st.markdown(
                         metric_card(
-                            "Model-Estimated Bat Speed",
-                            f"{predicted_bat_speed:.2f} mph",
+                            calc_output_label,
+                            f"{predicted_output:.2f} mph",
                             TEAL,
                         ),
                         unsafe_allow_html=True,
@@ -10682,7 +10711,7 @@ def render_ci100_hitting_models_tab(
                         )
 
                     st.caption(
-                        "Model equation: Bat Speed = "
+                        f"Model equation: {calc_equation_label} = "
                         f"{combined_coef[0]:.3f} "
                         f"{combined_coef[1]:+.4f} × Total CI "
                         f"{combined_coef[2]:+.4f} × CI100"
