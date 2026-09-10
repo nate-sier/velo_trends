@@ -36,6 +36,8 @@ DEFAULT_VELO_TAB = "FB Velo"
 DEFAULT_BAT_TAB = "PP_Sprint"
 DEFAULT_EXIT_TAB = "Nats Hitting"
 DEFAULT_PINCH_TAB = "Pinch Grip"
+DEFAULT_CI100_SHEET_NAME = "CI100 ForceDecks"
+DEFAULT_CI100_TAB = "CI100"
 DEFAULT_INFIELD_SHEET_NAME = "nats_players_infield_2026"
 DEFAULT_BASERUNNING_SHEET_NAME = "nats_players_baserunning_2026"
 DEFAULT_ALL_BASERUNNING_TAB = "All Baseball Baserunning"
@@ -1090,6 +1092,8 @@ def load_source_data() -> tuple:
     bat_tab = secret_or_default("BAT_TAB", DEFAULT_BAT_TAB)
     exit_tab = secret_or_default("EXIT_TAB", DEFAULT_EXIT_TAB)
     pinch_tab = secret_or_default("PINCH_TAB", DEFAULT_PINCH_TAB)
+    ci100_sheet_name = secret_or_default("CI100_SHEET_NAME", DEFAULT_CI100_SHEET_NAME)
+    ci100_tab = secret_or_default("CI100_TAB", DEFAULT_CI100_TAB)
 
     client = get_gspread_client()
 
@@ -1102,6 +1106,19 @@ def load_source_data() -> tuple:
     bat_raw = read_tab_from_book(core_book, bat_tab)
     exit_raw = read_tab_from_book(core_book, exit_tab)
     pinch_raw = read_tab_from_book(core_book, pinch_tab)
+    try:
+        ci100_raw = read_external_sheet(
+            client,
+            id_secret="CI100_SHEET_ID",
+            name_secret="CI100_SHEET_NAME",
+            default_name=ci100_sheet_name,
+            tab_secret="CI100_TAB",
+            default_tab_name=DEFAULT_CI100_TAB,
+        )
+    except (gspread.exceptions.SpreadsheetNotFound, gspread.exceptions.WorksheetNotFound):
+        # CI100 is optional for the rest of the dashboard. It lives in a separate
+        # workbook so the already-large core performance workbook is never modified.
+        ci100_raw = pd.DataFrame()
     infield_raw = read_external_sheet(
         client,
         id_secret="INFIELD_SHEET_ID",
@@ -1273,6 +1290,125 @@ def load_source_data() -> tuple:
         .sort_values(["athlete", "date"], kind="stable")
         .reset_index(drop=True)
     )
+
+    # Dedicated CI100 workbook. This is written from VALD SQL so total CI and
+    # CI @ 100 ms come from the exact same ForceDecks test/session. The CI100
+    # workbook is separate from the established core performance workbook.
+    ci100_columns = [
+        "player_id", "athlete", "date", "test_id", "ci", "ci100",
+        "ci100_ratio", "ci100_ratio_pct", "trials", "name_key",
+    ]
+    if ci100_raw.empty:
+        ci100 = pd.DataFrame(columns=ci100_columns)
+    else:
+        ci100_raw.columns = ci100_raw.columns.astype(str).str.strip()
+        ci100_name_col = first_existing(
+            ci100_raw.columns.tolist(),
+            ["Athlete", "athlete", "Name", "name", "Player", "player"],
+        )
+        ci100_date_col = first_existing(
+            ci100_raw.columns.tolist(),
+            ["Date", "date", "Test Date", "test_date"],
+        )
+        ci100_player_id_col = first_existing(
+            ci100_raw.columns.tolist(),
+            ["MLBAM ID", "MLBAM_ID", "mlbam_id", "Player ID", "player_id"],
+        )
+        ci100_test_id_col = first_existing(
+            ci100_raw.columns.tolist(),
+            ["Test ID", "test_id", "TestID", "testid"],
+        )
+        ci100_total_col = first_existing(
+            ci100_raw.columns.tolist(),
+            [
+                "Concentric Impulse [N s]", "Concentric Impulse", "Total CI",
+                "CI", "ci_total",
+            ],
+        )
+        ci100_value_col = first_existing(
+            ci100_raw.columns.tolist(),
+            [
+                "Concentric Impulse @ 100 ms [N s]",
+                "Concentric Impulse @ 100 ms",
+                "CI @ 100 ms", "CI100", "ci100",
+                "concentric_impulse_100ms",
+            ],
+        )
+        ci100_ratio_col = first_existing(
+            ci100_raw.columns.tolist(),
+            ["CI100 / Total CI", "CI100/Total CI", "ci100_ratio"],
+        )
+        ci100_ratio_pct_col = first_existing(
+            ci100_raw.columns.tolist(),
+            ["CI100 / Total CI (%)", "CI100/Total CI (%)", "ci100_ratio_pct"],
+        )
+        ci100_trials_col = first_existing(
+            ci100_raw.columns.tolist(),
+            ["Trials", "trials", "Trial Count", "trial_count"],
+        )
+
+        missing_ci100 = [
+            label for label, col in {
+                "athlete": ci100_name_col,
+                "date": ci100_date_col,
+                "total CI": ci100_total_col,
+                "CI @ 100 ms": ci100_value_col,
+            }.items() if col is None
+        ]
+        if missing_ci100:
+            raise ValueError(
+                f"The CI100 workbook tab '{ci100_tab}' is missing required column(s): "
+                + ", ".join(missing_ci100)
+                + ". Run sync_ci100_to_separate_workbook.py --write to rebuild it."
+            )
+
+        ci100 = pd.DataFrame({
+            "player_id": (
+                pd.to_numeric(ci100_raw[ci100_player_id_col], errors="coerce").astype("Int64")
+                if ci100_player_id_col else pd.Series(pd.NA, index=ci100_raw.index, dtype="Int64")
+            ),
+            "athlete": ci100_raw[ci100_name_col].astype(str).str.strip(),
+            "date": parse_sheet_dates(ci100_raw[ci100_date_col]),
+            "test_id": (
+                ci100_raw[ci100_test_id_col].astype(str).str.strip()
+                if ci100_test_id_col else ""
+            ),
+            "ci": pd.to_numeric(ci100_raw[ci100_total_col], errors="coerce"),
+            "ci100": pd.to_numeric(ci100_raw[ci100_value_col], errors="coerce"),
+            "ci100_ratio": (
+                pd.to_numeric(ci100_raw[ci100_ratio_col], errors="coerce")
+                if ci100_ratio_col else np.nan
+            ),
+            "ci100_ratio_pct": (
+                pd.to_numeric(ci100_raw[ci100_ratio_pct_col], errors="coerce")
+                if ci100_ratio_pct_col else np.nan
+            ),
+            "trials": (
+                pd.to_numeric(ci100_raw[ci100_trials_col], errors="coerce")
+                if ci100_trials_col else np.nan
+            ),
+        })
+        ci100["name_key"] = ci100["athlete"].map(canonical_name)
+        ratio_calc = np.where(
+            ci100["ci"].notna() & ~np.isclose(ci100["ci"], 0.0),
+            ci100["ci100"] / ci100["ci"],
+            np.nan,
+        )
+        ci100["ci100_ratio"] = ci100["ci100_ratio"].where(
+            ci100["ci100_ratio"].notna(), ratio_calc
+        )
+        ci100["ci100_ratio_pct"] = ci100["ci100_ratio_pct"].where(
+            ci100["ci100_ratio_pct"].notna(), ci100["ci100_ratio"] * 100.0
+        )
+        ci100 = (
+            ci100[
+                (ci100["athlete"] != "")
+                & (ci100["name_key"] != "")
+            ]
+            .dropna(subset=["date", "ci", "ci100"])
+            .sort_values(["athlete", "date"], kind="stable")
+            .reset_index(drop=True)
+        )
 
     # FB Velo
     velo_raw.columns = velo_raw.columns.astype(str).str.strip()
@@ -1725,12 +1861,13 @@ def load_source_data() -> tuple:
         f"{len(velo):,} FB Velo rows, {len(pinch):,} Pinch Grip rows, "
         f"{len(sprint):,} valid sprint-speed rows, {len(bat):,} hitter-month "
         f"bat-speed rows, {len(exit_velo):,} valid P90 exit-velocity rows, "
+        f"{len(ci100):,} CI100 session rows, "
         f"{len(infield_defense):,} IF Reaction 3ft rows, {len(baserunning_defense):,} Nationals baserunning rows, "
         f"and {len(all_baserunning_defense):,} all-baseball baserunning rows · "
         f"{datetime.now().strftime('%I:%M %p').lstrip('0')}"
     )
     return (
-        jump, jump_power, velo, bat, pinch, sprint, exit_velo,
+        jump, jump_power, velo, bat, pinch, sprint, exit_velo, ci100,
         infield_defense, baserunning_defense, all_baserunning_defense, status,
     )
 
@@ -8971,6 +9108,591 @@ def _projection_player_options(df: pd.DataFrame) -> list[str]:
         ["athlete"].astype(str).drop_duplicates().tolist()
     )
 
+# -----------------------------------------------------------------------------
+# HITTING MODELS — TOTAL CI + CI100 / CI100:CI RATIO
+# -----------------------------------------------------------------------------
+def build_ci100_hitting_model_panel(
+    ci100: pd.DataFrame,
+    jump: pd.DataFrame,
+    bat: pd.DataFrame,
+    exit_velo: pd.DataFrame,
+    start_date,
+    end_date,
+    team_filter: str,
+    min_ci_jumps: int,
+) -> pd.DataFrame:
+    """Build one cross-sectional row per hitter for the dedicated CI100 models.
+
+    Total CI and CI100 come from the same SQL-synced ForceDecks sessions. Bat speed
+    is the mean of the unique monthly PP_Sprint values in the selected window. P90
+    exit velocity is the current Nats Hitting snapshot already used by the app.
+    """
+    columns = [
+        "name_key", "athlete", "team", "avg_ci", "avg_ci100",
+        "avg_ci100_ratio", "avg_ci100_ratio_pct", "ci100_tests",
+        "ci100_test_dates", "first_ci100_date", "last_ci100_date",
+        "avg_bat_speed", "bat_speed_months", "p90_exit_velo",
+    ]
+    if ci100 is None or ci100.empty:
+        return pd.DataFrame(columns=columns)
+
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    work = ci100[
+        (ci100["date"] >= start)
+        & (ci100["date"] <= end)
+        & ci100["ci"].notna()
+        & ci100["ci100"].notna()
+    ].copy()
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+
+    # If a sync contains duplicate rows for the same test, collapse them first.
+    test_group_cols = ["name_key", "date"]
+    if "test_id" in work.columns and work["test_id"].astype(str).str.len().gt(0).any():
+        test_group_cols.append("test_id")
+
+    by_test = (
+        work.groupby(test_group_cols, as_index=False)
+        .agg(
+            athlete=("athlete", "first"),
+            ci=("ci", "mean"),
+            ci100=("ci100", "mean"),
+            ci100_ratio=("ci100_ratio", "mean"),
+        )
+    )
+    by_test["ci100_ratio"] = by_test["ci100_ratio"].where(
+        by_test["ci100_ratio"].notna(),
+        np.where(
+            by_test["ci"].notna() & ~np.isclose(by_test["ci"], 0.0),
+            by_test["ci100"] / by_test["ci"],
+            np.nan,
+        ),
+    )
+
+    physical = (
+        by_test.groupby("name_key", as_index=False)
+        .agg(
+            athlete=("athlete", "first"),
+            avg_ci=("ci", "mean"),
+            avg_ci100=("ci100", "mean"),
+            avg_ci100_ratio=("ci100_ratio", "mean"),
+            ci100_tests=("ci100", "count"),
+            ci100_test_dates=("date", "nunique"),
+            first_ci100_date=("date", "min"),
+            last_ci100_date=("date", "max"),
+        )
+    )
+    # Cross-sectional CI100:Total-CI ratio = hitter mean CI100 / hitter mean total CI.
+    # This directly answers how much of the athlete's average concentric impulse is
+    # represented in the first 100 ms, rather than averaging session-level ratios.
+    physical["avg_ci100_ratio"] = np.where(
+        physical["avg_ci"].notna() & ~np.isclose(physical["avg_ci"], 0.0),
+        physical["avg_ci100"] / physical["avg_ci"],
+        np.nan,
+    )
+    physical["avg_ci100_ratio_pct"] = physical["avg_ci100_ratio"] * 100.0
+    physical = physical[
+        physical["ci100_test_dates"] >= max(1, int(min_ci_jumps))
+    ].copy()
+
+    # Current team assignment comes from the established Jump Data source.
+    jump_to_end = jump[jump["date"] <= end].copy()
+    team_lookup = (
+        jump_to_end.sort_values("date", kind="stable")
+        .groupby("name_key", as_index=False)
+        .tail(1)[["name_key", "team"]]
+        .drop_duplicates("name_key")
+    )
+    physical = physical.merge(team_lookup, on="name_key", how="left")
+    if team_filter != "All Teams":
+        physical = physical[physical["team"] == team_filter].copy()
+
+    # Mean of unique monthly bat-speed summaries in the selected date window.
+    start_month = start.to_period("M").start_time
+    end_month = end.to_period("M").start_time
+    bat_window = bat[
+        (bat["month"] >= start_month)
+        & (bat["month"] <= end_month)
+    ].copy()
+    bat_summary = (
+        bat_window.groupby("name_key", as_index=False)
+        .agg(
+            avg_bat_speed=("monthly_avg_bat_speed", "mean"),
+            bat_speed_months=("month", "nunique"),
+        )
+    ) if not bat_window.empty else pd.DataFrame(
+        columns=["name_key", "avg_bat_speed", "bat_speed_months"]
+    )
+
+    exit_summary = (
+        exit_velo[["name_key", "p90_exit_velo"]]
+        .dropna(subset=["p90_exit_velo"])
+        .drop_duplicates("name_key", keep="last")
+    ) if exit_velo is not None and not exit_velo.empty else pd.DataFrame(
+        columns=["name_key", "p90_exit_velo"]
+    )
+
+    panel = physical.merge(bat_summary, on="name_key", how="left")
+    panel = panel.merge(exit_summary, on="name_key", how="left")
+    return panel[columns].sort_values(["team", "athlete"], kind="stable").reset_index(drop=True)
+
+
+def fit_hitting_cross_sectional_model(
+    frame: pd.DataFrame,
+    outcome_col: str,
+    predictor_cols: list[str],
+) -> dict | None:
+    """OLS + standardized betas + LOOCV for one-row-per-hitter models."""
+    needed = [outcome_col, *predictor_cols]
+    data = frame.dropna(subset=needed).copy().reset_index(drop=True)
+    n = len(data)
+    k = len(predictor_cols)
+    if n <= k + 2 or k == 0:
+        return None
+
+    predictors = data[predictor_cols].to_numpy(dtype=float)
+    y = data[outcome_col].to_numpy(dtype=float)
+    X = np.column_stack([np.ones(n), predictors])
+    if np.linalg.matrix_rank(X) < k + 1 or np.isclose(np.std(y), 0.0):
+        return None
+
+    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+    predicted = X @ coef
+    residual = y - predicted
+    ss_total = float(np.sum((y - y.mean()) ** 2))
+    ss_resid = float(np.sum(residual ** 2))
+    r2 = float(1.0 - ss_resid / ss_total) if ss_total > 0 else np.nan
+    df_residual = n - k - 1
+    adjusted_r2 = (
+        float(1.0 - (1.0 - r2) * (n - 1) / df_residual)
+        if df_residual > 0 and pd.notna(r2) else np.nan
+    )
+    rmse = float(np.sqrt(np.mean(residual ** 2)))
+
+    y_sd = float(np.std(y, ddof=0))
+    standardized_betas = []
+    for idx, col in enumerate(predictor_cols, start=1):
+        x_sd = float(data[col].std(ddof=0))
+        standardized_betas.append(
+            float(coef[idx] * x_sd / y_sd)
+            if not np.isclose(x_sd, 0.0) and not np.isclose(y_sd, 0.0)
+            else np.nan
+        )
+
+    cv_pred = np.full(n, np.nan, dtype=float)
+    for row_idx in range(n):
+        mask = np.ones(n, dtype=bool)
+        mask[row_idx] = False
+        X_train = X[mask]
+        y_train = y[mask]
+        if len(y_train) <= k or np.linalg.matrix_rank(X_train) < k + 1:
+            continue
+        train_coef, *_ = np.linalg.lstsq(X_train, y_train, rcond=None)
+        cv_pred[row_idx] = X[row_idx] @ train_coef
+
+    if np.isfinite(cv_pred).all():
+        cv_error = y - cv_pred
+        cv_rmse = float(np.sqrt(np.mean(cv_error ** 2)))
+        press = float(np.sum(cv_error ** 2))
+        cv_r2 = float(1.0 - press / ss_total) if ss_total > 0 else np.nan
+    else:
+        cv_rmse = np.nan
+        cv_r2 = np.nan
+
+    output = data.copy()
+    output["observed"] = y
+    output["predicted"] = predicted
+    output["residual"] = residual
+    output["cv_predicted"] = cv_pred
+
+    return {
+        "data": output,
+        "predictors": predictor_cols,
+        "coef": coef,
+        "standardized_betas": standardized_betas,
+        "r2": r2,
+        "adjusted_r2": adjusted_r2,
+        "rmse": rmse,
+        "cv_r2": cv_r2,
+        "cv_rmse": cv_rmse,
+        "n": n,
+        "k": k,
+    }
+
+
+def _incremental_model_signal(full_model: dict | None, reduced_model: dict | None, added_coef_index: int = -1) -> tuple[float, float]:
+    """Return incremental R² and signed partial r for nested models."""
+    if full_model is None or reduced_model is None:
+        return np.nan, np.nan
+    full_data = full_model["data"]
+    reduced_data = reduced_model["data"]
+    if len(full_data) != len(reduced_data):
+        return np.nan, np.nan
+    delta_r2 = float(full_model["r2"] - reduced_model["r2"])
+    sse_full = float(np.sum(full_data["residual"] ** 2))
+    sse_reduced = float(np.sum(reduced_data["residual"] ** 2))
+    partial_r2 = (
+        float((sse_reduced - sse_full) / sse_reduced)
+        if sse_reduced > 0 else np.nan
+    )
+    sign = np.sign(float(full_model["coef"][added_coef_index]))
+    partial_r = sign * np.sqrt(max(partial_r2, 0.0)) if pd.notna(partial_r2) else np.nan
+    return delta_r2, float(partial_r)
+
+
+def ci100_hitting_model_rows(
+    panel: pd.DataFrame,
+    outcome_col: str,
+    outcome_label: str,
+) -> tuple[pd.DataFrame, dict[str, dict | None]]:
+    """Fit baseline, CI+CI100, ratio-only, and CI+ratio models on one complete-case sample."""
+    complete = panel.dropna(
+        subset=[outcome_col, "avg_ci", "avg_ci100", "avg_ci100_ratio"]
+    ).copy().reset_index(drop=True)
+    models = {
+        "CI only": fit_hitting_cross_sectional_model(complete, outcome_col, ["avg_ci"]),
+        "CI + CI100": fit_hitting_cross_sectional_model(complete, outcome_col, ["avg_ci", "avg_ci100"]),
+        "CI100 / CI ratio only": fit_hitting_cross_sectional_model(complete, outcome_col, ["avg_ci100_ratio"]),
+        "CI + CI100 / CI ratio": fit_hitting_cross_sectional_model(complete, outcome_col, ["avg_ci", "avg_ci100_ratio"]),
+    }
+
+    delta_ci100, partial_ci100 = _incremental_model_signal(
+        models["CI + CI100"], models["CI only"], -1
+    )
+    delta_ratio, partial_ratio = _incremental_model_signal(
+        models["CI + CI100 / CI ratio"], models["CI only"], -1
+    )
+
+    rows = []
+    for model_name, model in models.items():
+        if model is None:
+            continue
+        row = {
+            "Outcome": outcome_label,
+            "Model": model_name,
+            "N": model["n"],
+            "R²": model["r2"],
+            "Adjusted R²": model["adjusted_r2"],
+            "LOOCV R²": model["cv_r2"],
+            "LOOCV RMSE": model["cv_rmse"],
+            "Incremental R² beyond CI": np.nan,
+            "Partial r beyond CI": np.nan,
+            "CI Std Beta": np.nan,
+            "CI100 Std Beta": np.nan,
+            "Ratio Std Beta": np.nan,
+        }
+        for predictor, beta in zip(model["predictors"], model["standardized_betas"]):
+            if predictor == "avg_ci":
+                row["CI Std Beta"] = beta
+            elif predictor == "avg_ci100":
+                row["CI100 Std Beta"] = beta
+            elif predictor == "avg_ci100_ratio":
+                row["Ratio Std Beta"] = beta
+        if model_name == "CI + CI100":
+            row["Incremental R² beyond CI"] = delta_ci100
+            row["Partial r beyond CI"] = partial_ci100
+        elif model_name == "CI + CI100 / CI ratio":
+            row["Incremental R² beyond CI"] = delta_ratio
+            row["Partial r beyond CI"] = partial_ratio
+        rows.append(row)
+
+    return pd.DataFrame(rows), models
+
+
+def build_ci100_observed_predicted_chart(
+    model: dict | None,
+    outcome_label: str,
+    unit: str,
+    model_label: str,
+    show_names: bool,
+) -> go.Figure:
+    fig = go.Figure()
+    if model is None or model.get("data") is None or model["data"].empty:
+        fig.add_annotation(
+            text="Not enough complete cases for this model.",
+            x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 390)
+
+    data = model["data"].copy()
+    low = float(min(data["observed"].min(), data["predicted"].min()))
+    high = float(max(data["observed"].max(), data["predicted"].max()))
+    pad = max((high - low) * 0.08, 0.5)
+    custom = np.column_stack([
+        data["athlete"].astype(str),
+        data["team"].fillna("Unassigned").astype(str),
+    ])
+    fig.add_trace(go.Scatter(
+        x=data["observed"],
+        y=data["predicted"],
+        mode="markers+text" if show_names else "markers",
+        text=data["athlete"] if show_names else None,
+        textposition="top center",
+        textfont={"size": 8, "color": NAVY},
+        marker={"size": 9, "color": TEAL, "opacity": 0.78},
+        customdata=custom,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>Team: %{customdata[1]}<br>"
+            f"Observed {outcome_label}: %{{x:.2f}} {unit}<br>"
+            f"Predicted {outcome_label}: %{{y:.2f}} {unit}<extra></extra>"
+        ),
+        showlegend=False,
+    ))
+    fig.add_trace(go.Scatter(
+        x=[low - pad, high + pad],
+        y=[low - pad, high + pad],
+        mode="lines",
+        line={"color": NAVY_MID, "dash": "dash", "width": 1.5},
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+    fig.update_xaxes(
+        title=f"Observed {outcome_label} ({unit})",
+        range=[low - pad, high + pad],
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+    )
+    fig.update_yaxes(
+        title=f"Predicted {outcome_label} ({unit})",
+        range=[low - pad, high + pad],
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+    )
+    fig.update_layout(title={"text": model_label, "x": 0.02, "xanchor": "left"})
+    return base_figure_layout(fig, 420)
+
+
+def build_ci100_ratio_scatter(
+    panel: pd.DataFrame,
+    outcome_col: str,
+    outcome_label: str,
+    unit: str,
+    show_names: bool,
+) -> go.Figure:
+    data = panel.dropna(subset=["avg_ci100_ratio_pct", outcome_col]).copy()
+    fig = go.Figure()
+    if len(data) < 3:
+        fig.add_annotation(
+            text="Not enough complete cases for the ratio relationship.",
+            x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 390)
+
+    x = data["avg_ci100_ratio_pct"].to_numpy(dtype=float)
+    y = data[outcome_col].to_numpy(dtype=float)
+    slope, intercept = np.polyfit(x, y, 1)
+    x_line = np.linspace(float(np.min(x)), float(np.max(x)), 100)
+    custom = np.column_stack([
+        data["athlete"].astype(str),
+        data["team"].fillna("Unassigned").astype(str),
+        data["avg_ci"].round(2),
+        data["avg_ci100"].round(2),
+    ])
+    fig.add_trace(go.Scatter(
+        x=x, y=y,
+        mode="markers+text" if show_names else "markers",
+        text=data["athlete"] if show_names else None,
+        textposition="top center",
+        textfont={"size": 8, "color": NAVY},
+        marker={"size": 9, "color": BLUE, "opacity": 0.75},
+        customdata=custom,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>Team: %{customdata[1]}<br>"
+            "Mean total CI: %{customdata[2]:.2f} N·s<br>"
+            "Mean CI100: %{customdata[3]:.2f} N·s<br>"
+            "CI100 / total CI: %{x:.2f}%<br>"
+            f"{outcome_label}: %{{y:.2f}} {unit}<extra></extra>"
+        ),
+        showlegend=False,
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_line,
+        y=intercept + slope * x_line,
+        mode="lines",
+        line={"color": ACCENT_RED, "width": 2},
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+    fig.update_xaxes(
+        title="Mean CI100 / Total CI (%)",
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+    )
+    fig.update_yaxes(
+        title=f"{outcome_label} ({unit})",
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+    )
+    return base_figure_layout(fig, 430)
+
+
+def render_ci100_hitting_models_tab(
+    panel: pd.DataFrame,
+    ci100_available: bool,
+) -> None:
+    st.caption(
+        "Cross-sectional hitter models. Total CI and CI @ 100 ms come from the same "
+        "ForceDecks sessions in the dedicated CI100 Google Sheets workbook. Bat speed is the "
+        "mean of the available PP_Sprint monthly averages in the selected window; P90 EV "
+        "uses the current Nats Hitting snapshot. Associations are descriptive, not causal."
+    )
+
+    if not ci100_available:
+        st.warning(
+            "The CI100 Google Sheets workbook is missing or empty. Run "
+            "`python3 ~/Downloads/sync_ci100_to_separate_workbook.py --write`, then refresh the app."
+        )
+        return
+    if panel is None or panel.empty:
+        st.info("No CI100 hitters match the current dashboard filters.")
+        return
+
+    outcome_specs = [
+        ("Bat Speed", "avg_bat_speed", "Bat Speed", "mph"),
+        ("P90 Exit Velo", "p90_exit_velo", "P90 Exit Velo", "mph"),
+    ]
+    sub_tabs = st.tabs([spec[0] for spec in outcome_specs])
+
+    for sub_tab, (tab_name, outcome_col, outcome_label, unit) in zip(sub_tabs, outcome_specs):
+        with sub_tab:
+            model_table, models = ci100_hitting_model_rows(panel, outcome_col, outcome_label)
+            if model_table.empty:
+                st.info(f"Not enough complete cases for {outcome_label}.")
+                continue
+
+            ci_only = models.get("CI only")
+            ci_ci100 = models.get("CI + CI100")
+            ratio_only = models.get("CI100 / CI ratio only")
+            ci_ratio = models.get("CI + CI100 / CI ratio")
+            delta_ci100, partial_ci100 = _incremental_model_signal(ci_ci100, ci_only, -1)
+            delta_ratio, partial_ratio = _incremental_model_signal(ci_ratio, ci_only, -1)
+
+            top = st.columns(4)
+            top_values = [
+                ("Hitters", str(int(ci_ci100["n"])) if ci_ci100 else "—", BLUE),
+                ("CI-only R²", f"{ci_only['r2']:.3f}" if ci_only else "—", NAVY_MID),
+                ("CI + CI100 R²", f"{ci_ci100['r2']:.3f}" if ci_ci100 else "—", ACCENT_RED),
+                ("CI100 Incremental R²", f"{delta_ci100:+.3f}" if pd.notna(delta_ci100) else "—", TEAL),
+            ]
+            for col, values in zip(top, top_values):
+                with col:
+                    st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+            bottom = st.columns(4)
+            bottom_values = [
+                ("CI100 Partial r", f"{partial_ci100:+.3f}" if pd.notna(partial_ci100) else "—", GREEN),
+                ("Ratio-only R²", f"{ratio_only['r2']:.3f}" if ratio_only else "—", BLUE),
+                ("CI + Ratio R²", f"{ci_ratio['r2']:.3f}" if ci_ratio else "—", NAVY_MID),
+                ("Ratio Incremental R²", f"{delta_ratio:+.3f}" if pd.notna(delta_ratio) else "—", TEAL),
+            ]
+            for col, values in zip(bottom, bottom_values):
+                with col:
+                    st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+            with st.container(border=True):
+                st.subheader("Model Comparison", anchor=False)
+                st.dataframe(
+                    model_table,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "N": st.column_config.NumberColumn(format="%d"),
+                        "R²": st.column_config.NumberColumn(format="%.3f"),
+                        "Adjusted R²": st.column_config.NumberColumn(format="%.3f"),
+                        "LOOCV R²": st.column_config.NumberColumn(format="%.3f"),
+                        "LOOCV RMSE": st.column_config.NumberColumn(format="%.3f"),
+                        "Incremental R² beyond CI": st.column_config.NumberColumn(format="%+.3f"),
+                        "Partial r beyond CI": st.column_config.NumberColumn(format="%+.3f"),
+                        "CI Std Beta": st.column_config.NumberColumn(format="%+.3f"),
+                        "CI100 Std Beta": st.column_config.NumberColumn(format="%+.3f"),
+                        "Ratio Std Beta": st.column_config.NumberColumn(format="%+.3f"),
+                    },
+                )
+                st.caption(
+                    "Incremental R² compares the two-predictor model with the CI-only model on the same complete-case sample. "
+                    "The CI100/CI ratio is calculated as each hitter's mean CI100 divided by mean total CI over the selected window."
+                )
+
+            show_names = st.checkbox(
+                "Show hitter names on CI100 model charts",
+                value=False,
+                key=f"ci100_show_names_{outcome_col}",
+            )
+            chart_left, chart_right = st.columns(2)
+            with chart_left:
+                st.plotly_chart(
+                    build_ci100_observed_predicted_chart(
+                        ci_ci100, outcome_label, unit, "Total CI + CI100", show_names
+                    ),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=f"ci100_pred_{outcome_col}_{show_names}",
+                )
+            with chart_right:
+                st.plotly_chart(
+                    build_ci100_observed_predicted_chart(
+                        ci_ratio, outcome_label, unit, "Total CI + CI100/CI Ratio", show_names
+                    ),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=f"ci100_ratio_pred_{outcome_col}_{show_names}",
+                )
+
+            with st.container(border=True):
+                st.subheader("CI100 / Total CI Ratio", anchor=False)
+                st.plotly_chart(
+                    build_ci100_ratio_scatter(
+                        panel, outcome_col, outcome_label, unit, show_names
+                    ),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=f"ci100_ratio_scatter_{outcome_col}_{show_names}",
+                )
+
+            with st.container(border=True):
+                st.subheader("Hitter Results", anchor=False)
+                display_cols = [
+                    "athlete", "team", "avg_ci", "avg_ci100", "avg_ci100_ratio_pct",
+                    "ci100_test_dates", "first_ci100_date", "last_ci100_date", outcome_col,
+                ]
+                if outcome_col == "avg_bat_speed":
+                    display_cols.insert(-1, "bat_speed_months")
+                display = panel[display_cols].dropna(subset=[outcome_col]).copy()
+                rename = {
+                    "athlete": "Hitter", "team": "Team", "avg_ci": "Average Total CI",
+                    "avg_ci100": "Average CI100", "avg_ci100_ratio_pct": "CI100 / Total CI (%)",
+                    "ci100_test_dates": "ForceDecks Test Dates", "first_ci100_date": "First Test",
+                    "last_ci100_date": "Last Test", "avg_bat_speed": "Average Bat Speed",
+                    "bat_speed_months": "Bat-Speed Months", "p90_exit_velo": "P90 Exit Velo",
+                }
+                display = display.rename(columns=rename)
+                for date_col in ["First Test", "Last Test"]:
+                    if date_col in display.columns:
+                        display[date_col] = display[date_col].map(fmt_date)
+                st.dataframe(
+                    display,
+                    hide_index=True,
+                    use_container_width=True,
+                    height=min(660, 44 + 36 * (len(display) + 1)),
+                    column_config={
+                        "Average Total CI": st.column_config.NumberColumn(format="%.2f N·s"),
+                        "Average CI100": st.column_config.NumberColumn(format="%.2f N·s"),
+                        "CI100 / Total CI (%)": st.column_config.NumberColumn(format="%.2f%%"),
+                        "Average Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
+                        "P90 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"),
+                    },
+                )
+                csv_download_button(
+                    display,
+                    f"Download {outcome_label} CI100 model CSV",
+                    f"ci100_{outcome_col}_model_results.csv",
+                    f"download_ci100_{outcome_col}_model_results",
+                )
+
+
 # st.tabs executes every tab on every rerun. A first-position tab therefore still
 # paid the cost of all player-level Google Sheet reads before the ranking appeared.
 # The ranking is now a true lightweight landing view, and the heavy dashboard is
@@ -8989,7 +9711,7 @@ if app_view == "S&C Influenced Performance Rankings":
 
 try:
     (
-        jump, jump_power, velo, bat, pinch, sprint, exit_velo,
+        jump, jump_power, velo, bat, pinch, sprint, exit_velo, ci100,
         infield_defense, baserunning_defense, all_baserunning_defense, status,
     ) = load_source_data()
 except Exception as exc:
@@ -9163,6 +9885,16 @@ exit_velo_summary = build_exit_velo_summary(
     team_filter=team_filter,
     min_ci_jumps=int(min_ci_jumps),
 )
+ci100_hitting_panel = build_ci100_hitting_model_panel(
+    ci100=ci100,
+    jump=jump,
+    bat=bat,
+    exit_velo=exit_velo,
+    start_date=start_date,
+    end_date=end_date,
+    team_filter=team_filter,
+    min_ci_jumps=int(min_ci_jumps),
+)
 if_reaction_power_summary = build_peak_power_rel_outcome_summary(
     jump_power=jump_power,
     outcome_df=infield_defense,
@@ -9256,6 +9988,7 @@ bat_projection_model = fit_simple_projection_model(
     sprint_overview_tab,
     bat_overview_tab,
     exit_velo_overview_tab,
+    ci100_hitting_models_tab,
     if_reaction_power_tab,
     rel_power_nbsr_tab,
     sprint_nbsr_tab,
@@ -9273,6 +10006,7 @@ bat_projection_model = fit_simple_projection_model(
     "Sprint Speed Overview",
     "Bat Speed Overview",
     "P90 Exit Velo Overview",
+    "CI + CI100 Hitting Models",
     "Rel PP × IF Reaction 3ft",
     "Rel PP × nBSR",
     "Sprint Speed × nBSR",
@@ -12158,6 +12892,13 @@ with exit_velo_overview_tab:
             )
 
 
+
+
+with ci100_hitting_models_tab:
+    render_ci100_hitting_models_tab(
+        ci100_hitting_panel,
+        ci100_available=(ci100 is not None and not ci100.empty),
+    )
 
 
 with if_reaction_power_tab:
