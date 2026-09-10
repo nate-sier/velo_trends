@@ -1,3 +1,4 @@
+# Standalone Bat Speed overview converted to 2026 regular-season cross-sectional analysis.
 """
 Performance × CI — Streamlit deployment-ready dashboard.
 
@@ -9360,6 +9361,422 @@ def build_ci100_hitting_model_panel(
         .reset_index(drop=True)
     )
 
+
+def build_season_bat_speed_pairs(
+    panel: pd.DataFrame,
+    min_fd_dates: int = 1,
+    min_bat_obs: int = 1,
+) -> pd.DataFrame:
+    """Standalone season Bat Speed × Total CI cross-sectional dataset.
+
+    This intentionally uses the same season CI100 panel as the CI + CI100
+    hitting-model tab so the standalone Bat Speed overview and CI100 models
+    share the same season, player IDs, Total CI source, and hitting outcome.
+    """
+    columns = [
+        "player_id", "name_key", "athlete", "team", "season",
+        "avg_ci", "avg_bat_speed", "bat_speed_observations",
+        "ci100_test_dates", "first_ci100_date", "last_ci100_date",
+        "first_bat_speed_date", "last_bat_speed_date", "observation",
+    ]
+    if panel is None or panel.empty:
+        return pd.DataFrame(columns=columns)
+
+    work = panel.copy()
+    work = work[
+        pd.to_numeric(work["ci100_test_dates"], errors="coerce")
+        .ge(max(1, int(min_fd_dates)))
+        & pd.to_numeric(work["bat_speed_observations"], errors="coerce")
+        .ge(max(1, int(min_bat_obs)))
+    ].copy()
+
+    work = work.dropna(subset=["avg_ci", "avg_bat_speed"]).copy()
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+
+    work["observation"] = work["athlete"]
+    for col in columns:
+        if col not in work.columns:
+            work[col] = np.nan
+
+    return (
+        work[columns]
+        .sort_values(["athlete"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+def season_bat_correlation_stats(
+    pairs: pd.DataFrame,
+) -> tuple[float, float, float, float] | None:
+    """Simple season-level Bat Speed ~ Total CI regression."""
+    if pairs is None or len(pairs) < 2:
+        return None
+    data = pairs[["avg_ci", "avg_bat_speed"]].dropna()
+    if len(data) < 2:
+        return None
+    x = data["avg_ci"].to_numpy(dtype=float)
+    y = data["avg_bat_speed"].to_numpy(dtype=float)
+    if np.isclose(np.std(x), 0) or np.isclose(np.std(y), 0):
+        return None
+    slope, intercept = np.polyfit(x, y, 1)
+    r = float(np.corrcoef(x, y)[0, 1])
+    return r, r * r, float(slope), float(intercept)
+
+
+def season_bat_ci_band_summary(
+    pairs: pd.DataFrame,
+    band_width: int,
+    bat_stat: str = "Mean",
+) -> pd.DataFrame:
+    stat = "Median" if str(bat_stat).strip().lower() == "median" else "Mean"
+    speed_col = f"{stat} Season Bat Speed"
+    if pairs is None or pairs.empty:
+        return pd.DataFrame(
+            columns=["CI band", speed_col, "Hitters", "Average CI"]
+        )
+
+    width = max(1, int(band_width))
+    work = pairs[
+        ["player_id", "avg_ci", "avg_bat_speed"]
+    ].dropna().copy()
+    work["band_start"] = hitting_ci_bucket_start(work["avg_ci"], width)
+
+    grouped = (
+        work.groupby("band_start", as_index=False)
+        .agg(
+            **{
+                speed_col: (
+                    "avg_bat_speed",
+                    "median" if stat == "Median" else "mean",
+                ),
+                "Hitters": ("player_id", "nunique"),
+                "Average CI": ("avg_ci", "mean"),
+            }
+        )
+        .sort_values("band_start")
+    )
+    grouped["CI band"] = grouped["band_start"].map(
+        lambda lower: hitting_ci_bucket_label(lower, width)
+    )
+    grouped[speed_col] = grouped[speed_col].round(2)
+    grouped["Average CI"] = grouped["Average CI"].round(2)
+    return grouped[["CI band", speed_col, "Hitters", "Average CI"]]
+
+
+def build_season_bat_band_chart(
+    pairs: pd.DataFrame,
+    band_width: int,
+    bat_stat: str = "Mean",
+) -> go.Figure:
+    stat = "Median" if str(bat_stat).strip().lower() == "median" else "Mean"
+    speed_col = f"{stat} Season Bat Speed"
+    bands = season_bat_ci_band_summary(pairs, band_width, stat)
+
+    fig = go.Figure()
+    if bands.empty:
+        fig.add_annotation(
+            text="No matched hitters are available for season CI bands.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 380)
+
+    fig.add_trace(go.Bar(
+        x=bands["CI band"],
+        y=bands[speed_col],
+        marker={"color": BLUE, "line": {"color": NAVY_MID, "width": 0.8}},
+        text=[f"{speed:.1f}" for speed in bands[speed_col]],
+        textposition="outside",
+        cliponaxis=False,
+        customdata=np.column_stack([bands["Hitters"], bands["Average CI"]]),
+        hovertemplate=(
+            f"<b>%{{x}}</b><br>{stat} regular-season bat speed: %{{y:.2f}} mph<br>"
+            "Hitters: %{customdata[0]}<br>"
+            "Mean season CI within band: %{customdata[1]:.2f} N·s"
+            "<extra></extra>"
+        ),
+    ))
+    y_min = max(0, float(bands[speed_col].min()) - 2.0)
+    y_max = float(bands[speed_col].max()) + 1.5
+    fig.update_xaxes(
+        title="Season average Total CI band",
+        showgrid=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title=f"{stat} regular-season average bat speed (mph)",
+        range=[y_min, y_max],
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 380)
+
+
+def build_season_bat_scatter(
+    pairs: pd.DataFrame,
+    show_labels: bool,
+    ci_lookup: float | None,
+) -> go.Figure:
+    fig = go.Figure()
+    if pairs is None or pairs.empty:
+        fig.add_annotation(
+            text="No matched hitters meet the season observation rules.",
+            showarrow=False,
+            font={"size": 15, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 560)
+
+    customdata = np.column_stack([
+        pairs["athlete"],
+        pairs["team"].fillna("Unassigned"),
+        pairs["bat_speed_observations"],
+        pairs["ci100_test_dates"],
+        pairs["first_ci100_date"].map(fmt_date),
+        pairs["last_ci100_date"].map(fmt_date),
+        pairs["first_bat_speed_date"].map(fmt_date),
+        pairs["last_bat_speed_date"].map(fmt_date),
+    ])
+    fig.add_trace(go.Scatter(
+        x=pairs["avg_ci"],
+        y=pairs["avg_bat_speed"],
+        mode="markers+text" if show_labels else "markers",
+        text=pairs["observation"] if show_labels else None,
+        textposition="top center",
+        textfont={"size": 9, "color": NAVY},
+        marker={
+            "size": 13,
+            "color": BLUE,
+            "opacity": 0.86,
+            "line": {"color": "#FFFFFF", "width": 2},
+        },
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Team: %{customdata[1]}<br>"
+            "Regular-season avg bat speed: %{y:.2f} mph<br>"
+            "Season avg Total CI: %{x:.2f} N·s<br><br>"
+            "Bat-speed observations: %{customdata[2]} · %{customdata[6]}–%{customdata[7]}<br>"
+            "ForceDecks test dates: %{customdata[3]} · %{customdata[4]}–%{customdata[5]}"
+            "<extra></extra>"
+        ),
+    ))
+
+    stats = season_bat_correlation_stats(pairs)
+    if stats is not None:
+        r, r2, slope, intercept = stats
+        x_range = np.linspace(
+            pairs["avg_ci"].min(), pairs["avg_ci"].max(), 100
+        )
+        fig.add_trace(go.Scatter(
+            x=x_range,
+            y=slope * x_range + intercept,
+            mode="lines",
+            line={"color": NAVY_MID, "width": 2.5, "dash": "dash"},
+            hoverinfo="skip",
+            showlegend=False,
+        ))
+        fig.add_annotation(
+            text=f"r = {r:+.2f} · R² = {r2:.2f} · n = {len(pairs)}",
+            x=0.02, y=0.98, xref="paper", yref="paper",
+            xanchor="left", yanchor="top",
+            showarrow=False,
+            font={"color": NAVY, "size": 13},
+            bgcolor="#FFFFFF", bordercolor=BORDER,
+            borderwidth=1, borderpad=7,
+        )
+        if ci_lookup is not None and np.isfinite(ci_lookup):
+            predicted = slope * float(ci_lookup) + intercept
+            fig.add_vline(
+                x=float(ci_lookup), line_color=TEAL,
+                line_width=1.5, line_dash="dot",
+            )
+            fig.add_hline(
+                y=predicted, line_color=TEAL,
+                line_width=1.5, line_dash="dot",
+            )
+            fig.add_trace(go.Scatter(
+                x=[float(ci_lookup)],
+                y=[predicted],
+                mode="markers",
+                marker={
+                    "size": 15, "color": TEAL, "symbol": "diamond",
+                    "line": {"color": "#FFFFFF", "width": 2},
+                },
+                hovertemplate=(
+                    "<b>CI lookup</b><br>"
+                    "Season avg Total CI: %{x:.1f} N·s<br>"
+                    "Estimated regular-season avg bat speed: %{y:.2f} mph"
+                    "<extra></extra>"
+                ),
+                showlegend=False,
+            ))
+
+    fig.update_xaxes(
+        title="Season average Total CI (N·s)",
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig.update_yaxes(
+        title="Regular-season average bat speed (mph)",
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+        tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    return base_figure_layout(fig, 560)
+
+
+def season_bat_ci_band_members(
+    pairs: pd.DataFrame,
+    band_width: int,
+    ci_band: str,
+    bat_stat: str = "Mean",
+) -> tuple[pd.DataFrame, float, str]:
+    stat = "Median" if str(bat_stat).strip().lower() == "median" else "Mean"
+    width = max(1, int(band_width))
+    cols = [
+        "athlete", "team", "avg_ci", "avg_bat_speed",
+        "bat_speed_observations", "ci100_test_dates",
+    ]
+
+    if pairs is None or pairs.empty or any(c not in pairs.columns for c in cols):
+        return (
+            pd.DataFrame(columns=cols + ["CI band", "Status", "Difference"]),
+            np.nan,
+            stat,
+        )
+
+    detail = pairs[cols].dropna(
+        subset=["avg_ci", "avg_bat_speed"]
+    ).copy()
+    detail["band_start"] = hitting_ci_bucket_start(detail["avg_ci"], width)
+    detail["CI band"] = detail["band_start"].map(
+        lambda lower: hitting_ci_bucket_label(lower, width)
+    )
+    detail = detail[detail["CI band"] == ci_band].copy()
+    if detail.empty:
+        return detail, np.nan, stat
+
+    reference = (
+        float(detail["avg_bat_speed"].median())
+        if stat == "Median"
+        else float(detail["avg_bat_speed"].mean())
+    )
+    detail["Difference"] = detail["avg_bat_speed"] - reference
+    detail["Status"] = np.where(
+        np.isclose(detail["Difference"], 0, atol=1e-10),
+        f"At {stat.lower()}",
+        np.where(
+            detail["Difference"] > 0,
+            f"Above {stat.lower()}",
+            f"Below {stat.lower()}",
+        ),
+    )
+    detail["Display"] = detail.apply(
+        lambda row: f"{row['athlete']} · {row['avg_ci']:.1f} CI",
+        axis=1,
+    )
+    return (
+        detail.sort_values("avg_bat_speed", ascending=False).reset_index(drop=True),
+        reference,
+        stat,
+    )
+
+
+def build_season_bat_ci_band_member_chart(
+    pairs: pd.DataFrame,
+    band_width: int,
+    ci_band: str,
+    bat_stat: str = "Mean",
+) -> go.Figure:
+    detail, reference, stat = season_bat_ci_band_members(
+        pairs, band_width, ci_band, bat_stat
+    )
+    fig = go.Figure()
+
+    if detail.empty:
+        fig.add_annotation(
+            text="No hitters are available in this season CI band.",
+            showarrow=False,
+            font={"size": 14, "color": SUBTEXT},
+            x=0.5, y=0.5, xref="paper", yref="paper",
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 340)
+
+    status_style = [
+        (f"Above {stat.lower()}", GREEN),
+        (f"At {stat.lower()}", TEAL),
+        (f"Below {stat.lower()}", ACCENT_RED),
+    ]
+    category_order = detail["Display"].tolist()
+
+    for status, color in status_style:
+        sub = detail[detail["Status"] == status].copy()
+        if sub.empty:
+            continue
+        customdata = np.column_stack([
+            sub["athlete"],
+            sub["team"].fillna("Unassigned"),
+            sub["avg_ci"],
+            sub["Difference"],
+            sub["Status"],
+            sub["bat_speed_observations"],
+            sub["ci100_test_dates"],
+        ])
+        fig.add_trace(go.Bar(
+            x=sub["avg_bat_speed"],
+            y=sub["Display"],
+            orientation="h",
+            name=status.title(),
+            marker={"color": color, "line": {"color": "#FFFFFF", "width": 1}},
+            text=[f"{v:.2f}" for v in sub["avg_bat_speed"]],
+            textposition="outside",
+            cliponaxis=False,
+            customdata=customdata,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Team: %{customdata[1]}<br>"
+                "Season avg Total CI: %{customdata[2]:.2f} N·s<br>"
+                "Regular-season avg bat speed: %{x:.2f} mph<br>"
+                f"{stat} difference: %{{customdata[3]:+.2f}} mph<br>"
+                "Bat-speed observations: %{customdata[5]}<br>"
+                "ForceDecks test dates: %{customdata[6]}<br>"
+                "Flag: %{customdata[4]}<extra></extra>"
+            ),
+        ))
+
+    fig.add_vline(
+        x=reference,
+        line_color=NAVY,
+        line_dash="dash",
+        line_width=1.5,
+        annotation_text=f"{stat}: {reference:.2f}",
+        annotation_position="top",
+    )
+    fig.update_yaxes(
+        autorange="reversed",
+        categoryorder="array",
+        categoryarray=category_order,
+        showgrid=False,
+        linecolor=BORDER,
+    )
+    fig.update_xaxes(
+        title="Regular-season average bat speed (mph)",
+        showgrid=True, gridcolor=GRID, zeroline=False, linecolor=BORDER,
+    )
+    return base_figure_layout(
+        fig,
+        max(340, min(760, 100 + 36 * len(detail))),
+    )
+
+
 def fit_hitting_cross_sectional_model(
     frame: pd.DataFrame,
     outcome_col: str,
@@ -10240,7 +10657,7 @@ bat_projection_model = fit_simple_projection_model(
     "Predicted vs Actual Velo",
     "BW + CI Projections",
     "Sprint Speed Overview",
-    "Bat Speed Overview",
+    "Season Bat Speed Overview",
     "P90 Exit Velo Overview",
     "CI + CI100 Season Hitting Models",
     "Rel PP × IF Reaction 3ft",
@@ -12516,318 +12933,370 @@ with sprint_overview_tab:
 
 
 with bat_overview_tab:
-    bat_stats = bat_correlation_stats(bat_monthly_pairs)
-    n_hitters = len(bat_monthly_pairs)
-    mean_bat_speed = (
-        bat_monthly_pairs["monthly_avg_bat_speed"].mean()
-        if n_hitters else np.nan
-    )
-    mean_monthly_ci = (
-        bat_monthly_pairs["avg_ci"].mean()
-        if n_hitters else np.nan
-    )
-    bat_r_text = (
-        f"{bat_stats[0]:+.2f}" if bat_stats is not None else "—"
-    )
-    bat_r2_text = (
-        f"{bat_stats[1]:.2f}" if bat_stats is not None else "—"
-    )
-    potential_bat_increase = (
-        bat_stats[2] * POTENTIAL_CI_INCREASE
-        if bat_stats is not None else np.nan
-    )
-    potential_bat_text = (
-        f"{potential_bat_increase:+.2f} mph"
-        if pd.notna(potential_bat_increase) else "—"
+    st.caption(
+        "2026 regular-season cross-sectional analysis. Each hitter contributes one row: "
+        "season-to-date mean Total CI from the same ForceDecks tests used by the CI100 models, "
+        "matched by MLBAM ID to regular-season mean bat speed from the Hitting Season tab. "
+        "The global dashboard date slider does not alter this tab."
     )
 
-    top_cols = st.columns(3)
-    top_metrics = [
-        ("Hitters", str(n_hitters), BLUE),
-        ("Correlation", bat_r_text, ACCENT_RED),
-        ("R²", bat_r2_text, NAVY_MID),
-    ]
-    for column, values in zip(top_cols, top_metrics):
-        with column:
-            st.markdown(metric_card(*values), unsafe_allow_html=True)
+    if hitting_season is None or hitting_season.empty:
+        st.warning(
+            "The 'Hitting Season' tab is missing or empty. Run "
+            "`python3 ~/Downloads/sync_ci100_hitting_regular_season_v4.py --write`, then refresh the app."
+        )
+    elif ci100_hitting_panel is None or ci100_hitting_panel.empty:
+        st.info("No season CI × Bat Speed hitters match the current team filter.")
+    else:
+        filter_cols = st.columns(2)
+        with filter_cols[0]:
+            bat_season_min_fd_dates = st.number_input(
+                "Minimum ForceDecks test dates",
+                min_value=1,
+                value=1,
+                step=1,
+                key="bat_season_min_fd_dates",
+            )
+        with filter_cols[1]:
+            bat_season_min_obs = st.number_input(
+                "Minimum bat-speed observations",
+                min_value=1,
+                value=1,
+                step=1,
+                key="bat_season_min_obs",
+            )
 
-    bottom_cols = st.columns(3)
-    bottom_metrics = [
-        (
-            "Monthly Avg Bat Speed",
-            f"{fmt(mean_bat_speed)} mph",
-            TEAL,
-        ),
-        (
-            "Monthly Average CI",
-            f"{fmt(mean_monthly_ci)} N·s",
-            GREEN,
-        ),
-        (
-            f"Potential Bat Speed Increase · +{POTENTIAL_CI_INCREASE:.0f} N·s CI",
-            potential_bat_text,
-            NAVY_MID,
-        ),
-    ]
-    for column, values in zip(bottom_cols, bottom_metrics):
-        with column:
-            st.markdown(metric_card(*values), unsafe_allow_html=True)
-
-    estimated_bat_speed = (
-        bat_stats[2] * float(bat_ci_lookup) + bat_stats[3]
-        if bat_stats is not None else np.nan
-    )
-    with st.container(border=True):
-        st.subheader("Monthly CI Lookup", anchor=False)
-        lookup_left, lookup_right = st.columns(2)
-        with lookup_left:
-            st.markdown(
-                "<div class='metric-label'>Monthly Average CI</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"<div class='lookup-value' style='color:#0A1F44;'>"
-                f"{fmt(bat_ci_lookup, 1)} N·s</div>",
-                unsafe_allow_html=True,
-            )
-        with lookup_right:
-            st.markdown(
-                "<div class='metric-label'>Estimated Monthly Avg Bat Speed</div>",
-                unsafe_allow_html=True,
-            )
-            lookup_value = (
-                f"{fmt(estimated_bat_speed)} mph"
-                if pd.notna(estimated_bat_speed) else "—"
-            )
-            st.markdown(
-                f"<div class='lookup-value' style='color:#0D7E8A;'>"
-                f"{lookup_value}</div>",
-                unsafe_allow_html=True,
-            )
-        st.number_input(
-            "CI lookup", min_value=0.0, step=1.0, value=280.0,
-            format="%.1f", key="bat_ci_lookup",
+        bat_season_pairs = build_season_bat_speed_pairs(
+            ci100_hitting_panel,
+            min_fd_dates=int(bat_season_min_fd_dates),
+            min_bat_obs=int(bat_season_min_obs),
+        )
+        bat_stats = season_bat_correlation_stats(bat_season_pairs)
+        n_hitters = len(bat_season_pairs)
+        mean_bat_speed = (
+            bat_season_pairs["avg_bat_speed"].mean()
+            if n_hitters else np.nan
+        )
+        mean_season_ci = (
+            bat_season_pairs["avg_ci"].mean()
+            if n_hitters else np.nan
+        )
+        bat_r_text = f"{bat_stats[0]:+.2f}" if bat_stats is not None else "—"
+        bat_r2_text = f"{bat_stats[1]:.2f}" if bat_stats is not None else "—"
+        potential_bat_increase = (
+            bat_stats[2] * POTENTIAL_CI_INCREASE
+            if bat_stats is not None else np.nan
+        )
+        potential_bat_text = (
+            f"{potential_bat_increase:+.2f} mph"
+            if pd.notna(potential_bat_increase) else "—"
         )
 
-    with st.container(border=True):
-        st.subheader(
-            f"{bat_ci_band_stat} Monthly Bat Speed by CI Band",
-            anchor=False,
+        season_values = pd.to_numeric(
+            bat_season_pairs.get("season"), errors="coerce"
+        ).dropna()
+        season_text = (
+            str(int(season_values.max()))
+            if not season_values.empty else "2026"
         )
-        st.plotly_chart(
-            build_bat_band_chart(
-                bat_monthly_pairs,
-                int(bat_ci_band_width),
-                bat_ci_band_stat,
+        st.caption(
+            f"Season: {season_text} · Current team filter: {team_filter} · "
+            "Observation minimums apply only to this tab."
+        )
+
+        top_cols = st.columns(3)
+        top_metrics = [
+            ("Hitters", str(n_hitters), BLUE),
+            ("Correlation", bat_r_text, ACCENT_RED),
+            ("R²", bat_r2_text, NAVY_MID),
+        ]
+        for column, values in zip(top_cols, top_metrics):
+            with column:
+                st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+        bottom_cols = st.columns(3)
+        bottom_metrics = [
+            (
+                "Regular-Season Avg Bat Speed",
+                f"{fmt(mean_bat_speed)} mph",
+                TEAL,
             ),
-            use_container_width=True,
-            config={"displayModeBar": False},
-            key=(
-                f"bat_ci_band_{bat_ci_band_width}_{bat_ci_band_stat}_"
-                f"{team_filter}_{start_date}_{end_date}"
+            (
+                "Season Average Total CI",
+                f"{fmt(mean_season_ci)} N·s",
+                GREEN,
             ),
-        )
-        bat_band_control_1, bat_band_control_2 = st.columns(2)
-        with bat_band_control_1:
-            st.selectbox(
-                "CI band width", [5, 10, 15, 20], index=1,
-                format_func=lambda x: f"{x} N·s", key="bat_ci_band_width",
-            )
-        with bat_band_control_2:
-            st.radio(
-                "Bat speed statistic", ["Mean", "Median"], horizontal=True,
-                key="bat_ci_band_stat",
-            )
-
-
-    with st.container(border=True):
-        st.subheader("Average CI by Bat Speed Bucket", anchor=False)
-        st.plotly_chart(
-            build_output_bucket_chart(
-                df=bat_monthly_pairs,
-                output_col="monthly_avg_bat_speed",
-                testing_col="avg_ci",
-                bucket_width=BAT_SPEED_OUTPUT_BUCKET_WIDTH,
-                output_bucket_label="Bat speed bucket",
-                testing_metric_label="CI",
-                output_axis_title="Monthly average bat speed bucket",
-                testing_axis_title="Average CI (N·s)",
-                output_unit="mph",
-                empty_text="No matched hitters are available for bat-speed buckets.",
-                color=TEAL,
+            (
+                f"Estimated Bat Speed Difference · +{POTENTIAL_CI_INCREASE:.0f} N·s CI",
+                potential_bat_text,
+                NAVY_MID,
             ),
-            use_container_width=True,
-            config={"displayModeBar": False},
-            key=f"bat_output_bucket_{team_filter}_{start_date}_{end_date}",
+        ]
+        for column, values in zip(bottom_cols, bottom_metrics):
+            with column:
+                st.markdown(metric_card(*values), unsafe_allow_html=True)
+
+        estimated_bat_speed = (
+            bat_stats[2] * float(bat_ci_lookup) + bat_stats[3]
+            if bat_stats is not None else np.nan
         )
-
-
-    bat_output_bands = output_bucket_summary(
-        bat_monthly_pairs,
-        "monthly_avg_bat_speed",
-        "avg_ci",
-        BAT_SPEED_OUTPUT_BUCKET_WIDTH,
-        "Bat speed bucket",
-        "CI",
-        "mph",
-        "N·s",
-    )
-    if not bat_output_bands.empty:
-        bat_output_options = bat_output_bands["Bat speed bucket"].tolist()
-        bat_output_key = "bat_output_bucket_detail_selector"
-        if st.session_state.get(bat_output_key) not in bat_output_options:
-            st.session_state[bat_output_key] = bat_output_options[0]
         with st.container(border=True):
-            st.subheader("Bat Speed Bucket Hitters", anchor=False)
-            selected_bat_output_bucket = st.selectbox(
-                "Bat speed bucket",
-                bat_output_options,
-                key=bat_output_key,
+            st.subheader("Season CI Lookup", anchor=False)
+            lookup_left, lookup_right = st.columns(2)
+            with lookup_left:
+                st.markdown(
+                    "<div class='metric-label'>Season Average Total CI</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f"<div class='lookup-value' style='color:#0A1F44;'>"
+                    f"{fmt(bat_ci_lookup, 1)} N·s</div>",
+                    unsafe_allow_html=True,
+                )
+            with lookup_right:
+                st.markdown(
+                    "<div class='metric-label'>Estimated Regular-Season Avg Bat Speed</div>",
+                    unsafe_allow_html=True,
+                )
+                lookup_value = (
+                    f"{fmt(estimated_bat_speed)} mph"
+                    if pd.notna(estimated_bat_speed) else "—"
+                )
+                st.markdown(
+                    f"<div class='lookup-value' style='color:#0D7E8A;'>"
+                    f"{lookup_value}</div>",
+                    unsafe_allow_html=True,
+                )
+            st.number_input(
+                "CI lookup",
+                min_value=0.0,
+                step=1.0,
+                value=280.0,
+                format="%.1f",
+                key="bat_ci_lookup",
             )
-            st.plotly_chart(
-                build_output_bucket_member_chart(
-                    df=bat_monthly_pairs,
-                    output_col="monthly_avg_bat_speed",
-                    testing_col="avg_ci",
-                    bucket_width=BAT_SPEED_OUTPUT_BUCKET_WIDTH,
-                    selected_bucket=selected_bat_output_bucket,
-                    output_bucket_label="Bat speed bucket",
-                    output_unit="mph",
-                    testing_axis_title="Monthly average CI",
-                    testing_unit="N·s",
-                    entity_label="Hitter",
-                    output_value_label="Monthly average bat speed",
-                ),
-                use_container_width=True,
-                config={"displayModeBar": False},
-                key=f"bat_output_detail_{selected_bat_output_bucket}_{team_filter}_{start_date}_{end_date}",
-            )
-
-    bat_ci_band_overview = bat_ci_band_summary(
-        bat_monthly_pairs,
-        int(bat_ci_band_width),
-        bat_ci_band_stat,
-    )
-
-    if not bat_ci_band_overview.empty:
-        bat_band_options = bat_ci_band_overview["CI band"].tolist()
-        bat_band_detail_key = "bat_ci_band_detail_selector"
-        if st.session_state.get(bat_band_detail_key) not in bat_band_options:
-            st.session_state[bat_band_detail_key] = bat_band_options[0]
 
         with st.container(border=True):
-            st.subheader("CI Band Hitters", anchor=False)
-            selected_bat_ci_band = st.selectbox(
-                "Hitter CI band",
-                bat_band_options,
-                key=bat_band_detail_key,
+            st.subheader(
+                f"{bat_ci_band_stat} Regular-Season Bat Speed by Season CI Band",
+                anchor=False,
             )
             st.plotly_chart(
-                build_bat_ci_band_member_chart(
-                    bat_monthly_pairs,
+                build_season_bat_band_chart(
+                    bat_season_pairs,
                     int(bat_ci_band_width),
-                    selected_bat_ci_band,
                     bat_ci_band_stat,
                 ),
                 use_container_width=True,
                 config={"displayModeBar": False},
                 key=(
-                    f"bat_ci_band_detail_{selected_bat_ci_band}_"
-                    f"{bat_ci_band_width}_{bat_ci_band_stat}_{team_filter}_"
-                    f"{start_date}_{end_date}"
+                    f"season_bat_ci_band_{bat_ci_band_width}_{bat_ci_band_stat}_"
+                    f"{team_filter}_{bat_season_min_fd_dates}_{bat_season_min_obs}"
                 ),
             )
-
-    with st.container(border=True):
-        st.subheader(
-            "Monthly CI vs Monthly Average Bat Speed",
-            anchor=False,
-        )
-        st.plotly_chart(
-            build_bat_scatter(
-                bat_monthly_pairs,
-                bat_show_labels,
-                float(bat_ci_lookup),
-            ),
-            use_container_width=True,
-            config={"displayModeBar": False},
-            key=(
-                f"bat_scatter_{team_filter}_{start_date}_{end_date}_"
-                f"{bat_show_labels}_{bat_ci_lookup}"
-            ),
-        )
-        st.checkbox("Show names", key="bat_show_labels")
-
-    with st.container(border=True):
-        st.subheader("Hitter Results", anchor=False)
-        if bat_monthly_pairs.empty:
-            st.info("No matching hitters.")
-        else:
-            bat_display = bat_monthly_pairs[[
-                "athlete",
-                "team",
-                "month",
-                "monthly_avg_bat_speed",
-                "bat_speed_as_of",
-                "avg_ci",
-                "ci_jumps",
-                "ci_test_dates",
-                "first_ci_date",
-                "last_ci_date",
-            ]].copy()
-            bat_display.columns = [
-                "Hitter",
-                "Team",
-                "Month",
-                "Monthly Avg Bat Speed",
-                "Bat Speed As Of",
-                "Monthly Average CI",
-                "CI Jumps",
-                "CI Test Dates",
-                "First CI",
-                "Last CI",
-            ]
-            bat_display["Month"] = (
-                pd.to_datetime(bat_display["Month"])
-                .dt.strftime("%b %Y")
-            )
-            for date_col in [
-                "Bat Speed As Of", "First CI", "Last CI"
-            ]:
-                bat_display[date_col] = bat_display[date_col].map(
-                    fmt_date
+            bat_band_control_1, bat_band_control_2 = st.columns(2)
+            with bat_band_control_1:
+                st.selectbox(
+                    "CI band width",
+                    [5, 10, 15, 20],
+                    index=1,
+                    format_func=lambda x: f"{x} N·s",
+                    key="bat_ci_band_width",
                 )
-            bat_display["Monthly Avg Bat Speed"] = (
-                bat_display["Monthly Avg Bat Speed"].round(2)
-            )
-            bat_display["Monthly Average CI"] = (
-                bat_display["Monthly Average CI"].round(2)
-            )
-            st.dataframe(
-                bat_display,
-                hide_index=True,
-                use_container_width=True,
-                height=min(
-                    660,
-                    44 + 36 * (len(bat_display) + 1),
+            with bat_band_control_2:
+                st.radio(
+                    "Bat speed statistic",
+                    ["Mean", "Median"],
+                    horizontal=True,
+                    key="bat_ci_band_stat",
+                )
+
+        with st.container(border=True):
+            st.subheader("Average Season CI by Bat Speed Bucket", anchor=False)
+            st.plotly_chart(
+                build_output_bucket_chart(
+                    df=bat_season_pairs,
+                    output_col="avg_bat_speed",
+                    testing_col="avg_ci",
+                    bucket_width=BAT_SPEED_OUTPUT_BUCKET_WIDTH,
+                    output_bucket_label="Bat speed bucket",
+                    testing_metric_label="Season CI",
+                    output_axis_title="Regular-season average bat speed bucket",
+                    testing_axis_title="Season average Total CI (N·s)",
+                    output_unit="mph",
+                    empty_text="No matched hitters are available for season bat-speed buckets.",
+                    color=TEAL,
                 ),
-                column_config={
-                    "Monthly Avg Bat Speed":
-                        st.column_config.NumberColumn(
-                            format="%.2f mph"
-                        ),
-                    "Monthly Average CI":
-                        st.column_config.NumberColumn(
-                            format="%.2f N·s"
-                        ),
-                },
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=(
+                    f"season_bat_output_bucket_{team_filter}_"
+                    f"{bat_season_min_fd_dates}_{bat_season_min_obs}"
+                ),
             )
-            csv_download_button(
-                bat_display,
-                "Download bat-speed results CSV",
-                "bat_speed_results.csv",
-                "download_bat_speed_results",
+
+        bat_output_bands = output_bucket_summary(
+            bat_season_pairs,
+            "avg_bat_speed",
+            "avg_ci",
+            BAT_SPEED_OUTPUT_BUCKET_WIDTH,
+            "Bat speed bucket",
+            "Season CI",
+            "mph",
+            "N·s",
+        )
+        if not bat_output_bands.empty:
+            bat_output_options = bat_output_bands["Bat speed bucket"].tolist()
+            bat_output_key = "season_bat_output_bucket_detail_selector"
+            if st.session_state.get(bat_output_key) not in bat_output_options:
+                st.session_state[bat_output_key] = bat_output_options[0]
+
+            with st.container(border=True):
+                st.subheader("Bat Speed Bucket Hitters", anchor=False)
+                selected_bat_output_bucket = st.selectbox(
+                    "Bat speed bucket",
+                    bat_output_options,
+                    key=bat_output_key,
+                )
+                st.plotly_chart(
+                    build_output_bucket_member_chart(
+                        df=bat_season_pairs,
+                        output_col="avg_bat_speed",
+                        testing_col="avg_ci",
+                        bucket_width=BAT_SPEED_OUTPUT_BUCKET_WIDTH,
+                        selected_bucket=selected_bat_output_bucket,
+                        output_bucket_label="Bat speed bucket",
+                        output_unit="mph",
+                        testing_axis_title="Season average Total CI",
+                        testing_unit="N·s",
+                        entity_label="Hitter",
+                        output_value_label="Regular-season average bat speed",
+                    ),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=(
+                        f"season_bat_output_detail_{selected_bat_output_bucket}_"
+                        f"{team_filter}_{bat_season_min_fd_dates}_{bat_season_min_obs}"
+                    ),
+                )
+
+        bat_ci_band_overview = season_bat_ci_band_summary(
+            bat_season_pairs,
+            int(bat_ci_band_width),
+            bat_ci_band_stat,
+        )
+        if not bat_ci_band_overview.empty:
+            bat_band_options = bat_ci_band_overview["CI band"].tolist()
+            bat_band_detail_key = "season_bat_ci_band_detail_selector"
+            if st.session_state.get(bat_band_detail_key) not in bat_band_options:
+                st.session_state[bat_band_detail_key] = bat_band_options[0]
+
+            with st.container(border=True):
+                st.subheader("CI Band Hitters", anchor=False)
+                selected_bat_ci_band = st.selectbox(
+                    "Hitter CI band",
+                    bat_band_options,
+                    key=bat_band_detail_key,
+                )
+                st.plotly_chart(
+                    build_season_bat_ci_band_member_chart(
+                        bat_season_pairs,
+                        int(bat_ci_band_width),
+                        selected_bat_ci_band,
+                        bat_ci_band_stat,
+                    ),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=(
+                        f"season_bat_ci_band_detail_{selected_bat_ci_band}_"
+                        f"{bat_ci_band_width}_{bat_ci_band_stat}_{team_filter}_"
+                        f"{bat_season_min_fd_dates}_{bat_season_min_obs}"
+                    ),
+                )
+
+        with st.container(border=True):
+            st.subheader(
+                "Season Average Total CI vs Regular-Season Average Bat Speed",
+                anchor=False,
             )
+            st.plotly_chart(
+                build_season_bat_scatter(
+                    bat_season_pairs,
+                    bat_show_labels,
+                    float(bat_ci_lookup),
+                ),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=(
+                    f"season_bat_scatter_{team_filter}_{bat_show_labels}_{bat_ci_lookup}_"
+                    f"{bat_season_min_fd_dates}_{bat_season_min_obs}"
+                ),
+            )
+            st.checkbox("Show names", key="bat_show_labels")
+
+        with st.container(border=True):
+            st.subheader("Hitter Results", anchor=False)
+            if bat_season_pairs.empty:
+                st.info("No matching hitters.")
+            else:
+                bat_display = bat_season_pairs[[
+                    "athlete",
+                    "team",
+                    "season",
+                    "avg_bat_speed",
+                    "bat_speed_observations",
+                    "avg_ci",
+                    "ci100_test_dates",
+                    "first_ci100_date",
+                    "last_ci100_date",
+                    "first_bat_speed_date",
+                    "last_bat_speed_date",
+                ]].copy()
+                bat_display.columns = [
+                    "Hitter",
+                    "Team",
+                    "Season",
+                    "Regular-Season Avg Bat Speed",
+                    "Bat Speed Observations",
+                    "Season Average Total CI",
+                    "ForceDecks Test Dates",
+                    "First ForceDecks Test",
+                    "Last ForceDecks Test",
+                    "First Bat Speed Date",
+                    "Last Bat Speed Date",
+                ]
+
+                for date_col in [
+                    "First ForceDecks Test",
+                    "Last ForceDecks Test",
+                    "First Bat Speed Date",
+                    "Last Bat Speed Date",
+                ]:
+                    bat_display[date_col] = bat_display[date_col].map(fmt_date)
+
+                st.dataframe(
+                    bat_display,
+                    hide_index=True,
+                    use_container_width=True,
+                    height=min(660, 44 + 36 * (len(bat_display) + 1)),
+                    column_config={
+                        "Season": st.column_config.NumberColumn(format="%d"),
+                        "Regular-Season Avg Bat Speed":
+                            st.column_config.NumberColumn(format="%.2f mph"),
+                        "Bat Speed Observations":
+                            st.column_config.NumberColumn(format="%d"),
+                        "Season Average Total CI":
+                            st.column_config.NumberColumn(format="%.2f N·s"),
+                        "ForceDecks Test Dates":
+                            st.column_config.NumberColumn(format="%d"),
+                    },
+                )
+                csv_download_button(
+                    bat_display,
+                    "Download season bat-speed results CSV",
+                    "season_bat_speed_results.csv",
+                    "download_season_bat_speed_results",
+                )
 
 with exit_velo_overview_tab:
     exit_stats = exit_velo_correlation_stats(exit_velo_summary)
