@@ -1,3 +1,4 @@
+# Removed CI100-to-Total-CI ratio references from Bat Speed and P90 model tabs.
 # Added matching CI + CI100 calculator for regular-season P90 exit velocity.
 # Calculator simplified to show only model-estimated bat speed.
 # Added CI + CI100 -> Bat Speed calculator to season hitting models.
@@ -10278,47 +10279,38 @@ def ci100_hitting_model_rows(
     outcome_col: str,
     outcome_label: str,
 ) -> tuple[pd.DataFrame, dict[str, dict | None]]:
-    """Fit season cross-sectional CI100 models on one hitter-level row each.
+    """Fit season cross-sectional CI and CI100 models on one hitter-level row each.
 
-    All incremental comparisons use the exact same complete-case sample.
+    The CI-only baseline and CI + CI100 model use the exact same complete-case
+    hitter sample so incremental R² and partial r are valid nested comparisons.
     """
-    ci_col, ci100_col, ratio_col, _ = _ci100_predictor_columns(outcome_col)
+    ci_col, ci100_col, _, _ = _ci100_predictor_columns(outcome_col)
 
     complete = panel.dropna(
-        subset=[outcome_col, ci_col, ci100_col, ratio_col]
+        subset=[outcome_col, ci_col, ci100_col]
     ).copy().reset_index(drop=True)
 
     matched_ci_only = fit_hitting_cross_sectional_model(
         complete, outcome_col, [ci_col]
     )
-    reference_ci_only = matched_ci_only
 
     models = {
-        "CI only": reference_ci_only,
+        "CI only": matched_ci_only,
         "CI + CI100": fit_hitting_cross_sectional_model(
             complete, outcome_col, [ci_col, ci100_col]
         ),
-        "CI100 / CI ratio only": fit_hitting_cross_sectional_model(
-            complete, outcome_col, [ratio_col]
-        ),
-        "CI + CI100 / CI ratio": fit_hitting_cross_sectional_model(
-            complete, outcome_col, [ci_col, ratio_col]
-        ),
-        # Internal matched baseline used only for valid incremental-R² calculations.
         "_CI only matched": matched_ci_only,
     }
 
     delta_ci100, partial_ci100 = _incremental_model_signal(
         models["CI + CI100"], matched_ci_only, -1
     )
-    delta_ratio, partial_ratio = _incremental_model_signal(
-        models["CI + CI100 / CI ratio"], matched_ci_only, -1
-    )
 
     rows = []
     for model_name, model in models.items():
         if model_name.startswith("_") or model is None:
             continue
+
         row = {
             "Outcome": outcome_label,
             "Model": model_name,
@@ -10331,21 +10323,20 @@ def ci100_hitting_model_rows(
             "Partial r beyond CI": np.nan,
             "CI Std Beta": np.nan,
             "CI100 Std Beta": np.nan,
-            "Ratio Std Beta": np.nan,
         }
-        for predictor, beta in zip(model["predictors"], model["standardized_betas"]):
+
+        for predictor, beta in zip(
+            model["predictors"], model["standardized_betas"]
+        ):
             if predictor == ci_col:
                 row["CI Std Beta"] = beta
             elif predictor == ci100_col:
                 row["CI100 Std Beta"] = beta
-            elif predictor == ratio_col:
-                row["Ratio Std Beta"] = beta
+
         if model_name == "CI + CI100":
             row["Incremental R² beyond CI"] = delta_ci100
             row["Partial r beyond CI"] = partial_ci100
-        elif model_name == "CI + CI100 / CI ratio":
-            row["Incremental R² beyond CI"] = delta_ratio
-            row["Partial r beyond CI"] = partial_ratio
+
         rows.append(row)
 
     return pd.DataFrame(rows), models
@@ -10583,11 +10574,10 @@ def render_ci100_hitting_models_tab(
 
             ci_only = models.get("CI only")
             ci_ci100 = models.get("CI + CI100")
-            ratio_only = models.get("CI100 / CI ratio only")
-            ci_ratio = models.get("CI + CI100 / CI ratio")
             matched_ci_only = models.get("_CI only matched", ci_only)
-            delta_ci100, partial_ci100 = _incremental_model_signal(ci_ci100, matched_ci_only, -1)
-            delta_ratio, partial_ratio = _incremental_model_signal(ci_ratio, matched_ci_only, -1)
+            delta_ci100, partial_ci100 = _incremental_model_signal(
+                ci_ci100, matched_ci_only, -1
+            )
 
             top = st.columns(4)
             top_values = [
@@ -10600,16 +10590,14 @@ def render_ci100_hitting_models_tab(
                 with col:
                     st.markdown(metric_card(*values), unsafe_allow_html=True)
 
-            bottom = st.columns(4)
-            bottom_values = [
-                ("CI100 Partial r", f"{partial_ci100:+.3f}" if pd.notna(partial_ci100) else "—", GREEN),
-                ("Ratio-only R²", f"{ratio_only['r2']:.3f}" if ratio_only else "—", BLUE),
-                ("CI + Ratio R²", f"{ci_ratio['r2']:.3f}" if ci_ratio else "—", NAVY_MID),
-                ("Ratio Incremental R²", f"{delta_ratio:+.3f}" if pd.notna(delta_ratio) else "—", TEAL),
-            ]
-            for col, values in zip(bottom, bottom_values):
-                with col:
-                    st.markdown(metric_card(*values), unsafe_allow_html=True)
+            st.markdown(
+                metric_card(
+                    "CI100 Partial r",
+                    f"{partial_ci100:+.3f}" if pd.notna(partial_ci100) else "—",
+                    GREEN,
+                ),
+                unsafe_allow_html=True,
+            )
 
             if outcome_col in {"avg_bat_speed", "p90_exit_velo"} and ci_ci100 is not None:
                 is_bat_speed = outcome_col == "avg_bat_speed"
@@ -10733,13 +10721,12 @@ def render_ci100_hitting_models_tab(
                         "Partial r beyond CI": st.column_config.NumberColumn(format="%+.3f"),
                         "CI Std Beta": st.column_config.NumberColumn(format="%+.3f"),
                         "CI100 Std Beta": st.column_config.NumberColumn(format="%+.3f"),
-                        "Ratio Std Beta": st.column_config.NumberColumn(format="%+.3f"),
                     },
                 )
                 st.caption(
-                    "CI-only, CI + CI100, ratio-only, and CI + ratio models are all fit on the same "
-                    "complete-case hitter sample within this outcome/filter combination. Incremental R² and "
-                    "partial r therefore compare properly nested models."
+                    "CI-only and CI + CI100 are fit on the same complete-case hitter sample "
+                    "within this outcome/filter combination. Incremental R² and partial r therefore "
+                    "compare properly nested models."
                 )
 
             show_names = st.checkbox(
@@ -10747,41 +10734,23 @@ def render_ci100_hitting_models_tab(
                 value=False,
                 key=f"ci100_season_show_names_{outcome_col}",
             )
-            chart_left, chart_right = st.columns(2)
-            with chart_left:
-                st.plotly_chart(
-                    build_ci100_observed_predicted_chart(
-                        ci_ci100, outcome_label, unit, "Season Total CI + CI100", show_names
-                    ),
-                    use_container_width=True,
-                    config={"displayModeBar": False},
-                    key=f"ci100_season_pred_{outcome_col}_{show_names}",
-                )
-            with chart_right:
-                st.plotly_chart(
-                    build_ci100_observed_predicted_chart(
-                        ci_ratio, outcome_label, unit, "Season Total CI + CI100/CI Ratio", show_names
-                    ),
-                    use_container_width=True,
-                    config={"displayModeBar": False},
-                    key=f"ci100_season_ratio_pred_{outcome_col}_{show_names}",
-                )
-
-            with st.container(border=True):
-                st.subheader("Season CI100 / Total CI Ratio", anchor=False)
-                st.plotly_chart(
-                    build_ci100_ratio_scatter(
-                        outcome_panel, outcome_col, outcome_label, unit, show_names
-                    ),
-                    use_container_width=True,
-                    config={"displayModeBar": False},
-                    key=f"ci100_season_ratio_scatter_{outcome_col}_{show_names}",
-                )
+            st.plotly_chart(
+                build_ci100_observed_predicted_chart(
+                    ci_ci100,
+                    outcome_label,
+                    unit,
+                    "Season Total CI + CI100",
+                    show_names,
+                ),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=f"ci100_season_pred_{outcome_col}_{show_names}",
+            )
 
             with st.container(border=True):
                 st.subheader("Hitter Results", anchor=False)
                 display_cols = [
-                    "athlete", "team", "avg_ci", "avg_ci100", "avg_ci100_ratio_pct",
+                    "athlete", "team", "avg_ci", "avg_ci100",
                     "ci100_test_dates", "first_ci100_date", "last_ci100_date", outcome_col,
                 ]
                 rename = {
@@ -10789,7 +10758,6 @@ def render_ci100_hitting_models_tab(
                     "team": "Team",
                     "avg_ci": "Season Average Total CI",
                     "avg_ci100": "Season Average CI100",
-                    "avg_ci100_ratio_pct": "CI100 / Total CI (%)",
                     "ci100_test_dates": "ForceDecks Test Dates",
                     "first_ci100_date": "First ForceDecks Test",
                     "last_ci100_date": "Last ForceDecks Test",
@@ -10829,7 +10797,6 @@ def render_ci100_hitting_models_tab(
                     column_config={
                         "Season Average Total CI": st.column_config.NumberColumn(format="%.2f N·s"),
                         "Season Average CI100": st.column_config.NumberColumn(format="%.2f N·s"),
-                        "CI100 / Total CI (%)": st.column_config.NumberColumn(format="%.2f%%"),
                         "Season Avg Bat Speed": st.column_config.NumberColumn(format="%.2f mph"),
                         "Regular-Season P90 Exit Velo": st.column_config.NumberColumn(format="%.2f mph"),
                         "Bat Speed Observations": st.column_config.NumberColumn(format="%d"),
